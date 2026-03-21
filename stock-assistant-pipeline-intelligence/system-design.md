@@ -585,7 +585,33 @@ Each item in the Morning Brief cache is a Scored Event. Top-level fields are use
 
 ## 7. Morning Brief API
 
-### 7.1 Endpoint
+### 7.1 Health Check
+
+```
+GET /health
+```
+
+**Response fields:**
+
+| Field | Values | Description |
+|---|---|---|
+| `status` | healthy / degraded / unhealthy | Overall service status |
+| `database` | ok / error | PostgreSQL connectivity |
+| `redis_stream` | ok / error | RedisStreamClient connectivity |
+| `redis_state` | ok / error | RedisStateClient connectivity |
+| `layers.nlp` | ok / error | NLP Layer consumer coroutine status |
+| `layers.aggregation` | ok / error | Aggregation Layer consumer coroutine status |
+| `layers.scoring` | ok / error | Scoring Layer consumer coroutine status |
+| `layers.cache` | ok / error | Cache Layer consumer coroutine status |
+
+**HTTP response codes:**
+- All healthy → `200 healthy`
+- Any layer degraded → `200 degraded`
+- Database or Redis unreachable → `503 unhealthy`
+
+> Post-MVP extension: add Dead Letter Stream backlog monitoring per layer to detect processing failures earlier.
+
+### 7.2 Morning Brief Endpoint
 
 ```
 GET /morning-brief?stocks=00700,09988,03690&k=20
@@ -596,7 +622,7 @@ GET /morning-brief?stocks=00700,09988,03690&k=20
 | `stocks` | string | Yes | Comma-separated HK stock codes from client watchlist |
 | `k` | integer | No | Max results to return; default `TOP_K_DEFAULT = 20` |
 
-### 7.2 Server Processing Logic
+### 7.3 Server Processing Logic
 
 ```
 Read morning_brief:v{current_version} from Redis
@@ -612,7 +638,7 @@ Step 2: If matched count < k
 Return results
 ```
 
-### 7.3 Response
+### 7.4 Response
 
 > All timestamps in response are UTC. `last_updated` reflects `morning_brief:last_updated` — the time of the last successful cache build.
 
@@ -691,7 +717,7 @@ Return results
 
 > Specific `error_code` values are defined per error scenario. Detailed error information is logged server-side only.
 
-### 7.4 Client Processing
+### 7.5 Client Processing
 
 The client applies `POOL_MATCH_BOOST` to watchlist-matching Events and re-ranks the results. See PRD Section 12.2 for client-side parameter details.
 
@@ -904,6 +930,22 @@ SCAN morning_brief:v*
 → Delete all other morning_brief:v* keys
 → Log cleanup results
 ```
+
+**Coroutine Monitoring**
+
+Each layer consumer coroutine is started as an `asyncio.Task` in `main.py`. A `done_callback` is attached to each Task to detect unexpected exits:
+
+```
+On Task exit:
+├── Normal shutdown → no action
+└── Unexpected exit (exception)
+    → log CRITICAL with exception detail
+    → recreate Task (auto-restart)
+```
+
+This lightweight mechanism handles coroutine crash recovery without requiring hang detection — the `XREADGROUP BLOCK` pattern prevents coroutines from hanging silently.
+
+`GET /health` uses Task liveness to report `layers.*` status: a Task that has exited unexpectedly reports `error` until it is successfully restarted.
 
 ---
 
