@@ -1,14 +1,14 @@
 # Stock Assistant Data Ingestion (SADI)
-## Technical Architecture Document — v0.5
+## Technical Architecture Document — v0.6
 
 | Field | Detail |
 |---|---|
 | Service Name | Stock Assistant Data Ingestion (SADI) |
-| Document Version | TAD v0.5 |
+| Document Version | TAD v0.6 |
 | Parent System | HK Stock AI Research Assistant |
 | Service Responsibility | News data ingestion and cleaning |
 | Tech Stack | Python + asyncio + FastAPI |
-| Dependencies | PostgreSQL 16, Downstream parsing service (via NOTIFY + API) |
+| Dependencies | PostgreSQL 16, Redis, MWP Admin Service (via API), Downstream parsing service (via Redis Streams + API) |
 | Document Status | DRAFT — Pending team review |
 
 ---
@@ -19,7 +19,7 @@
 2. [Data Source Design](#2-data-source-design)
 3. [Crawler Layer](#3-crawler-layer)
 4. [Cleaning Layer](#4-cleaning-layer)
-5. [NOTIFY Signal Specification](#5-notify-signal-specification)
+5. [Redis Stream Signal Specification](#5-redis-stream-signal-specification)
 6. [API](#6-api)
 7. [Database Retry Strategy](#7-database-retry-strategy)
 8. [Coroutine Health Management](#8-coroutine-health-management)
@@ -38,8 +38,8 @@ SADI is the data entry point of the HK Stock AI Research Assistant. It is respon
 
 | Layer | Input | Output | Out of Scope |
 |---|---|---|---|
-| Crawler | RSS feeds and page URLs from `data_sources` | `raw_news` records (plain text body) + NOTIFY signal | Content analysis, classification, entity recognition |
-| Cleaner | `raw_news` records with no corresponding entry in `cleaned_news` | `cleaned_news` records + NOTIFY signal to downstream | Business rules, scoring, NLP |
+| Crawler | RSS feeds and page URLs from Admin Service source config | `raw_news` records (plain text body) + Redis Stream signal | Content analysis, classification, entity recognition |
+| Cleaner | `raw_news` records with no corresponding entry in `cleaned_news` | `cleaned_news` records + Redis Stream signal to downstream | Business rules, scoring, NLP |
 
 ### 1.2 Tech Stack
 
@@ -55,7 +55,8 @@ SADI is the data entry point of the HK Stock AI Research Assistant. It is respon
 | PDF parsing | pdfplumber | vs PyPDF2: significantly better text extraction for complex layouts |
 | Text normalisation | unicodedata (stdlib) | NFKC normalisation for fullwidth-to-halfwidth conversion; zero dependency |
 | Hash computation | hashlib (stdlib) | SHA-256 for title deduplication; zero dependency |
-| Database client | asyncpg | vs psycopg2: native asyncio driver; native LISTEN/NOTIFY support (critical) |
+| Database client | asyncpg | vs psycopg2: native asyncio driver |
+| Redis client | redis-py (asyncio) | Redis Streams for inter-service messaging |
 | Database migration | Alembic | Standard Python migration tool; supports versioned seed data |
 | Containerisation | Docker | Independent deployment; docker-compose for local development |
 
@@ -72,37 +73,39 @@ SADI is the data entry point of the HK Stock AI Research Assistant. It is respon
 | AAStocks | Web | Traditional Chinese | RSS_CRAWLER — RSS for URL discovery, Crawler for body | P2 |
 | Yahoo Finance HK | RSS + Web | English | RSS_CRAWLER — RSS for URL discovery, Crawler for body | P2 |
 
-> **Note:** NewsAPI is reserved as a post-MVP data source. The pluggable `data_sources` table design accommodates its integration without code changes.
+> **Note:** NewsAPI is reserved as a post-MVP data source. New sources are added via Admin Service configuration without code changes.
 >
 > **Excluded from MVP:** SCMP (paywalled), Bloomberg HK (no stable RSS, strong anti-crawl), Reuters Asia (unstable RSS endpoints — pending Week 1 validation).
 
-### 2.2 `data_sources` Table
+### 2.2 Source Configuration — Admin Service
 
-All source configurations are stored in the database. Enabling or disabling a source requires only a record update — no code changes or service restarts needed.
+Data source configurations are managed by MWP Admin Service and shared across services. SADI fetches configuration via Admin API and caches it in Redis with TTL-based auto-refresh.
 
-| Field | Type | Description |
-|---|---|---|
-| source_id | UUID | Primary key |
-| source_name | VARCHAR(50) | Source identifier, e.g. HKEX, MINGPAO, AASTOCKS, YAHOO_HK |
-| source_type | VARCHAR(20) | RSS_FULL / RSS_CRAWLER / API — determines crawl strategy branch |
-| rss_url | TEXT | RSS feed URL |
-| base_url | TEXT | Site root URL, used for resolving relative paths in crawler |
-| is_active | BOOLEAN | Whether the source is enabled; default true |
-| priority | VARCHAR(5) | P1 / P2 / P3 |
-| max_concurrent | INTEGER | Max concurrent crawler coroutines for this source; default 3 |
-| request_interval_min_ms | INTEGER | Minimum request interval (ms); default 500 |
-| request_interval_max_ms | INTEGER | Maximum request interval (ms); default 1000 |
-| crawl_config | JSONB | Source-specific extension config, e.g. CSS selectors, custom headers |
-| created_at | TIMESTAMPTZ | Created at UTC |
-| updated_at | TIMESTAMPTZ | Last updated at UTC |
+```
+Crawl execution requires source config:
+├── Redis key exists → read directly
+└── Redis key expired or missing
+    → fetch from Admin API
+    → write to Redis with TTL = SOURCE_CONFIG_TTL_S
+    → fallback if Admin API unreachable: use previous Redis cache; log warning
+```
 
-> **Constraint:** `request_interval_min_ms < request_interval_max_ms` enforced via CHECK constraint in schema.
->
-> **Initialisation:** Seed data managed via Alembic migration scripts, versioned alongside table creation scripts.
+> **Note:** SADI does not own the `data_sources` table. Source configuration is the single responsibility of MWP Admin Service. SADI is a read-only consumer of this configuration.
 
-**Index strategy:**
-- `source_name` — unique index
-- `is_active` — index
+The source config cached in Redis contains the fields required for crawl execution:
+
+| Field | Description |
+|---|---|
+| source_name | Source identifier, e.g. HKEX, MINGPAO, AASTOCKS, YAHOO_HK |
+| source_type | RSS_FULL / RSS_CRAWLER / API — determines crawl strategy branch |
+| rss_url | RSS feed URL |
+| base_url | Site root URL, used for resolving relative paths |
+| is_active | Whether the source is currently enabled |
+| priority | P1 / P2 / P3 |
+| max_concurrent | Max concurrent crawler coroutines for this source; default 3 |
+| request_interval_min_ms | Minimum request interval (ms); default 500 |
+| request_interval_max_ms | Maximum request interval (ms); default 1000 |
+| crawl_config | Source-specific extension config, e.g. CSS selectors, custom headers |
 
 ---
 
@@ -114,12 +117,13 @@ The crawler layer is fully async, driven by Python's asyncio event loop. All fou
 
 ```mermaid
 flowchart TD
-    A([Job Triggered]) --> B[Start 4 Concurrent Source Tasks]
+    A([Crawl Triggered]) --> B[Load source config from Admin API / Redis cache]
+    B --> C[Start 4 Concurrent Source Tasks]
 
-    B --> S1[HKEx NEWSLINE]
-    B --> S2[Ming Pao Finance]
-    B --> S3[AAStocks]
-    B --> S4[Yahoo Finance HK]
+    C --> S1[HKEx NEWSLINE]
+    C --> S2[Ming Pao Finance]
+    C --> S3[AAStocks]
+    C --> S4[Yahoo Finance HK]
 
     S1 -->|RSS_FULL| R1[fetch_rss]
     R1 --> DB1[save to raw_news]
@@ -140,7 +144,7 @@ flowchart TD
     C3 --> DB2
     C4 --> DB2
 
-    DB1 --> N[NOTIFY raw_news_inserted]
+    DB1 --> N[Write to stream:raw_news_inserted]
     DB2 --> N
 ```
 
@@ -168,8 +172,8 @@ After fetching a page, the crawler determines the parsing path based on the HTTP
 
 | Parameter | Default | Description | Config Location |
 |---|---|---|---|
-| max_concurrent | 3 | Max concurrent crawler coroutines per source | `data_sources.max_concurrent` |
-| request_interval | 500–1000ms random | Random jitter between requests to mimic human behaviour | `data_sources.request_interval_min/max_ms` |
+| max_concurrent | 3 | Max concurrent crawler coroutines per source | Source config via Admin API |
+| request_interval | 500–1000ms random | Random jitter between requests to mimic human behaviour | Source config via Admin API |
 | CRAWL_REQUEST_TIMEOUT_S | 10s | Single page fetch timeout | Environment variable |
 | CRAWL_MAX_RETRY | 3 | Max retry attempts with exponential backoff | Environment variable |
 
@@ -196,7 +200,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | HTML structure changed (empty body) | Log to `crawl_error_log`; requires manual intervention |
 | Unsupported Content-Type | Log to `crawl_error_log`; discard URL |
 
-> **Note:** `crawl_error_log` is a pure audit log and does not drive any retry business logic. Failed URLs within the time window will be re-discovered naturally in the next Job via RSS.
+> **Note:** `crawl_error_log` is a pure audit log and does not drive any retry business logic. Failed URLs within the time window will be re-discovered naturally in the next crawl execution via RSS.
 
 **Retry mechanism:**
 - Retries execute within the same coroutine; no database state required
@@ -219,7 +223,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | Field | Type | Description |
 |---|---|---|
 | raw_id | UUID | Primary key |
-| source_id | UUID | FK → `data_sources.source_id` ON DELETE SET NULL |
+| source_name | VARCHAR(50) | Source identifier from Admin Service config, e.g. HKEX, MINGPAO |
 | source_url | TEXT | Original article URL; unique index |
 | title | TEXT | Original title; never modified |
 | body | TEXT | Plain text body guaranteed by crawler layer; never modified |
@@ -235,7 +239,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 |---|---|---|
 | error_id | UUID | Primary key |
 | execution_id | UUID | Execution context ID |
-| source_id | UUID | FK → `data_sources.source_id` |
+| source_name | VARCHAR(50) | Source identifier from Admin Service config, e.g. HKEX, MINGPAO |
 | url | TEXT | Failed article URL; null indicates RSS-level failure |
 | error_type | VARCHAR(50) | NETWORK / PARSE / STORAGE |
 | error_code | VARCHAR(50) | Specific error code, e.g. HTTP_403, PDF_ENCRYPTED, TIMEOUT |
@@ -249,19 +253,18 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 - `raw_hash` — unique index; `INSERT ON CONFLICT DO NOTHING`
 - `is_deleted` — index
 - `created_at` — index
-- `source_id` — FK index
 
 ### 3.7 Crawler Data Flow
 
 | Stage | Action | Output |
 |---|---|---|
-| Crawl triggered | Read time window from request; read all `is_active = true` sources from `data_sources` | Time window + source config list |
+| Crawl triggered | Read time window from request; load `is_active = true` source configs from Redis / Admin API | Time window + source config list |
 | Concurrent start | Create one `asyncio.Task` per source; run all via `asyncio.gather()` | 4 concurrent tasks |
 | RSS fetch | Parse feed; filter articles outside time window | Article list (title, url, published_at) |
-| RSS_FULL save | Write directly to `raw_news`; trigger `NOTIFY raw_news_inserted(raw_id)` | `raw_news` record + NOTIFY |
+| RSS_FULL save | Write directly to `raw_news`; write to `stream:raw_news_inserted` | `raw_news` record + Stream message |
 | RSS_CRAWLER enqueue | Enqueue article URLs into per-source `asyncio.Queue`; crawler workers consume concurrently | URLs in queue |
 | Crawler fetch | httpx request; Content-Type detection; trafilatura or pdfplumber parsing | Plain text body |
-| Save | Write to `raw_news` (`INSERT ON CONFLICT DO NOTHING`); trigger `NOTIFY raw_news_inserted(raw_id)` | `raw_news` record + NOTIFY |
+| Save | Write to `raw_news` (`INSERT ON CONFLICT DO NOTHING`); write to `stream:raw_news_inserted` | `raw_news` record + Stream message |
 | Error handling | Retryable: exponential backoff up to max retries. Non-retryable: write to `crawl_error_log` immediately | `crawl_error_log` record |
 
 ---
@@ -272,7 +275,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 
 ```mermaid
 flowchart TD
-    A([NOTIFY / Fallback Poll]) --> B[Enqueue raw_id]
+    A([stream:raw_news_inserted]) --> B[Enqueue raw_id]
     B --> C[Concurrent Workers]
     C --> D{raw_id exists in cleaned_news?}
     D -->|Yes| E([Skip])
@@ -280,21 +283,22 @@ flowchart TD
     F --> G{Passed?}
     G -->|No| H[Log rejection / mark is_deleted in raw_news]
     G -->|Yes| I[Write to cleaned_news]
-    I --> J[NOTIFY raw_news_cleaned]
+    I --> J[Write to stream:raw_news_cleaned]
 ```
 
 ### 4.2 Trigger Mechanism
 
-| Trigger | Mechanism | Use Case |
-|---|---|---|
-| Primary | `LISTEN raw_news_inserted` — on NOTIFY, enqueue `raw_id` to internal queue | Normal operation, real-time processing |
-| Fallback | Poll `raw_news` for records with no corresponding entry in `cleaned_news` every `FALLBACK_POLL_INTERVAL_S` seconds | Catches missed NOTIFYs due to service restarts or abnormal exits |
+The cleaning layer consumes from `stream:raw_news_inserted` via Redis Streams Consumer Group. Messages are persistent — no fallback polling required.
 
-> **Design note:** NOTIFY carries only the `raw_id` signal — no data payload. The cleaner fetches the full record from the database. Migrating to Kafka in the future only requires changing the trigger entry point; all internal processing logic remains unchanged.
+| Mechanism | Description |
+|---|---|
+| Primary trigger | Redis Streams `XREADGROUP COUNT+BLOCK` on `stream:raw_news_inserted`; on message received, enqueue `raw_id` to internal queue |
+| At-least-once delivery | Unacknowledged messages are automatically redelivered via `XAUTOCLAIM` after `STREAM_CLAIM_TIMEOUT_MS` |
+| Service restart recovery | Consumer Group position is preserved in Redis; processing resumes automatically from last ACKed message on restart |
 
-Both triggers feed into the same internal `asyncio.Queue`. Workers consume from a single queue regardless of how the `raw_id` arrived.
+> **Design note:** Redis Streams persistence guarantees no message loss on service restart, eliminating the need for fallback polling. All inter-service signals use Redis Streams exclusively.
 
-**Idempotency:** Before processing, each worker checks whether a record with the same `raw_id` already exists in `cleaned_news`. If so, the record is skipped, ensuring duplicate entries in the queue cause no data corruption.
+**Idempotency:** Before processing, each worker checks whether a record with the same `raw_id` already exists in `cleaned_news`. If so, the record is skipped, ensuring redelivered messages cause no data corruption.
 
 **Concurrency:** Default 5 concurrent workers, configurable via `CLEAN_WORKER_CONCURRENCY`. Guidelines for tuning:
 - Workers should not exceed 60% of the database connection pool size
@@ -311,7 +315,7 @@ Both triggers feed into the same internal `asyncio.Queue`. Workers consume from 
 | 4. Title hash deduplication | Compute `SHA-256(normalised_title)`; if collision found, retain record with earliest `created_at` | Duplicate → log rejection (`DUPLICATE_TITLE`); mark `is_deleted = true` in `raw_news`; stop processing |
 | 5. Body normalisation | Strip excess whitespace and line breaks, fullwidth-to-halfwidth | Normalisation failure logged as warning; does not block |
 | 6. Body length check | After normalisation, if `len(body_cleaned) < CLEAN_BODY_MIN_LENGTH` | Too short → log rejection (`BODY_TOO_SHORT`); mark `is_deleted = true` in `raw_news`; stop processing |
-| 7. Write to `cleaned_news` | Insert record with `title_cleaned`, `body_cleaned`, `created_at = now()` | On success: trigger `NOTIFY raw_news_cleaned(cleaned_id)`. On failure: rely on fallback poll — do not send NOTIFY |
+| 7. Write to `cleaned_news` | Insert record with `title_cleaned`, `body_cleaned`, `created_at = now()` | On success: write to `stream:raw_news_cleaned`. On failure: do not write to stream — message remains unACKed for redelivery |
 
 > **Rejection logging:** Rejected records are marked `is_deleted = true` with `deleted_reason` in `raw_news`. No entry is written to `cleaned_news`. Rejection details are recorded in application logs only.
 
@@ -335,25 +339,25 @@ Both triggers feed into the same internal `asyncio.Queue`. Workers consume from 
 
 | Stage | Action | Output |
 |---|---|---|
-| NOTIFY received | asyncpg `LISTEN raw_news_inserted`; extract `raw_id` from payload | `raw_id` enqueued |
-| Fallback poll | Every `FALLBACK_POLL_INTERVAL_S` seconds, scan `raw_news` for records with no entry in `cleaned_news`; enqueue `raw_id` | `raw_id` enqueued |
+| Stream message received | `XREADGROUP` reads from `stream:raw_news_inserted`; extract `raw_id` from message | `raw_id` enqueued to internal queue |
 | Idempotency check | Worker dequeues `raw_id`; checks if `raw_id` exists in `cleaned_news` — skip if found | Skip or proceed |
 | Execute cleaning | Run 7-step cleaning sequence (see Section 4.3) | Field updates or soft delete in `raw_news` |
 | Write result | Insert into `cleaned_news`; set `created_at = now()` | `cleaned_news` record |
-| Notify downstream | Trigger `NOTIFY raw_news_cleaned(cleaned_id)` on successful write only | Downstream parsing service receives signal |
+| Signal downstream | Write to `stream:raw_news_cleaned` with `cleaned_id`; ACK original message | Downstream parsing service receives stream message |
+| Redelivery | Messages not ACKed within `STREAM_CLAIM_TIMEOUT_MS` are reclaimed via `XAUTOCLAIM` and redelivered | Reprocessed from idempotency check |
 
 ---
 
-## 5. NOTIFY Signal Specification
+## 5. Redis Stream Signal Specification
 
-NOTIFY is used as a lightweight event signal between SADI's internal layers and downstream services. Payload carries only the record ID — receivers fetch full data via database query (internal) or API (external).
+Redis Streams are used as the inter-service messaging mechanism. Each stream message carries only the record ID — receivers fetch full data via database query (internal) or API (external).
 
-| Signal | Triggered When | Payload | Listener |
-|---|---|---|---|
-| `raw_news_inserted` | Crawler successfully writes one `raw_news` record | `raw_id` (UUID string) | SADI cleaning layer |
-| `raw_news_cleaned` | Cleaner successfully writes one `cleaned_news` record | `cleaned_id` (UUID string) | Downstream parsing service |
+| Stream | Producer | Consumer Group | Message Fields | Role |
+|---|---|---|---|---|
+| `stream:raw_news_inserted` | Crawler layer | `sadi-cleaner` | `raw_id` | Cleaning layer input trigger |
+| `stream:raw_news_cleaned` | Cleaning layer | `sapi-nlp` | `cleaned_id` | Downstream parsing service input trigger |
 
-> **Migration note:** Migrating to Kafka requires replacing only the NOTIFY sender and LISTEN receiver entry points — all downstream processing logic is unchanged.
+> **Note:** Both connections may point to the same Redis instance in MVP. `stream:raw_news_cleaned` is consumed by SAPI; SADI only produces to this stream and has no dependency on its consumers.
 
 ---
 
@@ -367,7 +371,8 @@ SADI exposes a minimal REST API via FastAPI. The API serves two purposes: extern
 |---|---|---|
 | POST | `/crawl` | Trigger a crawl execution; accepts optional time window parameter |
 | GET | `/health` | Service health check |
-| GET | `/cleaned_news/{cleaned_id}` | Return a cleaned article record by ID; consumed by downstream parsing service after receiving NOTIFY |
+| GET | `/cleaned_news/{cleaned_id}` | Return a single cleaned article record by ID |
+| POST | `/cleaned_news/batch` | Return multiple cleaned article records by ID list; consumed by downstream parsing service |
 
 ### 6.2 `GET /health` Response
 
@@ -375,14 +380,14 @@ SADI exposes a minimal REST API via FastAPI. The API serves two purposes: extern
 |---|---|---|
 | status | healthy / degraded / unhealthy | Overall service status |
 | database | ok / error | Database connectivity |
+| redis | ok / error | Redis connectivity |
 | coroutines.clean_worker | ok / error | clean_worker coroutine status |
-| coroutines.notify_listener | ok / error | notify_listener coroutine status |
-| coroutines.fallback_poller | ok / error | fallback_poller coroutine status |
+| coroutines.stream_handler | ok / error | stream_handler coroutine status |
 
 HTTP response codes:
 - All healthy → `200 healthy`
-- Any coroutine degraded → `200 degraded`
-- Database unreachable → `503 unhealthy`
+- Any component degraded → `200 degraded`
+- Database or Redis unreachable → `503 unhealthy`
 
 ---
 
@@ -426,9 +431,8 @@ Watchdog manages only long-running coroutines. Crawl-scoped coroutines (`rss_fet
 
 | Coroutine | Responsibility |
 |---|---|
-| `clean_worker` | Dequeues raw_ids; executes cleaning steps |
-| `notify_listener` | Listens for PostgreSQL NOTIFY signals |
-| `fallback_poller` | Periodically scans for unprocessed records |
+| `clean_worker` | Dequeues raw_ids from internal queue; executes cleaning steps |
+| `stream_handler` | Consumes `stream:raw_news_inserted`; enqueues raw_ids to internal queue; writes to `stream:raw_news_cleaned` |
 
 ### 8.2 Watchdog Mechanism
 
@@ -437,8 +441,6 @@ Each coroutine is monitored for two failure modes:
 **Unexpected exit** — Coroutine terminates due to an unhandled exception. Watchdog detects the exit and immediately restarts the coroutine.
 
 **Deadlock / hang** — Coroutine becomes unresponsive without raising an exception. Each coroutine has a configurable timeout threshold. If exceeded, Watchdog forcibly cancels and restarts the coroutine.
-
-The fallback poller runs as an internal asyncio timed loop. It is monitored by the same Watchdog mechanism to handle unexpected cancellation or hang.
 
 ### 8.3 Restart Strategy
 
@@ -452,8 +454,7 @@ The fallback poller runs as an internal asyncio timed loop. It is monitored by t
 | Parameter | Default | Description |
 |---|---|---|
 | WATCHDOG_CLEAN_WORKER_TIMEOUT_S | 30 | Hang detection threshold for `clean_worker` (seconds) |
-| WATCHDOG_NOTIFY_LISTENER_TIMEOUT_S | 30 | Hang detection threshold for `notify_listener` (seconds) |
-| WATCHDOG_FALLBACK_POLLER_TIMEOUT_S | 30 | Hang detection threshold for `fallback_poller` (seconds) |
+| WATCHDOG_STREAM_HANDLER_TIMEOUT_S | 30 | Hang detection threshold for `stream_handler` (seconds) |
 | WATCHDOG_MAX_RESTART | 5 | Max consecutive restarts before halting and awaiting manual intervention |
 
 ---
@@ -466,6 +467,7 @@ The fallback poller runs as an internal asyncio timed loop. It is monitored by t
 |---|---|---|
 | sadi | python:3.12-slim (custom build) | Main SADI service; includes crawler, cleaning layers and API |
 | postgres | postgres:16-alpine | Primary database; persistent volume mounted |
+| redis | redis:7-alpine | Redis Streams for inter-service messaging; shared with SAPI |
 
 ### 9.2 Environment Variables
 
@@ -475,15 +477,17 @@ The fallback poller runs as an internal asyncio timed loop. It is monitored by t
 | DB_POOL_SIZE | 10 | Database connection pool size |
 | DB_MAX_RETRY | 3 | Max database operation retry attempts |
 | DB_RETRY_BASE_WAIT_MS | 100 | Database retry base wait time (ms) |
+| REDIS_URL | — | Redis connection string; required |
+| MWP_ADMIN_API_URL | — | Admin Service API endpoint for source configuration; required |
+| SOURCE_CONFIG_TTL_S | 3600 | Source configuration Redis cache TTL (seconds) |
 | CRAWL_MAX_RETRY | 3 | Max crawler retry attempts |
 | CRAWL_RETRY_BASE_WAIT_MS | 500 | Crawler retry base wait time (ms) |
 | CRAWL_REQUEST_TIMEOUT_S | 10 | Single page fetch timeout (seconds) |
 | CLEAN_WORKER_CONCURRENCY | 5 | Number of concurrent cleaning workers |
 | CLEAN_BODY_MIN_LENGTH | 50 | Minimum body length after cleaning (characters) |
-| FALLBACK_POLL_INTERVAL_S | 300 | Fallback poll interval (seconds) |
+| STREAM_CLAIM_TIMEOUT_MS | 30000 | Message pending time before XAUTOCLAIM redelivery (ms) |
 | WATCHDOG_CLEAN_WORKER_TIMEOUT_S | 30 | `clean_worker` hang detection threshold (seconds) |
-| WATCHDOG_NOTIFY_LISTENER_TIMEOUT_S | 30 | `notify_listener` hang detection threshold (seconds) |
-| WATCHDOG_FALLBACK_POLLER_TIMEOUT_S | 30 | `fallback_poller` hang detection threshold (seconds) |
+| WATCHDOG_STREAM_HANDLER_TIMEOUT_S | 30 | `stream_handler` hang detection threshold (seconds) |
 | WATCHDOG_MAX_RESTART | 5 | Max consecutive coroutine restarts before halting |
 
 ### 9.3 Project Structure
@@ -499,8 +503,7 @@ sadi/
 │   │   └── crawler_service.py       # process_source(), concurrency orchestration
 │   ├── cleaner/
 │   │   ├── cleaning_service.py      # Cleaning layer main service, queue management
-│   │   ├── notify_listener.py       # PostgreSQL LISTEN/NOTIFY handler
-│   │   ├── fallback_poller.py       # Fallback poll loop
+│   │   ├── stream_handler.py        # Redis Streams consumer/producer
 │   │   ├── text_normaliser.py       # Fullwidth conversion, whitespace cleaning
 │   │   └── dedup_service.py         # Title hash deduplication logic
 │   ├── watchdog/
@@ -509,18 +512,20 @@ sadi/
 │   │   ├── routes/
 │   │   │   ├── crawl.py             # POST /crawl
 │   │   │   ├── health.py            # GET /health
-│   │   │   └── cleaned_news.py      # GET /cleaned_news/{cleaned_id}
+│   │   │   └── cleaned_news.py      # GET /cleaned_news/{cleaned_id}, POST /cleaned_news/batch
 │   │   └── main.py                  # FastAPI app initialisation
 │   ├── db/
-│   │   ├── connection.py            # asyncpg connection pool
-│   │   └── notify.py                # NOTIFY sender abstraction
+│   │   └── connection.py            # asyncpg connection pool
+│   ├── redis/
+│   │   └── stream_client.py         # Redis Streams client abstraction
+│   ├── admin/
+│   │   └── source_config.py         # Admin API client + Redis cache for source config
 │   ├── models/                      # Data model definitions
 │   ├── config.py                    # Environment variable loading
 │   └── main.py                      # Service entry point
 ├── alembic/
 │   └── versions/
-│       ├── 001_create_tables.py     # Schema creation
-│       └── 002_seed_sources.py      # Initial data source configuration
+│       └── 001_create_tables.py     # Schema creation
 ├── Dockerfile
 ├── requirements.txt
 └── docker-compose.yml
@@ -538,4 +543,4 @@ sadi/
 
 ---
 
-*— End of Document | SADI TAD v0.5 | Pending team review before status change to APPROVED —*
+*— End of Document | SADI TAD v0.6 | Pending team review before status change to APPROVED —*
