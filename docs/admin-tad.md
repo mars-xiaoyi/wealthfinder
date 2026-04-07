@@ -1,10 +1,10 @@
 # MWP Admin Service
-## Technical Architecture Document — v0.1
+## Technical Architecture Document — v0.2
 
 | Field | Detail |
 |---|---|
 | Service Name | MWP Admin Service |
-| Document Version | TAD v0.1 |
+| Document Version | TAD v0.2 |
 | Parent System | HK Stock AI Research Assistant |
 | Service Responsibility | System configuration, source management, and job scheduling |
 | Tech Stack | Java 21 + Spring Boot 3 |
@@ -42,13 +42,13 @@ Stores job configuration. One record per named job. Modified by operators only.
 | Field | Type | Description |
 |---|---|---|
 | `job_id` | UUID | Primary key |
-| `job_name` | VARCHAR | Human-readable name, e.g. `morning-crawl` |
-| `job_type` | ENUM | `SINGLE_FIRE` / `MULTI_FIRE` |
-| `handler_key` | VARCHAR | Maps to handler class name and file in handlers directory, e.g. `MORNING_CRAWL` |
-| `start_time` | TIME (UTC) | Daily trigger time; for `MULTI_FIRE` defines window start |
-| `interval_value` | INTEGER | Null for `SINGLE_FIRE` |
-| `interval_unit` | ENUM | `MINUTE` / `HOUR` / `DAY`; Null for `SINGLE_FIRE` |
-| `stop_time` | TIME (UTC) | Inclusive final trigger time; Null for `SINGLE_FIRE` |
+| `job_name` | VARCHAR | Human-readable name, e.g. `hkex-morning-crawl` |
+| `job_type` | ENUM | `ONE_TIME` / `RECURRING` |
+| `handler_key` | VARCHAR | Maps to handler class name in handlers package, e.g. `CRAWL` |
+| `job_params` | JSONB | Per-job parameters passed to handler via `JobContext`, e.g. `{"source_name": "HKEX", "date_offset": 0}` |
+| `start_time` | TIME (UTC) | Daily trigger time; for `RECURRING` defines first trigger of the day |
+| `interval_value` | INTEGER | Null for `ONE_TIME` |
+| `interval_unit` | ENUM | `MINUTE` / `HOUR` / `DAY`; Null for `ONE_TIME` |
 | `execution_timeout_s` | INTEGER | Execution timeout passed to `Future.get(timeout)`; Null uses `DEFAULT_EXECUTION_TIMEOUT_S` |
 | `is_active` | BOOLEAN | Whether this job is currently enabled |
 | `created_at` | TIMESTAMPTZ | Record creation time UTC |
@@ -56,10 +56,17 @@ Stores job configuration. One record per named job. Modified by operators only.
 
 **MVP seed data:**
 
-| job_name | job_type | handler_key | start_time | interval_value / unit | stop_time |
+| job_name | job_type | handler_key | job_params | start_time | interval_value / unit |
 |---|---|---|---|---|---|
-| `morning-crawl` | `SINGLE_FIRE` | `MORNING_CRAWL` | 14:00 UTC | null / null | null |
-| `pre-open-crawl` | `MULTI_FIRE` | `PRE_OPEN_CRAWL` | 00:00 UTC | 15 / `MINUTE` | 01:00 UTC |
+| `hkex-evening-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "HKEX"}` | 14:00 UTC | 1 / `DAY` |
+| `hkex-morning-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "HKEX"}` | 01:00 UTC | 1 / `DAY` |
+| `mingpao-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "MINGPAO"}` | 00:00 UTC | 1 / `HOUR` |
+| `aastocks-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "AASTOCKS"}` | 00:00 UTC | 1 / `HOUR` |
+| `yahoo-hk-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "YAHOO_HK"}` | 00:00 UTC | 1 / `HOUR` |
+
+> **HKEX:** Two daily executions — evening (14:00 UTC = 22:00 HKT, post-market) and morning (01:00 UTC = 09:00 HKT, pre-open). Both use `interval = 1 DAY`, generating exactly one trigger per day each.
+>
+> **Other sources:** `interval = 1 HOUR` with no stop time — triggers generated for every hour of the day (24 triggers/day per source).
 
 #### `scheduled_triggers`
 
@@ -77,7 +84,7 @@ Pre-generated trigger time points for all active jobs. Generated daily at `TRIGG
 
 > **Trigger status flow:** `PENDING` → `FIRED` (normal) / `SKIPPED` (init returned false) / `MISSED` (stale on service restart)
 
-> **Manual re-trigger:** Insert a new `PENDING` record with `scheduled_time = now()`. The main loop picks it up on the next cycle. `stop_time` is not validated at execution time — it is used only during trigger generation.
+> **Manual re-trigger:** Insert a new `PENDING` record with `scheduled_time = now()`. The main loop picks it up on the next cycle.
 
 #### `job_executions`
 
@@ -88,7 +95,7 @@ One record per handler invocation. Written and updated exclusively by the framew
 | `execution_id` | UUID | Primary key |
 | `job_id` | UUID | FK → `scheduled_jobs.job_id` |
 | `status` | ENUM | `RUNNING` / `SUCCESS` / `FAILED` / `INTERRUPTED` |
-| `start_time` | TIMESTAMPTZ | Written by framework after `init()` returns True; used as `window_stop` by the next execution's handler |
+| `start_time` | TIMESTAMPTZ | Written by framework after `init()` returns True; equals `trigger.scheduled_time` |
 | `completed_at` | TIMESTAMPTZ | Null until terminal state reached |
 | `error_detail` | TEXT | Null unless `FAILED` |
 | `created_at` | TIMESTAMPTZ | Record creation time UTC |
@@ -100,19 +107,21 @@ One record per handler invocation. Written and updated exclusively by the framew
 
 **Daily generation:** At `TRIGGER_GENERATION_TIME` (00:00 UTC), the framework generates all trigger records for the current day for every `is_active = true` job.
 
-**MULTI_FIRE trigger calculation:**
+**RECURRING trigger calculation:**
 
 ```mermaid
 flowchart TD
-    A([Generate triggers for MULTI_FIRE job]) --> B{stop_time >= start_time?}
-    B -->|Yes — same-day window| C[Generate start_time + n x interval\nwhere result <= stop_time]
-    B -->|No — cross-midnight window| D[Generate start_time + n x interval\nwhere result <= 23:59\ntoday's portion]
-    D --> E[Tomorrow's portion generated\non next day's generation run]
-    C --> F([Insert PENDING records])
-    E --> F
+    A([Generate triggers for RECURRING job]) --> B[t = start_time]
+    B --> C{t <= 23:59?}
+    C -->|Yes| D[Insert PENDING trigger at t]
+    D --> E[t = t + interval]
+    E --> C
+    C -->|No| F([Done])
 ```
 
-> `stop_time` is inclusive — the `stop_time` point itself is always generated as a trigger.
+> `interval = 1 DAY` produces exactly one trigger per day at `start_time`. `interval = 1 HOUR` produces 24 triggers. The same formula handles both cases uniformly — no special branching required.
+
+> **`stop_time` removed:** All `RECURRING` jobs run for the full day. Scheduling constraints (e.g. crawl only during trading hours) are expressed by adjusting `start_time` and `interval`, or by adding a second job record.
 
 ### 1.4 Scheduler Main Loop
 
@@ -165,6 +174,7 @@ to ThreadPoolTaskExecutor]
 |---|---|---|---|
 | `job_id` | UUID | Framework at dispatch | From `scheduled_triggers.job_id` |
 | `trigger_id` | UUID | Framework at dispatch | From `scheduled_triggers.trigger_id` |
+| `job_params` | Map | Framework at dispatch | Parsed from `scheduled_jobs.job_params` JSONB; e.g. `{"source_name": "HKEX"}` |
 | `execution_id` | UUID | Framework after `init()` returns True | Set after `RUNNING` record written; available to `execute()` and `complete_*()` |
 | `start_time` | datetime | Framework after `init()` returns True | Set after `RUNNING` record written; equals `trigger.scheduled_time` |
 
@@ -178,8 +188,7 @@ Handlers are loaded dynamically at dispatch time via Java reflection. All handle
 
 ```
 com.mwp.admin.handlers/
-    MORNING_CRAWL.java     # class MORNING_CRAWL implements JobHandler
-    PRE_OPEN_CRAWL.java    # class PRE_OPEN_CRAWL implements JobHandler
+    CRAWL.java     # class CRAWL implements JobHandler
 ```
 
 `JobExecutor` resolves and instantiates the handler at dispatch time:
@@ -193,8 +202,8 @@ JobHandler handler = (JobHandler) clazz.getDeclaredConstructor().newInstance()
 
 ```mermaid
 flowchart TD
-    A([dispatch trigger]) --> B[Load handler via handler_key\nfrom HANDLERS_DIR]
-    B --> C[Build JobContext\njob_id + trigger_id]
+    A([dispatch trigger]) --> B[Load handler via handler_key\nfrom HANDLERS_PACKAGE]
+    B --> C[Build JobContext\njob_id + trigger_id + job_params]
     C --> D[await handler.init]
     D --> E{Result?}
     E -->|Raises| F[log error\nno execution record written]
@@ -220,6 +229,7 @@ flowchart TD
 | Poll `scheduled_triggers` and dispatch | yes | |
 | Limit concurrent dispatches via Semaphore | yes | |
 | Dynamically load handler by `handler_key` | yes | |
+| Parse `job_params` from `scheduled_jobs` and populate `JobContext` | yes | |
 | Decide whether to execute (conflict detection) | | `init()` |
 | Insert retry trigger on conflict | | `init()` |
 | Write and update `job_executions` records | yes | |
@@ -240,9 +250,8 @@ flowchart TD
 | `DEFAULT_EXECUTION_TIMEOUT_S` | 1800 | Global execution timeout (30 min); overridden per job via `scheduled_jobs.execution_timeout_s` |
 | `SCHEDULER_LOOP_INTERVAL_S` | 60 | Main loop wake interval (seconds) |
 | `TRIGGER_GENERATION_TIME` | 00:00 UTC | Daily time at which trigger records are generated |
-| `FALLBACK_WINDOW_HOURS` | 24 | Crawl window start fallback when no previous execution exists |
 | `MAX_CONCURRENT_DISPATCHES` | 10 | `ThreadPoolTaskExecutor` max pool size; limits concurrent dispatch tasks |
-| `HANDLERS_DIR` | `handlers/` | Directory containing handler implementations |
+| `HANDLERS_PACKAGE` | `com.mwp.admin.handlers` | Package containing handler implementations; used for dynamic class loading via reflection |
 
 ---
 
@@ -250,12 +259,11 @@ flowchart TD
 
 ### 2.1 Overview
 
-`CrawlHandler` is the base behaviour shared by `MORNING_CRAWL` and `PRE_OPEN_CRAWL`. Both trigger SADI's crawl pipeline via `POST /crawl` and await completion via `stream:crawl_completed`. The only behavioural difference is the conflict retry delay.
+`CRAWL` is the single handler implementation for all source crawl jobs. It reads `source_name` from `context.job_params`, triggers SADI's crawl pipeline via `POST /crawl`, and awaits completion via `stream:crawl_completed`.
 
-| handler_key | Job | Conflict retry delay |
-|---|---|---|
-| `MORNING_CRAWL` | morning-crawl | 30 minutes |
-| `PRE_OPEN_CRAWL` | pre-open-crawl | 5 minutes |
+| handler_key | Handles |
+|---|---|
+| `CRAWL` | All source crawl jobs — `source_name` resolved from `context.job_params` |
 
 ### 2.2 `init()`
 
@@ -268,18 +276,21 @@ flowchart TD
     E --> F([return False])
 ```
 
+> `retry_delay` is a fixed constant within the handler (default: 5 minutes). If per-job tuning is needed post-MVP, it can be added to `job_params`.
+
 ### 2.3 `execute()`
 
 ```mermaid
 flowchart TD
-    A([execute called]) --> B[Query job_executions\nGet previous execution start_time\nfor this job_id]
-    B --> C[Derive time window\nwindow_start = previous start_time\nor now - FALLBACK_WINDOW_HOURS\nwindow_stop = context.start_time]
-    C --> D[POST /crawl\nbody: execution_id\nwindow_start\nwindow_stop]
-    D --> E[Subscribe stream:crawl_completed\nAwait message where\nmessage.execution_id = context.execution_id]
-    E --> F{message.status?}
-    F -->|SUCCESS| G([return normally])
-    F -->|FAILED| H([raise CrawlFailedError\nmessage.error_detail])
+    A([execute called]) --> B[Read source_name from context.job_params]
+    B --> C[POST /crawl\nbody: execution_id source_name date]
+    C --> D[Subscribe stream:crawl_completed\nAwait message where\nmessage.execution_id = context.execution_id]
+    D --> E{message.status?}
+    E -->|SUCCESS| F([return normally])
+    E -->|FAILED| G([raise CrawlFailedError\nmessage.error_detail])
 ```
+
+> `date` in the request body is derived from `context.start_time` (formatted as `YYYYMMDD`). SADI uses it only for HKEX batch pull; other sources ignore it.
 
 > `execute()` is subject to `Future.get(execution_timeout_s)` timeout enforced by `JobExecutor`. On timeout, the framework marks the execution `FAILED` and calls `complete_with_error()`.
 
@@ -289,7 +300,7 @@ No-op in MVP.
 
 ### 2.5 `complete_with_error()`
 
-Logs a CRITICAL alert with fields: `job_id`, `execution_id`, `error_detail`.
+Logs a CRITICAL alert with fields: `job_id`, `execution_id`, `source_name`, `error_detail`.
 
 ---
 
@@ -297,56 +308,39 @@ Logs a CRITICAL alert with fields: `job_id`, `execution_id`, `error_detail`.
 
 ### 3.1 `data_sources` Table
 
-Stores configuration for all news sources. Owned and managed exclusively by Admin Service. All other services are read-only consumers via `GET /sources`.
+Stores configuration for all news sources. Owned and managed exclusively by Admin Service. SAPI is the sole read-only consumer via `GET /sources`.
 
 | Field | Type | Description |
 |---|---|---|
 | `source_id` | UUID | Primary key |
 | `source_name` | VARCHAR | Canonical source identifier, e.g. `HKEX`, `MINGPAO`; unique |
-| `source_type` | ENUM | `RSS_FULL` / `RSS_CRAWLER` / `API` |
-| `priority` | ENUM | `P1` / `P2` / `P3`; controls crawl resource allocation |
 | `authority_weight` | FLOAT | Source authority score used by SAPI Rule Score; per-source value |
-| `rss_url` | TEXT | RSS feed URL; nullable |
-| `base_url` | TEXT | Site root URL for resolving relative paths; nullable |
-| `max_concurrent` | INTEGER | Max concurrent crawler coroutines; default 3 |
-| `request_interval_min_ms` | INTEGER | Min request interval (ms); default 500 |
-| `request_interval_max_ms` | INTEGER | Max request interval (ms); default 1000 |
-| `crawl_config` | JSONB | Source-specific config, e.g. CSS selectors, custom headers; `{}` until schema defined |
 | `is_active` | BOOLEAN | Whether this source is currently enabled |
 | `created_at` | TIMESTAMPTZ | Record creation time UTC |
 | `updated_at` | TIMESTAMPTZ | Last updated time UTC |
 
-> `priority` and `authority_weight` are independent fields. `priority` governs crawl ordering and resource allocation. `authority_weight` is the numeric score used in SAPI Rule Score computation and allows per-source fine-tuning independent of tier.
-
-> `crawl_config` schema is pending investigation. All records return `{}` in MVP.
+> Crawl logic (URL patterns, selectors, pagination) and crawl behaviour parameters (concurrency, request interval) are owned exclusively by SADI. They are not stored in `data_sources`.
 
 **MVP seed data:**
 
-| source_name | source_type | priority | authority_weight | is_active |
-|---|---|---|---|---|
-| `HKEX` | `RSS_FULL` | `P1` | 9.0 | true |
-| `MINGPAO` | `RSS_CRAWLER` | `P1` | 9.0 | true |
-| `AASTOCKS` | `RSS_CRAWLER` | `P2` | 6.0 | true |
-| `YAHOO_HK` | `RSS_CRAWLER` | `P2` | 6.0 | true |
+| source_name | authority_weight | is_active |
+|---|---|---|
+| `HKEX` | 9.0 | true |
+| `MINGPAO` | 9.0 | true |
+| `AASTOCKS` | 6.0 | true |
+| `YAHOO_HK` | 6.0 | true |
 
-> Initial `authority_weight` values follow P1=9.0, P2=6.0 defaults. To be validated against real data in Week 3-4 (PRD OQ-2).
+> Initial `authority_weight` values follow P1=9.0, P2=6.0 groupings. To be validated against real data in Week 3-4 (PRD OQ-2).
 
 ### 3.2 `GET /sources`
 
-Returns all `is_active = true` source records in full. Key design points:
-
-- No query parameters — returns all active sources; consumers filter fields locally
-- `crawl_config` always returns `{}` in MVP
-- Full API contract (request/response schema) defined in API specification document
+Returns all `is_active = true` source records. Consumed by SAPI for `authority_weight` lookup. Full API contract defined in API specification document.
 
 ### 3.3 Consumer Caching
 
-Each consumer fetches `GET /sources` and caches the result locally in Redis with TTL-based auto-refresh. On Admin API unreachable, consumers fall back to their existing Redis cache.
-
 | Consumer | Fields used | Redis key | Fallback |
 |---|---|---|---|
-| SADI | All fields | `source:config` (Hash keyed by `source_name`) | Use stale cache; log warning |
-| SAPI | `source_name`, `authority_weight` | `source:config` (Hash keyed by `source_name`) | Use default weights P1=9, P2=6, P3=4; log warning |
+| SAPI | `source_name`, `authority_weight` | `source:config` (Hash keyed by `source_name`) | Use default weights P1=9, P2=6; log warning |
 
 ---
 
@@ -432,7 +426,6 @@ HTTP response codes:
 | `DEFAULT_EXECUTION_TIMEOUT_S` | 1800 | Global job execution timeout (seconds) |
 | `SCHEDULER_LOOP_INTERVAL_S` | 60 | Scheduler main loop wake interval (seconds) |
 | `TRIGGER_GENERATION_TIME` | 00:00 UTC | Daily trigger generation time |
-| `FALLBACK_WINDOW_HOURS` | 24 | Crawl window start fallback when no previous execution exists |
 | `MAX_CONCURRENT_DISPATCHES` | 10 | `ThreadPoolTaskExecutor` max pool size for dispatch tasks |
 | `HANDLERS_PACKAGE` | `com.mwp.admin.handlers` | Package containing handler implementations |
 | `STREAM_CLAIM_TIMEOUT_MS` | 30000 | Pending message idle time before XAUTOCLAIM redelivery (ms) |
@@ -446,11 +439,10 @@ admin/
 │   ├── scheduler/
 │   │   ├── SchedulerLoop.java           # Main loop; startup recovery; trigger dispatch
 │   │   ├── JobExecutor.java             # dispatch(); dynamic handler loading; framework execution flow
-│   │   ├── TriggerGenerator.java        # MULTI_FIRE calculation; daily generation; cross-midnight logic
+│   │   ├── TriggerGenerator.java        # RECURRING calculation; daily generation
 │   │   └── JobHandler.java              # JobHandler interface; JobContext class
 │   ├── handlers/
-│   │   ├── MORNING_CRAWL.java           # class MORNING_CRAWL implements JobHandler
-│   │   └── PRE_OPEN_CRAWL.java          # class PRE_OPEN_CRAWL implements JobHandler
+│   │   └── CRAWL.java                   # class CRAWL implements JobHandler; reads source_name from job_params
 │   ├── stream/
 │   │   └── CrawlCompletedConsumer.java  # XREADGROUP consumer for stream:crawl_completed; XAUTOCLAIM; Dead Letter
 │   ├── api/
@@ -478,10 +470,10 @@ admin/
 | # | Question | Impact | Target |
 |---|---|---|---|
 | Q-1 | Validate `DEFAULT_EXECUTION_TIMEOUT_S = 1800s` against real crawl + pipeline completion time | Timeout calibration | Week 1 |
-| Q-2 | `POST /crawl` and `GET /sources` full API contracts defined in API specification document | CrawlHandler implementation | Next session |
-| Q-3 | `crawl_config` JSONB schema: define structure for CSS selectors, custom headers, and other source-specific crawl parameters | SADI crawl accuracy | Week 1 |
+| Q-2 | ~~`POST /crawl` and `GET /sources` full API contracts defined in API specification document~~ | ~~CrawlHandler implementation~~ | ✅ **Resolved** — see API Specification v0.2 |
+| Q-3 | ~~`crawl_config` JSONB schema: define structure for CSS selectors, custom headers, and other source-specific crawl parameters~~ | ~~SADI crawl accuracy~~ | ✅ **Resolved** — `crawl_config` abolished; crawl logic owned exclusively by SADI codebase |
 | Q-4 | Validate `authority_weight` initial values (P1=9.0, P2=6.0) against real data; per-source fine-tuning post-validation | SAPI Rule Score calibration | Week 3-4 |
 
 ---
 
-*— End of Document | Admin TAD v0.1 | Work in progress —*
+*— End of Document | Admin TAD v0.2 | Work in progress —*

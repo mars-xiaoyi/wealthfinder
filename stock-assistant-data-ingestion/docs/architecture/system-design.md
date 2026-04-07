@@ -1,14 +1,14 @@
 # Stock Assistant Data Ingestion (SADI)
-## Technical Architecture Document — v0.6
+## Technical Architecture Document — v0.8
 
 | Field | Detail |
 |---|---|
 | Service Name | Stock Assistant Data Ingestion (SADI) |
-| Document Version | TAD v0.6 |
+| Document Version | TAD v0.8 |
 | Parent System | HK Stock AI Research Assistant |
 | Service Responsibility | News data ingestion and cleaning |
 | Tech Stack | Python + asyncio + FastAPI |
-| Dependencies | PostgreSQL 16, Redis, MWP Admin Service (via API), Downstream parsing service (via Redis Streams + API) |
+| Dependencies | PostgreSQL 16, Redis, Downstream parsing service (via Redis Streams + API) |
 | Document Status | DRAFT — Pending team review |
 
 ---
@@ -22,9 +22,8 @@
 5. [Redis Stream Signal Specification](#5-redis-stream-signal-specification)
 6. [API](#6-api)
 7. [Database Retry Strategy](#7-database-retry-strategy)
-8. [Coroutine Health Management](#8-coroutine-health-management)
-9. [Deployment](#9-deployment)
-10. [Open Questions](#10-open-questions)
+8. [Deployment](#8-deployment)
+9. [Open Questions](#9-open-questions)
 
 ---
 
@@ -38,7 +37,7 @@ SADI is the data entry point of the HK Stock AI Research Assistant. It is respon
 
 | Layer | Input | Output | Out of Scope |
 |---|---|---|---|
-| Crawler | RSS feeds and page URLs from Admin Service source config | `raw_news` records (plain text body) + Redis Stream signal | Content analysis, classification, entity recognition |
+| Crawler | `source_name` from crawl trigger; per-source crawler implementation in code; per-source behaviour config (concurrency, interval) in SADI config file | `raw_news` records (plain text body) + Redis Stream signal | Content analysis, classification, entity recognition |
 | Cleaner | `raw_news` records with no corresponding entry in `cleaned_news` | `cleaned_news` records + Redis Stream signal to downstream | Business rules, scoring, NLP |
 
 ### 1.2 Tech Stack
@@ -52,7 +51,8 @@ SADI is the data entry point of the HK Stock AI Research Assistant. It is respon
 | RSS parsing | feedparser | De facto standard for RSS/Atom in Python; no viable alternative |
 | Content extraction | trafilatura | vs newspaper3k: actively maintained, lighter, higher body extraction accuracy |
 | HTML fallback parser | BeautifulSoup4 | CSS selector override when trafilatura extraction quality is insufficient |
-| PDF parsing | pdfplumber | vs PyPDF2: significantly better text extraction for complex layouts |
+| PDF parsing | pymupdf (fitz) | Primary PDF text extractor; handles standard text-layer PDFs and partial XFA support. pdfminer.six as fallback for complex layouts. Replaces pdfplumber |
+| Browser crawler | playwright (async) | Required for sources where TLS fingerprint detection blocks httpx; currently: MINGPAO |
 | Text normalisation | unicodedata (stdlib) | NFKC normalisation for fullwidth-to-halfwidth conversion; zero dependency |
 | Hash computation | hashlib (stdlib) | SHA-256 for title deduplication; zero dependency |
 | Database client | asyncpg | vs psycopg2: native asyncio driver |
@@ -66,46 +66,132 @@ SADI is the data entry point of the HK Stock AI Research Assistant. It is respon
 
 ### 2.1 MVP Data Sources
 
-| Source | Type | Language | Strategy | Priority |
-|---|---|---|---|---|
-| HKEx NEWSLINE | Official RSS | EN / ZH | RSS_FULL — RSS full text, no crawler required | P1 |
-| Ming Pao Finance | RSS + Web | Traditional Chinese | RSS_CRAWLER — RSS for URL discovery, Crawler for body | P1 |
-| AAStocks | Web | Traditional Chinese | RSS_CRAWLER — RSS for URL discovery, Crawler for body | P2 |
-| Yahoo Finance HK | RSS + Web | English | RSS_CRAWLER — RSS for URL discovery, Crawler for body | P2 |
+| Source | Language | Crawl Strategy |
+|---|---|---|
+| HKEx NEWSLINE | EN / ZH | `HKEXCrawler` — playwright daily batch pull via `titlesearch.xhtml`; LOAD MORE pagination; PDF direct fetch via httpx |
+| Ming Pao Finance | Traditional Chinese | `MingPaoCrawler` — feedparser RSS for URL discovery; playwright headless browser for article body (httpx blocked by TLS fingerprint) |
+| AAStocks | Traditional Chinese | `AAStocksCrawler` — httpx list page + CSS selector for URL discovery; httpx + CSS selector for article body |
+| Yahoo Finance HK | English | `YahooHKCrawler` — feedparser RSS with `url_prefix_filter` for URL discovery; httpx + trafilatura for article body |
 
-> **Note:** NewsAPI is reserved as a post-MVP data source. New sources are added via Admin Service configuration without code changes.
+> **Source strategy validation status:** All four sources fully validated as of probe v4 (2026-04-06). See Section 2.3 for per-source implementation details.
 >
-> **Excluded from MVP:** SCMP (paywalled), Bloomberg HK (no stable RSS, strong anti-crawl), Reuters Asia (unstable RSS endpoints — pending Week 1 validation).
+> **Note:** NewsAPI is reserved as a post-MVP data source. Adding a new source requires implementing a new Crawler class in SADI and adding a corresponding `scheduled_trigger` entry in Admin Service.
+>
+> **Excluded from MVP:** SCMP (paywalled), Bloomberg HK (no stable RSS, strong anti-crawl), Reuters Asia (unstable RSS endpoints).
 
-### 2.2 Source Configuration — Admin Service
+### 2.2 Source Configuration — Responsibility Split
 
-Data source configurations are managed by MWP Admin Service and shared across services. SADI fetches configuration via Admin API and caches it in Redis with TTL-based auto-refresh.
+Source configuration is split across two boundaries by nature of the data:
+
+| Config Category | Fields | Owner | Rationale |
+|---|---|---|---|
+| Scheduling | Crawl frequency, enabled/disabled per source | Admin Service `scheduled_triggers` table | Business decisions; managed by operators |
+| Crawl behaviour config | `max_concurrent`, `request_interval_min_ms`, `request_interval_max_ms` | SADI config file (per-source) | Runtime tuning parameters; no code change required; not business decisions |
+| Crawl logic | URL patterns, CSS selectors, pagination, parsers | SADI codebase (per-source Crawler class) | Tightly coupled to site structure; requires code change when sites change |
+
+**`source_name` validation:**
+
+SADI validates the `source_name` in each crawl request against its own set of implemented Crawler classes. If the `source_name` does not match a known Crawler class, the request is rejected with HTTP 400. SADI has no runtime dependency on Admin Service.
 
 ```
-Crawl execution requires source config:
-├── Redis key exists → read directly
-└── Redis key expired or missing
-    → fetch from Admin API
-    → write to Redis with TTL = SOURCE_CONFIG_TTL_S
-    → fallback if Admin API unreachable: use previous Redis cache; log warning
+Crawl triggered with source_name:
+├── source_name matches a known Crawler class → load per-source behaviour config → execute Crawler
+└── source_name unknown → reject with HTTP 400; log warning
 ```
 
-> **Note:** SADI does not own the `data_sources` table. Source configuration is the single responsibility of MWP Admin Service. SADI is a read-only consumer of this configuration.
+**SADI config file — per-source behaviour parameters:**
 
-The source config cached in Redis contains the fields required for crawl execution:
+```yaml
+sources:
+  HKEX:
+    max_concurrent: 1
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
+  MINGPAO:
+    max_concurrent: 3
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
+  AASTOCKS:
+    max_concurrent: 3
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
+  YAHOO_HK:
+    max_concurrent: 3
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
+```
 
-| Field | Description |
+> **HKEX note:** `max_concurrent = 1` because the HKEX crawl is a sequential batch operation (LOAD MORE pagination in a single playwright session); parallel execution is not applicable.
+
+### 2.3 Per-Source Implementation Guide
+
+This section documents the implementation details for each source crawler. It is intended for developers writing the Crawler class for each source. All times are stored as UTC in the database; all source timestamps are HKT (UTC+8) unless otherwise noted.
+
+---
+
+**HKEX (`HKEXCrawler`)**
+
+| Item | Detail |
 |---|---|
-| source_name | Source identifier, e.g. HKEX, MINGPAO, AASTOCKS, YAHOO_HK |
-| source_type | RSS_FULL / RSS_CRAWLER / API — determines crawl strategy branch |
-| rss_url | RSS feed URL |
-| base_url | Site root URL, used for resolving relative paths |
-| is_active | Whether the source is currently enabled |
-| priority | P1 / P2 / P3 |
-| max_concurrent | Max concurrent crawler coroutines for this source; default 3 |
-| request_interval_min_ms | Minimum request interval (ms); default 500 |
-| request_interval_max_ms | Maximum request interval (ms); default 1000 |
-| crawl_config | Source-specific extension config, e.g. CSS selectors, custom headers |
+| Entry point | `https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=EN&category=0&market=SEHK&searchType=0&stockId=&from={date}&to={date}&title=` |
+| Date format | URL parameter: `YYYYMMDD` (e.g. `20260402`). Note: the form's hidden input uses `YYYY-MM-DD` and visible input uses `YYYY/MM/DD` — these are managed by the page's JSF state and must not be manually constructed. Only the URL parameter needs to be set by the crawler. |
+| Browser required | Yes — LOAD MORE triggers a JSF full-page POST that maintains `javax.faces.ViewState` session state; httpx cannot replicate this |
+| playwright `waitUntil` | `domcontentloaded` |
+| Pagination | Click `a.component-loadmore__link` repeatedly. Termination: read text from `.component-loadmore-leftPart__container` (e.g. `"Showing 1471 of 1471 records"`); extract both integers with regex; stop when equal |
+| Estimated crawl time | ~14 LOAD MORE clicks × ~3,174ms/click ≈ 44s for a full trading day (~1,471 records) |
+| Row extraction | `table tbody tr` — extract per row: PDF link (`td > div.doc-link > a[href$='.pdf']`), headline (`td > div.headline`), release time (`td.release-time`), stock code (`td.stock-short-code`) |
+| PDF fetch | httpx direct GET; no session cookie required (`credentials: 'omit'` returns HTTP 200). PDF links are fully public |
+| PDF base URL | `https://www1.hkexnews.hk` — prepend to relative PDF hrefs |
+| PDF parsing | pymupdf (fitz) primary → pdfminer.six fallback for complex layouts. Two sub-types: standard text-layer PDF (most announcements) and XFA form PDF (e.g. Next Day Disclosure Returns). Encrypted or scanned PDFs: log error, discard |
+| `published_at` | Raw format: `DD/MM/YYYY HH:mm` (e.g. `02/04/2026 22:59`). Timezone: HKT (UTC+8). Convert to UTC before storing |
+| Deduplication | PDF URL (`source_url`). `newsId` is not available in search result HTML |
+| Stock code | Extracted from search result table (`td.stock-short-code`). Stored in `raw_news.extra_metadata` as `{"stock_code": "00700"}`. `body` is not modified |
+| playwright instance | Shared with MINGPAO (same `Browser` process, separate `BrowserContext`). Context is created fresh per crawl execution and closed on completion |
+
+---
+
+**MINGPAO (`MingPaoCrawler`)**
+
+| Item | Detail |
+|---|---|
+| RSS URL | `https://news.mingpao.com/rss/pns/s00004.xml` |
+| RSS auth | None — bare httpx GET works |
+| RSS entry count | ~26 entries per poll |
+| RSS `published_at` | RFC 822 format with explicit timezone (e.g. `Mon, 06 Apr 2026 01:03:00 +0800`). feedparser parses this into `time.struct_time`; convert explicitly to UTC before storing |
+| Article fetch | playwright headless browser required — httpx returns HTTP 403 due to TLS fingerprint detection. No paywall, no login required |
+| playwright `waitUntil` | `domcontentloaded` (~2,226ms). Do not use `networkidle` (~5,871ms) — unnecessary overhead; `<article>` is available at domContentLoaded |
+| Article body selector | `article` — captures full article body (~950 chars average) |
+| `published_at` fallback | If RSS `published` field is missing, extract from article page `<time>` element innerText using regex `\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}:\d{2}[AP]M` |
+| playwright instance | Shared with HKEX (same `Browser` process, separate `BrowserContext`). Multiple page workers within MINGPAO share the same `BrowserContext`. Context is created fresh per crawl execution and closed on completion |
+
+---
+
+**AASTOCKS (`AAStocksCrawler`)**
+
+| Item | Detail |
+|---|---|
+| List page URL | `https://www.aastocks.com/tc/stocks/news/aafn/latest-news` |
+| Language requirement | `/tc/` URL path prefix is required for Traditional Chinese. `?totc=1` query parameter is ineffective |
+| List page entry count | 9 articles per fetch. No pagination, no LOAD MORE. Coverage depends on crawl frequency configured in Admin Service `scheduled_triggers` |
+| URL discovery selector | `a[href*='/aafn-con/NOW.']` — extracts article URLs from list page |
+| Article fetch | httpx (no browser required; no anti-crawl measures detected) |
+| Article body selector | `[class*='newscon']` — matches class `newscontent5 fLevel3`; captures article body (~361 chars average) |
+| `published_at` | Extracted from visible page text via regex `\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}` (e.g. `2026/04/06 01:27`). Not available in meta tags. Timezone: HKT (UTC+8). Convert to UTC before storing |
+
+---
+
+**YAHOO_HK (`YahooHKCrawler`)**
+
+| Item | Detail |
+|---|---|
+| RSS URL | `https://hk.finance.yahoo.com/news/rssindex` |
+| RSS auth | None |
+| RSS entry count | 5 entries per poll |
+| URL filter | RSS feed mixes real article URLs with `promotions.yahoo.com` ad URLs. Filter: retain only entries whose URL contains `hk.finance.yahoo.com/news/` |
+| Article fetch | httpx (no browser required) |
+| Article body extraction | trafilatura auto-extraction (~739 chars average). No CSS selector override required |
+| `published_at` | From RSS `published` field. RFC 822 format; feedparser parses automatically. Convert to UTC before storing |
+| Coverage gap detection | RSS returns only 5 entries per poll. If the oldest entry in a poll has `published_at` newer than the previous crawl's execution time, log a warning: potential entries may have been missed. Crawl frequency is managed by Admin Service `scheduled_triggers` |
 
 ---
 
@@ -113,35 +199,41 @@ The source config cached in Redis contains the fields required for crawl executi
 
 ### 3.1 Concurrency Model
 
-The crawler layer is fully async, driven by Python's asyncio event loop. All four sources start concurrently as independent tasks and do not interfere with each other.
+The crawler layer is fully async, driven by Python's asyncio event loop. Each crawl execution targets a single source, specified by `source_name` in the trigger request. The Crawler class for that source is instantiated and executed as an asyncio Task.
 
 ```mermaid
 flowchart TD
-    A([Crawl Triggered]) --> B[Load source config from Admin API / Redis cache]
-    B --> C[Start 4 Concurrent Source Tasks]
+    A([POST /crawl source_name=X]) --> B{source_name known?}
+    B -->|No| E([HTTP 400])
+    B -->|Yes| C[Load per-source behaviour config from SADI config file]
+    C --> D[Instantiate Crawler class for source_name]
 
-    C --> S1[HKEx NEWSLINE]
-    C --> S2[Ming Pao Finance]
-    C --> S3[AAStocks]
-    C --> S4[Yahoo Finance HK]
+    D --> S1{source_name}
 
-    S1 -->|RSS_FULL| R1[fetch_rss]
-    R1 --> DB1[save to raw_news]
+    S1 -->|HKEX| TS1[HKEXCrawler]
+    S1 -->|MINGPAO| S2[MingPaoCrawler]
+    S1 -->|AASTOCKS| S3[AAStocksCrawler]
+    S1 -->|YAHOO_HK| S4[YahooHKCrawler]
 
-    S2 -->|RSS_CRAWLER| R2[fetch_rss]
-    S3 -->|RSS_CRAWLER| R3[fetch_rss]
-    S4 -->|RSS_CRAWLER| R4[fetch_rss]
+    TS1 --> LM1[playwright: titlesearch.xhtml by date]
+    LM1 --> LM2[Click LOAD MORE until Showing N of N]
+    LM2 --> P1[Extract PDF links from table rows]
+    P1 --> PF1[httpx: fetch each PDF]
+    PF1 --> DB1[save to raw_news]
 
+    S2 --> R2[feedparser RSS]
     R2 --> Q2[URL Queue]
-    R3 --> Q3[URL Queue]
-    R4 --> Q4[URL Queue]
+    Q2 --> B2[playwright browser crawlers]
+    B2 --> DB2[save to raw_news]
 
-    Q2 --> C2[Concurrent Crawlers]
-    Q3 --> C3[Concurrent Crawlers]
-    Q4 --> C4[Concurrent Crawlers]
-
-    C2 --> DB2[save to raw_news]
+    S3 --> L3[httpx: list page CSS selector]
+    L3 --> Q3[URL Queue]
+    Q3 --> C3[httpx + CSS selector crawlers]
     C3 --> DB2
+
+    S4 --> R4[feedparser RSS + url_prefix_filter]
+    R4 --> Q4[URL Queue]
+    Q4 --> C4[httpx + trafilatura crawlers]
     C4 --> DB2
 
     DB1 --> N[Write to stream:raw_news_inserted]
@@ -150,30 +242,43 @@ flowchart TD
 
 ### 3.2 Pipeline Model
 
-RSS_CRAWLER sources use a producer-consumer pipeline. RSS fetching (producer) and page crawling (consumer) run concurrently per source — crawling begins as soon as the first URLs are available, without waiting for other sources.
+The crawler layer uses a strategy pattern. Each source has a dedicated Crawler class; `source_name` is the dispatch key. There is no generic `source_type` field — routing is determined at code level, not by runtime config.
+
+| Crawler Class | Source | List Discovery | Body Fetch |
+|---|---|---|---|
+| `HKEXCrawler` | HKEX | playwright: `titlesearch.xhtml` by date; LOAD MORE until all records shown (~14 clicks, ~44s) | httpx + pymupdf (PDF direct link, no auth required) |
+| `YahooHKCrawler` | YAHOO_HK | feedparser RSS + `url_prefix_filter` | httpx + trafilatura |
+| `MingPaoCrawler` | MINGPAO | feedparser RSS | playwright headless browser + `article` CSS selector |
+| `AAStocksCrawler` | AASTOCKS | httpx list page + CSS selector `a[href*='/aafn-con/NOW.']` | httpx + CSS selector `[class*='newscon']` |
+
+For strategies with a URL discovery phase, a producer-consumer pipeline is used. URL discovery (producer) and page crawling (consumer) run concurrently — crawling begins as soon as the first URLs are available.
 
 | Role | Implementation | Responsibility |
 |---|---|---|
-| Producer | `fetch_rss(source)` | Parses RSS feed, filters articles outside the time window, enqueues URLs |
-| Consumer | `crawl_worker(queue, source)` | Dequeues URLs, fetches pages, extracts body, writes to `raw_news` |
+| Producer | `fetch_rss(source)` or `fetch_list_page(source)` | Discovers article URLs; enqueues URLs |
+| Consumer | `crawl_worker(queue, source)` | Dequeues URLs; fetches pages; extracts body; writes to `raw_news` |
 | Queue | `asyncio.Queue` (one per source) | Decouples producer and consumer throughput; enforces per-source concurrency limit |
+
+> **BROWSER_CRAWLER note:** playwright browser instances are initialised once per crawl execution and shared across workers for the same source. Each instance uses a fresh browser context (no cookie persistence between executions) to avoid session state accumulation.
 
 ### 3.3 Content Format Handling
 
 After fetching a page, the crawler determines the parsing path based on the HTTP response `Content-Type` header. URL suffix is not used — it is unreliable for dynamically generated URLs (e.g. HKEx announcement links).
 
-| Content-Type | Parser | Output |
-|---|---|---|
-| text/html | trafilatura (auto-extraction); CSS selector override from `crawl_config` if quality is insufficient | Plain text body |
-| application/pdf | pdfplumber — extracts PDF text layer; encrypted or scanned PDFs are logged as errors | Plain text body |
-| Other | Skip | Logged to `crawl_error_log` with `error_code = UNSUPPORTED_CONTENT_TYPE` |
+| Content-Type | Source | Parser | Notes |
+|---|---|---|---|
+| `application/pdf` | HKEX | pymupdf (fitz) primary → pdfminer.six fallback | Two PDF sub-types exist: standard text-layer PDF (most announcements) and XFA form PDF (e.g. Next Day Disclosure Returns generated by Adobe Experience Manager). pymupdf handles both; pdfminer.six is fallback for complex layouts. Encrypted or scanned PDFs are logged as errors |
+| `text/html` via playwright | MINGPAO | playwright + `article` CSS selector | httpx blocked by TLS fingerprint detection; playwright headless browser required. Body ~950 chars in Traditional Chinese. No paywall |
+| `text/html` via httpx | AASTOCKS | CSS selector `[class*='newscon']` | Matches class `newscontent5 fLevel3`. Traditional Chinese requires `/tc/` URL prefix |
+| `text/html` via httpx | YAHOO_HK | trafilatura (auto-extraction) | No CSS override needed; trafilatura extraction quality sufficient (~739 chars) |
+| Other | All | Skip | Logged to `crawl_error_log` with `error_code = UNSUPPORTED_CONTENT_TYPE` |
 
 ### 3.4 Crawl Parameters
 
 | Parameter | Default | Description | Config Location |
 |---|---|---|---|
-| max_concurrent | 3 | Max concurrent crawler coroutines per source | Source config via Admin API |
-| request_interval | 500–1000ms random | Random jitter between requests to mimic human behaviour | Source config via Admin API |
+| max_concurrent | 3 (HKEX: 1) | Max concurrent crawler coroutines per source | SADI config file (per-source) |
+| request_interval | 500–1000ms random | Random jitter between requests to mimic human behaviour | SADI config file (per-source) |
 | CRAWL_REQUEST_TIMEOUT_S | 10s | Single page fetch timeout | Environment variable |
 | CRAWL_MAX_RETRY | 3 | Max retry attempts with exponential backoff | Environment variable |
 
@@ -200,7 +305,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | HTML structure changed (empty body) | Log to `crawl_error_log`; requires manual intervention |
 | Unsupported Content-Type | Log to `crawl_error_log`; discard URL |
 
-> **Note:** `crawl_error_log` is a pure audit log and does not drive any retry business logic. Failed URLs within the time window will be re-discovered naturally in the next crawl execution via RSS.
+> **Note:** `crawl_error_log` is a pure audit log and does not drive any retry business logic. For RSS-based sources (MINGPAO, YAHOO_HK), failed URLs within the time window will be re-discovered naturally in the next crawl execution. For non-RSS sources (HKEX, AASTOCKS), failed URLs within the same day's batch will not be automatically retried — manual intervention or next-day re-crawl is required.
 
 **Retry mechanism:**
 - Retries execute within the same coroutine; no database state required
@@ -210,11 +315,10 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 
 **Crawl-scoped coroutine error handling:**
 
-`rss_fetcher` and `crawl_worker` run for the duration of a single crawl execution and are not managed by Watchdog. On exception:
+`rss_fetcher` and `crawl_worker` run for the duration of a single crawl execution. On exception:
 - Exception is captured at the execution level via `asyncio.gather()`
 - Failure is logged to application log and `crawl_error_log`
-- Other source Tasks are unaffected and continue running
-- Unprocessed URLs in the Queue are discarded; they will be re-discovered naturally in the next crawl execution via RSS
+- Unprocessed URLs in the Queue are discarded; for RSS-based sources they will be re-discovered naturally in the next crawl execution
 
 ### 3.6 Data Model
 
@@ -223,13 +327,14 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | Field | Type | Description |
 |---|---|---|
 | raw_id | UUID | Primary key |
-| source_name | VARCHAR(50) | Source identifier from Admin Service config, e.g. HKEX, MINGPAO |
+| source_name | VARCHAR(50) | Source identifier from crawl trigger, e.g. HKEX, MINGPAO |
 | source_url | TEXT | Original article URL; unique index |
 | title | TEXT | Original title; never modified |
 | body | TEXT | Plain text body guaranteed by crawler layer; never modified |
 | published_at | TIMESTAMPTZ | Article publish time UTC; nullable — consuming layers fall back to `created_at` when null |
 | created_at | TIMESTAMPTZ | Record creation time UTC |
 | raw_hash | VARCHAR(64) | SHA-256(normalised_title); unique index for cross-source deduplication |
+| extra_metadata | JSONB | Source-specific structured metadata; e.g. `{"stock_code": "00700"}` for HKEX. Nullable |
 | is_deleted | BOOLEAN | Soft delete flag set by cleaning layer for rejected records; default false |
 | deleted_reason | VARCHAR(50) | EMPTY_FIELD / DUPLICATE_TITLE / BODY_TOO_SHORT; required when `is_deleted = true` |
 
@@ -238,8 +343,8 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | Field | Type | Description |
 |---|---|---|
 | error_id | UUID | Primary key |
-| execution_id | UUID | Execution context ID |
-| source_name | VARCHAR(50) | Source identifier from Admin Service config, e.g. HKEX, MINGPAO |
+| execution_id | UUID | Correlation ID from `POST /crawl` request body; nullable if crawl was triggered outside Admin Service context |
+| source_name | VARCHAR(50) | Source identifier from crawl trigger, e.g. HKEX, MINGPAO |
 | url | TEXT | Failed article URL; null indicates RSS-level failure |
 | error_type | VARCHAR(50) | NETWORK / PARSE / STORAGE |
 | error_code | VARCHAR(50) | Specific error code, e.g. HTTP_403, PDF_ENCRYPTED, TIMEOUT |
@@ -253,19 +358,25 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 - `raw_hash` — unique index; `INSERT ON CONFLICT DO NOTHING`
 - `is_deleted` — index
 - `created_at` — index
+- `extra_metadata` — GIN index for JSONB key lookup
 
 ### 3.7 Crawler Data Flow
 
 | Stage | Action | Output |
 |---|---|---|
-| Crawl triggered | Read time window from request; load `is_active = true` source configs from Redis / Admin API | Time window + source config list |
-| Concurrent start | Create one `asyncio.Task` per source; run all via `asyncio.gather()` | 4 concurrent tasks |
-| RSS fetch | Parse feed; filter articles outside time window | Article list (title, url, published_at) |
-| RSS_FULL save | Write directly to `raw_news`; write to `stream:raw_news_inserted` | `raw_news` record + Stream message |
-| RSS_CRAWLER enqueue | Enqueue article URLs into per-source `asyncio.Queue`; crawler workers consume concurrently | URLs in queue |
-| Crawler fetch | httpx request; Content-Type detection; trafilatura or pdfplumber parsing | Plain text body |
+| Crawl triggered | Validate `source_name` against known Crawler classes (HTTP 400 if unknown); load per-source behaviour config from SADI config file; instantiate Crawler class | Crawler instance ready |
+| **HKEX** — titlesearch batch | playwright GET `titlesearch.xhtml?from={date}&to={date}` (date format: `YYYYMMDD`); click LOAD MORE until regex extracts equal integers from `.component-loadmore-leftPart__container` (≤15 clicks, ~44s total); extract all rows: PDF link, headline, stock code, release time | Full PDF link list for the day |
+| **HKEX** — PDF fetch | httpx GET each PDF URL (direct link, no auth, no cookie); pymupdf → pdfminer.six fallback; dedup by PDF URL; write stock code to `extra_metadata.stock_code` | Plain text body + metadata |
+| **MINGPAO** — RSS fetch | feedparser GET RSS (bare request, no auth); returns ~26 entries; `published_at` from RFC 822 `published` field converted to UTC | Article list (title, url, published_at) |
+| **MINGPAO** — Browser crawl | playwright headless browser GET article URL (`waitUntil='domcontentloaded'`); extract with `article` CSS selector; fallback `published_at` from `<time>` innerText if RSS field missing | Plain text body |
+| **AASTOCKS** — List fetch | httpx GET list page (`/tc/` prefix); CSS selector `a[href*='/aafn-con/NOW.']` extracts 9 article URLs | Article URL list |
+| **AASTOCKS** — Article crawl | httpx GET article URL (`/tc/` prefix); CSS selector `[class*='newscon']` extracts body; regex extracts `published_at` from visible text (format: `YYYY/MM/DD HH:mm`); convert HKT→UTC | Plain text body |
+| **YAHOO_HK** — RSS fetch | feedparser GET RSS; apply `url_prefix_filter` (`hk.finance.yahoo.com/news/`) to discard ad URLs; returns ≤5 real entries; `published_at` from RSS `published` field converted to UTC | Article list (title, url, published_at) |
+| **YAHOO_HK** — Coverage check | If oldest entry `published_at` > previous crawl execution time: log warning (potential gap) | Warning log entry |
+| **YAHOO_HK** — Article crawl | httpx GET article URL; trafilatura auto-extraction | Plain text body |
 | Save | Write to `raw_news` (`INSERT ON CONFLICT DO NOTHING`); write to `stream:raw_news_inserted` | `raw_news` record + Stream message |
-| Error handling | Retryable: exponential backoff up to max retries. Non-retryable: write to `crawl_error_log` immediately | `crawl_error_log` record |
+| Signal completion | After all records for this execution written: write to `stream:crawl_completed` with `execution_id` (from request) + `status=SUCCESS` | Admin CrawlHandler unblocks |
+| Error handling | Retryable: exponential backoff up to max retries. Non-retryable: write to `crawl_error_log` immediately; on fatal source-level failure write `stream:crawl_completed` with `status=FAILED` | `crawl_error_log` record |
 
 ---
 
@@ -356,8 +467,13 @@ Redis Streams are used as the inter-service messaging mechanism. Each stream mes
 |---|---|---|---|---|
 | `stream:raw_news_inserted` | Crawler layer | `sadi-cleaner` | `raw_id` | Cleaning layer input trigger |
 | `stream:raw_news_cleaned` | Cleaning layer | `sapi-nlp` | `cleaned_id` | Downstream parsing service input trigger |
+| `stream:crawl_completed` | Crawler layer | `admin-scheduler` | `execution_id`, `status` (SUCCESS / FAILED), `error_detail` | Admin Service CrawlHandler completion signal |
 
-> **Note:** Both connections may point to the same Redis instance in MVP. `stream:raw_news_cleaned` is consumed by SAPI; SADI only produces to this stream and has no dependency on its consumers.
+> `stream:crawl_completed` is written by the Crawler layer immediately after all `raw_news` records for the execution have been written — before the Cleaning layer processes them. `execution_id` is echoed from the `POST /crawl` request body. `error_detail` is null on SUCCESS.
+
+> `stream:raw_news_cleaned` is consumed by SAPI; SADI only produces to this stream and has no dependency on its consumers.
+
+> All three streams may point to the same Redis instance in MVP.
 
 ---
 
@@ -369,10 +485,19 @@ SADI exposes a minimal REST API via FastAPI. The API serves two purposes: extern
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/crawl` | Trigger a crawl execution; accepts optional time window parameter |
+| POST | `/crawl` | Trigger a crawl execution; `source_name` is required |
 | GET | `/health` | Service health check |
 | GET | `/cleaned_news/{cleaned_id}` | Return a single cleaned article record by ID |
 | POST | `/cleaned_news/batch` | Return multiple cleaned article records by ID list; consumed by downstream parsing service |
+
+**`POST /crawl` request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| source_name | STRING | Yes | Source identifier: `HKEX`, `MINGPAO`, `AASTOCKS`, `YAHOO_HK`. Must match a known Crawler class in SADI |
+| date | STRING | No | Target date for HKEX batch pull, format `YYYYMMDD`. Defaults to current date if omitted. Ignored for non-HKEX sources |
+
+> **Note:** `source_name` is mandatory. Requests without `source_name` or with an unknown `source_name` are rejected with HTTP 400. Each scheduled trigger in Admin Service maps to one `POST /crawl` call with a specific `source_name`; scheduling frequency is configured per-source in Admin Service `scheduled_triggers`.
 
 ### 6.2 `GET /health` Response
 
@@ -381,8 +506,6 @@ SADI exposes a minimal REST API via FastAPI. The API serves two purposes: extern
 | status | healthy / degraded / unhealthy | Overall service status |
 | database | ok / error | Database connectivity |
 | redis | ok / error | Redis connectivity |
-| coroutines.clean_worker | ok / error | clean_worker coroutine status |
-| coroutines.stream_handler | ok / error | stream_handler coroutine status |
 
 HTTP response codes:
 - All healthy → `200 healthy`
@@ -423,45 +546,9 @@ Backoff formula: `wait = DB_RETRY_BASE_WAIT_MS × 2^(attempt - 1)`
 
 ---
 
-## 8. Coroutine Health Management
+## 8. Deployment
 
-### 8.1 Managed Coroutines
-
-Watchdog manages only long-running coroutines. Crawl-scoped coroutines (`rss_fetcher`, `crawl_worker`) are handled at the execution level — see Section 3.5.
-
-| Coroutine | Responsibility |
-|---|---|
-| `clean_worker` | Dequeues raw_ids from internal queue; executes cleaning steps |
-| `stream_handler` | Consumes `stream:raw_news_inserted`; enqueues raw_ids to internal queue; writes to `stream:raw_news_cleaned` |
-
-### 8.2 Watchdog Mechanism
-
-Each coroutine is monitored for two failure modes:
-
-**Unexpected exit** — Coroutine terminates due to an unhandled exception. Watchdog detects the exit and immediately restarts the coroutine.
-
-**Deadlock / hang** — Coroutine becomes unresponsive without raising an exception. Each coroutine has a configurable timeout threshold. If exceeded, Watchdog forcibly cancels and restarts the coroutine.
-
-### 8.3 Restart Strategy
-
-- Restart interval uses exponential backoff
-- If consecutive restarts exceed `WATCHDOG_MAX_RESTART`, the coroutine is not restarted
-- A critical alert is written to the application log
-- Manual intervention is required to resume
-
-### 8.4 Watchdog Configuration
-
-| Parameter | Default | Description |
-|---|---|---|
-| WATCHDOG_CLEAN_WORKER_TIMEOUT_S | 30 | Hang detection threshold for `clean_worker` (seconds) |
-| WATCHDOG_STREAM_HANDLER_TIMEOUT_S | 30 | Hang detection threshold for `stream_handler` (seconds) |
-| WATCHDOG_MAX_RESTART | 5 | Max consecutive restarts before halting and awaiting manual intervention |
-
----
-
-## 9. Deployment
-
-### 9.1 Container Configuration
+### 8.1 Container Configuration
 
 | Service | Image | Notes |
 |---|---|---|
@@ -469,7 +556,7 @@ Each coroutine is monitored for two failure modes:
 | postgres | postgres:16-alpine | Primary database; persistent volume mounted |
 | redis | redis:7-alpine | Redis Streams for inter-service messaging; shared with SAPI |
 
-### 9.2 Environment Variables
+### 8.2 Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -478,36 +565,34 @@ Each coroutine is monitored for two failure modes:
 | DB_MAX_RETRY | 3 | Max database operation retry attempts |
 | DB_RETRY_BASE_WAIT_MS | 100 | Database retry base wait time (ms) |
 | REDIS_URL | — | Redis connection string; required |
-| MWP_ADMIN_API_URL | — | Admin Service API endpoint for source configuration; required |
-| SOURCE_CONFIG_TTL_S | 3600 | Source configuration Redis cache TTL (seconds) |
 | CRAWL_MAX_RETRY | 3 | Max crawler retry attempts |
 | CRAWL_RETRY_BASE_WAIT_MS | 500 | Crawler retry base wait time (ms) |
 | CRAWL_REQUEST_TIMEOUT_S | 10 | Single page fetch timeout (seconds) |
 | CLEAN_WORKER_CONCURRENCY | 5 | Number of concurrent cleaning workers |
 | CLEAN_BODY_MIN_LENGTH | 50 | Minimum body length after cleaning (characters) |
 | STREAM_CLAIM_TIMEOUT_MS | 30000 | Message pending time before XAUTOCLAIM redelivery (ms) |
-| WATCHDOG_CLEAN_WORKER_TIMEOUT_S | 30 | `clean_worker` hang detection threshold (seconds) |
-| WATCHDOG_STREAM_HANDLER_TIMEOUT_S | 30 | `stream_handler` hang detection threshold (seconds) |
-| WATCHDOG_MAX_RESTART | 5 | Max consecutive coroutine restarts before halting |
 
-### 9.3 Project Structure
+### 8.3 Project Structure
 
 ```
 sadi/
 ├── app/
 │   ├── crawler/
-│   │   ├── feed_fetcher.py          # RSS parsing, fetch_rss()
-│   │   ├── page_crawler.py          # HTTP fetch, crawl_with_retry()
-│   │   ├── html_parser.py           # trafilatura extraction + BS4 fallback
-│   │   ├── pdf_parser.py            # pdfplumber text extraction
-│   │   └── crawler_service.py       # process_source(), concurrency orchestration
+│   │   ├── base_crawler.py          # Abstract base class for all Crawler implementations
+│   │   ├── hkex_crawler.py          # HKEXCrawler — playwright batch, PDF fetch
+│   │   ├── mingpao_crawler.py       # MingPaoCrawler — RSS + playwright browser
+│   │   ├── aastocks_crawler.py      # AAStocksCrawler — list page + httpx
+│   │   ├── yahoo_hk_crawler.py      # YahooHKCrawler — RSS + trafilatura
+│   │   ├── browser_manager.py       # playwright Browser/BrowserContext lifecycle (shared HKEX + MINGPAO)
+│   │   ├── feed_fetcher.py          # RSS parsing via feedparser
+│   │   ├── page_crawler.py          # HTTP fetch via httpx, crawl_with_retry()
+│   │   ├── html_parser.py           # trafilatura extraction + BS4/CSS selector fallback
+│   │   └── pdf_parser.py            # pymupdf primary + pdfminer.six fallback
 │   ├── cleaner/
 │   │   ├── cleaning_service.py      # Cleaning layer main service, queue management
 │   │   ├── stream_handler.py        # Redis Streams consumer/producer
 │   │   ├── text_normaliser.py       # Fullwidth conversion, whitespace cleaning
 │   │   └── dedup_service.py         # Title hash deduplication logic
-│   ├── watchdog/
-│   │   └── watchdog.py              # Coroutine health monitoring and restart
 │   ├── api/
 │   │   ├── routes/
 │   │   │   ├── crawl.py             # POST /crawl
@@ -518,11 +603,11 @@ sadi/
 │   │   └── connection.py            # asyncpg connection pool
 │   ├── redis/
 │   │   └── stream_client.py         # Redis Streams client abstraction
-│   ├── admin/
-│   │   └── source_config.py         # Admin API client + Redis cache for source config
 │   ├── models/                      # Data model definitions
-│   ├── config.py                    # Environment variable loading
+│   ├── config.py                    # Environment variable loading + SADI config file loader
 │   └── main.py                      # Service entry point
+├── config/
+│   └── sources.yaml                 # Per-source behaviour config: max_concurrent, request_interval
 ├── alembic/
 │   └── versions/
 │       └── 001_create_tables.py     # Schema creation
@@ -533,14 +618,18 @@ sadi/
 
 ---
 
-## 10. Open Questions
+## 9. Open Questions
 
-| # | Question | Impact | Target |
+| # | Question | Impact | Status |
 |---|---|---|---|
-| Q-1 | Validate RSS URLs and CSS selectors for Ming Pao Finance and AAStocks via real crawl test | HTML parsing accuracy | Week 1 |
-| Q-2 | Validate whether `CLEAN_BODY_MIN_LENGTH = 50` is appropriate based on real data | BODY_TOO_SHORT rejection rate | Week 2 |
-| Q-3 | Assess anti-crawl measures per source: User-Agent, Cookie, or proxy requirements | Crawl success rate | Week 1 |
+| Q-1 | ~~Validate RSS URLs and CSS selectors for Ming Pao Finance and AAStocks via real crawl test~~ | ~~HTML parsing accuracy~~ | ✅ **Resolved** — see Section 2.3 for confirmed selectors per source |
+| Q-2 | Validate whether `CLEAN_BODY_MIN_LENGTH = 50` is appropriate based on real data | BODY_TOO_SHORT rejection rate | **Pending** — Week 2; baseline: MINGPAO ~950 chars, AASTOCKS ~361 chars, YAHOO_HK ~739 chars, HKEX PDF varies |
+| Q-3 | ~~Assess anti-crawl measures per source: User-Agent, Cookie, or proxy requirements~~ | ~~Crawl success rate~~ | ✅ **Resolved** — MINGPAO requires playwright (TLS fingerprint); HKEX/AASTOCKS/YAHOO_HK no anti-crawl detected |
+| Q-4 | ~~Validate playwright async performance: can one browser instance handle MINGPAO's crawl volume within the scheduler time window?~~ | ~~MINGPAO crawl throughput~~ | ✅ **Resolved** — domContentLoaded = 2,226ms; 3 concurrent contexts cover 26 RSS entries in ~19s. Use `waitUntil='domcontentloaded'`; do not use `networkidle` (5,871ms, unnecessary). Per-source config updated accordingly |
+| Q-5 | ~~Confirm HKEX `homecat` JSON polling frequency: do endpoints update in real-time or on a fixed schedule?~~ | ~~HKEX data freshness~~ | ✅ **Resolved** — homecat insufficient for full coverage; replaced by `titlesearch.xhtml` daily batch pull |
+| Q-6 | ~~HKEX full coverage strategy~~ | ~~HKEX data completeness~~ | ✅ **Resolved** — daily `titlesearch.xhtml` batch pull adopted; see Section 2.3 |
+| Q-7 | ~~HKEX stock_code field ownership~~ | ~~Data model; SAPI EntityAnalysisSkill input format~~ | ✅ **Resolved** — `raw_news.extra_metadata JSONB` field added; stock_code stored as `{"stock_code": "00700"}`. `body` remains unmodified |
 
 ---
 
-*— End of Document | SADI TAD v0.6 | Pending team review before status change to APPROVED —*
+*— End of Document | SADI TAD v0.8 | Pending team review before status change to APPROVED —*

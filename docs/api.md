@@ -1,9 +1,9 @@
 # HK Stock AI Research Assistant
-## API Specification — v0.1
+## API Specification — v0.2
 
 | Field | Detail |
 |---|---|
-| Document Version | v0.1 |
+| Document Version | v0.2 |
 | Parent System | HK Stock AI Research Assistant |
 | Document Status | DRAFT — Work in progress |
 | API Versioning | All endpoints prefixed with `/v1` |
@@ -28,7 +28,7 @@ All services return a unified error response body on non-2xx responses:
 
 ```json
 {
-    "error_code": "SADI-4001",
+    "error_code": "COMMON-4001",
     "message": "Human-readable description of the error",
     "detail": {}
 }
@@ -81,8 +81,8 @@ When `COMMON-4001` is returned, `detail` contains a list of field-level errors:
     "detail": {
         "errors": [
             {
-                "field": "window_start",
-                "issue": "must be a valid ISO 8601 datetime"
+                "field": "source_name",
+                "issue": "must be one of: HKEX, MINGPAO, AASTOCKS, YAHOO_HK"
             },
             {
                 "field": "k",
@@ -120,11 +120,7 @@ Returns service health status.
 {
     "status": "healthy",
     "database": "ok",
-    "redis": "ok",
-    "coroutines": {
-        "clean_worker": "ok",
-        "stream_handler": "ok"
-    }
+    "redis": "ok"
 }
 ```
 
@@ -133,8 +129,6 @@ Returns service health status.
 | `status` | `healthy` / `degraded` / `unhealthy` | Overall service status |
 | `database` | `ok` / `error` | PostgreSQL connectivity |
 | `redis` | `ok` / `error` | Redis connectivity |
-| `coroutines.clean_worker` | `ok` / `error` | `clean_worker` coroutine status |
-| `coroutines.stream_handler` | `ok` / `error` | `stream_handler` coroutine status |
 
 **HTTP status codes:**
 - All components healthy → `200` with `status: healthy`
@@ -145,27 +139,23 @@ Returns service health status.
 
 ### 2.3 `POST /v1/crawl`
 
-Triggers a crawl execution asynchronously. SADI begins crawling immediately and signals completion via `stream:crawl_completed` when done.
+Triggers a crawl execution for a single source asynchronously. SADI begins crawling immediately and signals completion via `stream:crawl_completed` when done.
 
 **Request body:**
 
 ```json
 {
     "execution_id": "550e8400-e29b-41d4-a716-446655440000",
-    "window_start": "2025-01-14T14:00:00Z",
-    "window_stop": "2025-01-15T00:00:00Z"
+    "source_name": "HKEX",
+    "date": "20260406"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `execution_id` | UUID | Yes | Correlation ID from Admin Scheduler; echoed back in `stream:crawl_completed` |
-| `window_start` | ISO 8601 datetime (UTC) | Yes | Start of crawl time window; inclusive |
-| `window_stop` | ISO 8601 datetime (UTC) | Yes | End of crawl time window; inclusive |
-
-**Constraints:**
-- `window_start` must be before `window_stop`
-- `window_stop` must not be in the future
+| `source_name` | String | Yes | Source identifier: `HKEX`, `MINGPAO`, `AASTOCKS`, `YAHOO_HK`. Must match a known Crawler class in SADI |
+| `date` | String (`YYYYMMDD`) | No | Target date for HKEX batch pull. Defaults to current date if omitted. Ignored for non-HKEX sources |
 
 **Response `HTTP 202 Accepted`:**
 
@@ -186,8 +176,7 @@ Triggers a crawl execution asynchronously. SADI begins crawling immediately and 
 | Error Code | HTTP Status | Trigger |
 |---|---|---|
 | `COMMON-4000` | 400 | Malformed JSON body |
-| `COMMON-4001` | 400 | Validation failed: missing fields, invalid datetime format, `window_start >= window_stop`, `window_stop` in future |
-| `SADI-4001` | 409 | A crawl with this `execution_id` is already running |
+| `COMMON-4001` | 400 | Validation failed: `execution_id` missing, `source_name` missing or unknown, `date` invalid format |
 | `COMMON-5001` | 503 | Database or Redis unavailable |
 
 ---
@@ -502,7 +491,7 @@ Returns service health status.
 
 ### 4.3 `GET /v1/sources`
 
-Returns all currently active source configurations. Consumed by SADI and SAPI on startup and TTL-based cache refresh.
+Returns all currently active source configurations. Consumed by SAPI for `authority_weight` lookup on startup and TTL-based cache refresh.
 
 **Response `HTTP 200`:**
 
@@ -512,15 +501,7 @@ Returns all currently active source configurations. Consumed by SADI and SAPI on
         {
             "source_id": "550e8400-e29b-41d4-a716-446655440000",
             "source_name": "HKEX",
-            "source_type": "RSS_FULL",
-            "priority": "P1",
             "authority_weight": 9.0,
-            "rss_url": "https://www.hkexnews.hk/rss/listedco_rss.xhtml",
-            "base_url": "https://www.hkexnews.hk",
-            "max_concurrent": 3,
-            "request_interval_min_ms": 500,
-            "request_interval_max_ms": 1000,
-            "crawl_config": {},
             "is_active": true,
             "updated_at": "2025-01-15T00:00:00Z"
         }
@@ -532,15 +513,7 @@ Returns all currently active source configurations. Consumed by SADI and SAPI on
 |---|---|---|
 | `source_id` | UUID | Primary key |
 | `source_name` | String | Canonical source identifier, e.g. `HKEX`, `MINGPAO` |
-| `source_type` | String | `RSS_FULL` / `RSS_CRAWLER` / `API` |
-| `priority` | String | `P1` / `P2` / `P3` |
 | `authority_weight` | Float | Source authority score for SAPI Rule Score |
-| `rss_url` | String / null | RSS feed URL |
-| `base_url` | String / null | Site root URL for resolving relative paths |
-| `max_concurrent` | Integer | Max concurrent crawler coroutines |
-| `request_interval_min_ms` | Integer | Min request interval (ms) |
-| `request_interval_max_ms` | Integer | Max request interval (ms) |
-| `crawl_config` | Object | Source-specific crawl config; always `{}` in MVP |
 | `is_active` | Boolean | Always `true` — only active sources are returned |
 | `updated_at` | ISO 8601 datetime (UTC) | Last configuration update time |
 
@@ -556,9 +529,7 @@ Returns all currently active source configurations. Consumed by SADI and SAPI on
 
 ### SADI Error Codes
 
-| Error Code | HTTP Status | Description |
-|---|---|---|
-| `SADI-4001` | 409 | Duplicate `execution_id` — a crawl with this ID is already running |
+No service-specific error codes defined in MVP.
 
 ### SAPI Error Codes
 
@@ -584,4 +555,4 @@ No service-specific error codes defined in MVP.
 
 ---
 
-*— End of Document | API Specification v0.1 | Work in progress —*
+*— End of Document | API Specification v0.2 | Work in progress —*
