@@ -317,7 +317,8 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 
 `rss_fetcher` and `crawl_worker` run for the duration of a single crawl execution. On exception:
 - Exception is captured at the execution level via `asyncio.gather()`
-- Failure is logged to application log and `crawl_error_log`
+- RSS-level failure (e.g. RSS fetch fails after all retries): logged to application log only — no `crawl_error_log` entry. There is no URL to skip in future executions; the feed will be retried fresh on the next crawl cycle.
+- URL-level failure (per-article): logged to `crawl_error_log`. `PageCrawler` checks this table before fetching to skip known-bad URLs in future executions.
 - Unprocessed URLs in the Queue are discarded; for RSS-based sources they will be re-discovered naturally in the next crawl execution
 
 ### 3.6 Data Model
@@ -345,7 +346,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | error_id | UUID | Primary key |
 | execution_id | UUID | Correlation ID from `POST /crawl` request body; nullable if crawl was triggered outside Admin Service context |
 | source_name | VARCHAR(50) | Source identifier from crawl trigger, e.g. HKEX, MINGPAO |
-| url | TEXT | Failed article URL; null indicates RSS-level failure |
+| url | TEXT | Failed article URL; always non-null — only URL-level failures are logged here |
 | error_type | VARCHAR(50) | NETWORK / PARSE / STORAGE |
 | error_code | VARCHAR(50) | Specific error code, e.g. HTTP_403, PDF_ENCRYPTED, TIMEOUT |
 | attempt_count | INTEGER | Total attempts made |

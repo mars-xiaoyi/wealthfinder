@@ -260,19 +260,13 @@ Fetches multiple cleaned article records by ID list. Called by SAPI NLP Layer fo
             "source_url": "https://finance.mingpao.com/...",
             "created_at": "2025-01-15T00:05:00Z"
         }
-    ],
-    "not_found": [
-        "770e8400-e29b-41d4-a716-446655440002"
     ]
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `results` | Array | Successfully found records; same schema as `GET /cleaned_news/{cleaned_id}` response |
-| `not_found` | Array of UUID | IDs from request that were not found; empty array if all found |
-
-> Partial success is a valid `HTTP 200` response. Callers must check `not_found` to detect missing records.
+| `results` | Array | Found records; same schema as `GET /cleaned_news/{cleaned_id}` response. IDs not found are silently omitted |
 
 **Error codes:**
 
