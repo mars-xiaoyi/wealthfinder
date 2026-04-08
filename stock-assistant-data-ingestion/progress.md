@@ -1,6 +1,6 @@
 # SADI — Implementation Progress
 
-Last updated: 2026-04-07
+Last updated: 2026-04-08
 
 ---
 
@@ -18,8 +18,8 @@ Last updated: 2026-04-07
 
 ## Phase 2 — Infrastructure Clients
 
-- [ ] `app/db/connection.py` — `DatabaseClient` (`execute`, `fetch_one`, `fetch_all`, `close`), `create_db_client()`
-- [ ] `app/redis/stream_client.py` — `StreamClient` + stream name constants, `create_stream_client()`
+- [x] `app/db/connection.py` — `DatabaseClient` (`execute`, `fetch_one`, `fetch_all`, `close`), `create_db_client()`
+- [x] `app/redis/stream_client.py` — `StreamClient` + stream name constants, `create_stream_client()`
 
 ## Phase 3 — Data Models & API Contracts
 
