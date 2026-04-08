@@ -13,8 +13,8 @@ Last updated: 2026-04-07
 
 ## Phase 1 — Foundation
 
-- [ ] `app/config.py` — `AppConfig`, `load_config()`, `get_config()` singleton
-- [ ] `config/sources.yaml` — per-source crawl behaviour config
+- [x] `app/config.py` — `AppConfig`, `load_config()`, `get_config()` singleton
+- [x] `config/sources.yaml` — per-source crawl behaviour config
 
 ## Phase 2 — Infrastructure Clients
 

@@ -1,0 +1,5 @@
+# Config
+pyyaml==6.0.3
+
+# Testing
+pytest==9.0.3

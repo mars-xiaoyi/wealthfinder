@@ -124,10 +124,10 @@ sadi/
 │   │   ├── raw_news.py              # RawNews dataclass
 │   │   ├── cleaned_news.py          # CleanedNews dataclass
 │   │   └── crawl_error_log.py       # CrawlErrorLog dataclass
-│   ├── config.py                    # App config: env vars + sources.yaml loader
+│   ├── config.py                    # App config: env vars + crawl_sources.yaml loader
 │   └── main.py                      # Service entry point (lifespan)
 ├── config/
-│   └── sources.yaml                 # Per-source behaviour config
+│   └── crawl_sources.yaml           # Per-source behaviour config
 ├── alembic/
 │   └── versions/
 │       └── 001_create_tables.py
@@ -304,13 +304,13 @@ class ErrorResponse(BaseModel):
 
 ### Purpose
 
-Loads all environment variables and the `config/sources.yaml` file into a single `AppConfig` object. All other modules import config from here — never use `os.environ` directly in business code.
+Loads all environment variables and the `config/crawl_sources.yaml` file into a single `AppConfig` object. All other modules import config from here — never use `os.environ` directly in business code.
 
-### Class: `SourceConfig`
+### Class: `CrawlSourceConfig`
 
 ```python
 @dataclass
-class SourceConfig:
+class CrawlSourceConfig:
     max_concurrent: int               # Max parallel crawler coroutines for this source
     request_interval_min_ms: int      # Minimum random jitter between requests (ms)
     request_interval_max_ms: int      # Maximum random jitter between requests (ms)
@@ -326,7 +326,7 @@ class CrawlConfig:
     max_retry: int                # Max retry attempts per URL fetch (env: CRAWL_MAX_RETRY)
     retry_base_wait_ms: int       # Base wait for exponential backoff (env: CRAWL_RETRY_BASE_WAIT_MS)
     request_timeout_s: int        # Single page fetch timeout in seconds (env: CRAWL_REQUEST_TIMEOUT_S)
-    sources: dict[str, SourceConfig]  # Per-source behaviour; loaded from sources.yaml
+    crawl_sources: dict[str, CrawlSourceConfig]  # Per-source behaviour; loaded from crawl_sources.yaml
 ```
 
 ### Class: `CleanConfig`
@@ -370,14 +370,14 @@ class AppConfig:
 ### Function: `load_config() -> AppConfig`
 
 ```
-Purpose : Read environment variables and sources.yaml; construct and return a validated AppConfig.
+Purpose : Read environment variables and crawl_sources.yaml; construct and return a validated AppConfig.
 Called  : Once at service startup in app/main.py lifespan.
 Raises  : ValueError if a required env var is missing.
 ```
 
 Implementation notes:
 - Use `os.environ` here only (not in business code)
-- Load `sources.yaml` with `yaml.safe_load()`; construct one `SourceConfig` per source entry
+- Load `crawl_sources.yaml` with `yaml.safe_load()`; construct one `CrawlSourceConfig` per source entry
 - Build `DatabaseConfig`, `CrawlConfig`, and `CleanConfig` from their respective env var groups, then compose into `AppConfig`
 - Store the loaded `AppConfig` as a module-level singleton so routes can import it
 
@@ -387,10 +387,10 @@ from app.config import get_config
 config = get_config()
 ```
 
-### `config/sources.yaml`
+### `config/crawl_sources.yaml`
 
 ```yaml
-sources:
+crawl_sources:
   HKEX:
     max_concurrent: 5           # Controls parallel PDF fetch workers (Phase 2); playwright pagination is always sequential
     request_interval_min_ms: 500
@@ -830,14 +830,14 @@ All four crawler classes extend `BaseCrawler`. Crawlers are responsible only for
 from abc import ABC, abstractmethod
 from typing import Optional
 from datetime import date
-from app.config import SourceConfig
+from app.config import CrawlSourceConfig
 from app.crawler.page_crawler import PageCrawler
 from app.crawler.browser_manager import BrowserManager
 
 class BaseCrawler(ABC):
     def __init__(
         self,
-        source_config: SourceConfig,
+        source_config: CrawlSourceConfig,
         page_crawler: PageCrawler,
         crawl_date: Optional[date] = None,   # only HKEXCrawler uses this
     ):
@@ -884,7 +884,7 @@ class CrawlService:
         db: DatabaseClient,
         stream_client: StreamClient,
         page_crawler: PageCrawler,
-        config: CrawlConfig,      # needed to look up per-source SourceConfig
+        config: CrawlConfig,      # needed to look up per-source CrawlSourceConfig
     ): ...
 ```
 
@@ -1123,7 +1123,7 @@ The HKEX crawl has two distinct phases:
 - **Phase 1 — Link collection** (sequential): A single playwright session loads `titlesearch.xhtml` and clicks LOAD MORE until all rows are visible. This is inherently sequential — one browser session, one page.
 - **Phase 2 — PDF fetching** (parallel): Each PDF is an independent httpx GET with no shared session state. Fetched concurrently using `asyncio.Semaphore(source_config.max_concurrent)`.
 
-> `max_concurrent` in the HKEX `SourceConfig` controls Phase 2 PDF fetch concurrency only. Phase 1 playwright pagination is always sequential by nature and ignores this value.
+> `max_concurrent` in the HKEX `CrawlSourceConfig` controls Phase 2 PDF fetch concurrency only. Phase 1 playwright pagination is always sequential by nature and ignores this value.
 
 #### Method: `run() -> CrawlResult`
 
@@ -1282,7 +1282,7 @@ Returns : UTC datetime (convert from HKT by subtracting 8 hours), or None if not
 class YahooHKCrawler(BaseCrawler):
     def __init__(
         self,
-        source_config: SourceConfig,
+        source_config: CrawlSourceConfig,
         page_crawler: PageCrawler,
         crawl_date: Optional[date],
         db: DatabaseClient,         # extra — for _get_previous_crawl_time()

@@ -21,7 +21,14 @@ When updating an existing implementation, state clearly:
 
 Then wait for confirmation before making edits.
 
-### 3. Write unit tests for every function created or updated
+### 3. Add dependencies to requirements.txt only when first needed
+When a phase introduces a new dependency, add it to `requirements.txt` as part of the plan presented before coding — not speculatively ahead of time. Install with:
+```bash
+uv pip install -r requirements.txt
+```
+Never install packages ad-hoc without updating `requirements.txt` first.
+
+### 4. Write unit tests for every function created or updated
 After implementing or modifying any function, write a corresponding unit test. Tests live in `tests/` mirroring the `app/` structure (e.g. `app/cleaner/text_normaliser.py` → `tests/cleaner/test_text_normaliser.py`). Tests must cover:
 - The happy path
 - Key failure/edge cases documented in `docs/implementation.md`

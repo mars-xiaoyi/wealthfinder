@@ -1,0 +1,17 @@
+crawl_sources:
+  HKEX:
+    max_concurrent: 5           # Controls parallel PDF fetch workers; playwright pagination is always sequential
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
+  MINGPAO:
+    max_concurrent: 3
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
+  AASTOCKS:
+    max_concurrent: 3
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
+  YAHOO_HK:
+    max_concurrent: 3
+    request_interval_min_ms: 500
+    request_interval_max_ms: 1000
