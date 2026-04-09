@@ -1,6 +1,6 @@
 # SADI — Implementation Progress
 
-Last updated: 2026-04-08
+Last updated: 2026-04-09
 
 ---
 
@@ -23,15 +23,15 @@ Last updated: 2026-04-08
 
 ## Phase 3 — Data Models & API Contracts
 
-- [ ] `app/models/raw_news.py`
-- [ ] `app/models/cleaned_news.py`
-- [ ] `app/models/crawl_error_log.py`
-- [ ] `app/api/schemas.py` — Pydantic schemas (`CrawlRequest`, `CrawlResponse`, `CleanedNewsRecord`, `BatchRequest`, `BatchResponse`, `HealthResponse`, `ErrorResponse`)
-- [ ] `app/api/dependencies.py` — `get_db`, `get_crawl_service`, `get_stream_client`, `get_config`
+- [x] `app/models/raw_news.py`
+- [x] `app/models/cleaned_news.py`
+- [x] `app/models/crawl_error_log.py`
+- [x] `app/api/schemas.py` — Pydantic schemas (`CrawlRequest`, `CrawlResponse`, `CleanedNewsRecord`, `BatchRequest`, `BatchResponse`, `HealthResponse`, `ErrorResponse`)
+- [x] `app/api/dependencies.py` — `get_db`, `get_crawl_service`, `get_stream_client`, `get_config`
 
 ## Phase 4 — Health Route
 
-- [ ] `app/api/routes/health.py` — `GET /v1/health`
+- [x] `app/api/routes/health.py` — `GET /v1/health`
 
 ## Phase 5 — Crawler Utilities
 

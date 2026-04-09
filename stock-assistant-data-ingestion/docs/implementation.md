@@ -197,7 +197,7 @@ from typing import Optional
 @dataclass
 class CrawlErrorLog:
     error_id: UUID              # Primary key; generate with uuid.uuid4()
-    execution_id: Optional[UUID]  # Correlation ID from POST /crawl; null if crawl triggered outside Admin context
+    execution_id: Optional[str]  # Correlation ID from POST /crawl; null if crawl triggered outside Admin context
     source_name: str            # e.g. "HKEX"
     url: str                    # Failed article URL; always present — only URL-level failures are logged here
     error_type: str             # "NETWORK" / "PARSE" / "STORAGE"
@@ -211,15 +211,15 @@ class CrawlErrorLog:
 These are the request/response shapes for the FastAPI routes. Pydantic validates incoming JSON automatically.
 
 ```python
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from uuid import UUID
-from typing import Optional, List
+from typing import List, Optional, Union
 from datetime import datetime, date
 from enum import Enum
 
 # ── Enums ────────────────────────────────────────────────────────────────────
 
-class SourceName(str, Enum):
+class CrawlSourceName(str, Enum):
     """
     All known source identifiers. Adding a new source requires:
     1. Adding a new member here.
@@ -234,40 +234,32 @@ class SourceName(str, Enum):
 class CrawlStatus(str, Enum):
     ACCEPTED = "accepted"
 
+class HealthStatus(str, Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+
+class ComponentStatus(str, Enum):
+    OK = "ok"
+    ERROR = "error"
+
 # ── POST /v1/crawl ──────────────────────────────────────────────────────────
 
 class CrawlRequest(BaseModel):
-    execution_id: UUID
-    source_name: SourceName          # Enum — invalid values rejected automatically by Pydantic
-    date: Optional[date] = None      # Parsed from "YYYYMMDD" string in request body; only used by HKEX
-
-    @field_validator("date", mode="before")
-    @classmethod
-    def parse_yyyymmdd(cls, v) -> Optional[date]:
-        """
-        Accept the API wire format "YYYYMMDD" (e.g. "20260406") and convert to a date object.
-        Pydantic's default date parser expects ISO 8601 ("2026-04-06"); this validator handles
-        the project-specific format defined in the API spec.
-        """
-        if v is None:
-            return None
-        if isinstance(v, str):
-            try:
-                return datetime.strptime(v, "%Y%m%d").date()
-            except ValueError:
-                raise ValueError("must be format YYYYMMDD, e.g. 20260406")
-        return v  # already a date object (e.g. in tests)
+    execution_id: str
+    source_name: CrawlSourceName          # Enum — invalid values rejected automatically by Pydantic
+    crawl_date: Optional[date] = Field(default=None, alias="date")  # ISO 8601 "YYYY-MM-DD"; only used by HKEX
 
 class CrawlResponse(BaseModel):
-    execution_id: UUID
+    execution_id: str
     status: CrawlStatus = CrawlStatus.ACCEPTED
 
 # ── GET /v1/health ────────────────────────────────────────────────────────────
 
 class HealthResponse(BaseModel):
-    status: str         # "healthy" / "degraded" / "unhealthy"
-    database: str       # "ok" / "error"
-    redis: str          # "ok" / "error"
+    status: HealthStatus
+    database: ComponentStatus
+    redis: ComponentStatus
 
 # ── GET /v1/cleaned_news/{cleaned_id} and POST /v1/cleaned_news/batch ─────────
 
@@ -281,21 +273,18 @@ class CleanedNewsRecord(BaseModel):
     source_url: str                     # From raw_news
     created_at: datetime                # cleaned_news.created_at
 
-class BatchRequest(BaseModel):
+class CleanedNewsBatchRequest(BaseModel):
     cleaned_ids: List[UUID] = Field(..., min_length=1, max_length=50)
 
-class BatchResponse(BaseModel):
+class CleanedNewsBatchResponse(BaseModel):
     results: List[CleanedNewsRecord]   # IDs not found are silently omitted from this list
 
 # ── Error Response (used by all routes) ──────────────────────────────────────
 
-class ErrorDetail(BaseModel):
-    errors: List[dict]   # e.g. [{"field": "source_name", "issue": "..."}]
-
 class ErrorResponse(BaseModel):
     error_code: str
     message: str
-    detail: dict = {}
+    detail: Union[str, dict] = {}  # Free format: string for simple context, dict for structured errors
 ```
 
 ---
@@ -686,7 +675,7 @@ def create_app() -> FastAPI:
 
 ```mermaid
 flowchart TD
-    A([POST /v1/crawl]) --> B[Pydantic validates CrawlRequest\nSourceName enum rejects unknown source_name]
+    A([POST /v1/crawl]) --> B[Pydantic validates CrawlRequest\nCrawlSourceName enum rejects unknown source_name]
     B -->|Validation error| BE([HTTP 400 COMMON-4001])
     B -->|Valid| C{Check DB + Redis connectivity}
     C -->|Unavailable| CE([HTTP 503 COMMON-5001])
@@ -711,7 +700,7 @@ Implementation notes:
 - Use `asyncio.create_task()` to fire `crawl_service.execute(...)` in the background
 - Do NOT `await` the task — return HTTP 202 immediately
 - Attach an `add_done_callback` to the task to log any unhandled exceptions that escape `CrawlService`
-- `source_name` validation is handled by Pydantic (`SourceName` enum) before the handler is called — no manual registry lookup needed here
+- `source_name` validation is handled by Pydantic (`CrawlSourceName` enum) before the handler is called — no manual registry lookup needed here
 - `CrawlService` is injected via `Depends(get_crawl_service)` from `app/api/dependencies.py`
 
 ### 7.3 `app/api/routes/cleaned_news.py`
@@ -742,13 +731,13 @@ JOIN raw_news rn ON cn.raw_id = rn.raw_id
 WHERE cn.cleaned_id = $1
 ```
 
-#### Handler: `post_cleaned_news_batch(request: BatchRequest) -> BatchResponse`
+#### Handler: `post_cleaned_news_batch(request: CleanedNewsBatchRequest) -> CleanedNewsBatchResponse`
 
 ```
 Purpose : Fetch multiple cleaned articles by ID list. IDs not found are silently
           omitted from the results array — no error is raised for missing IDs.
 Params  : request.cleaned_ids — list of 1–50 UUIDs (validated by Pydantic)
-Returns : HTTP 200 BatchResponse with results array (only found records)
+Returns : HTTP 200 CleanedNewsBatchResponse with results array (only found records)
 Errors  : HTTP 400 COMMON-4001 if validation fails
           HTTP 503 COMMON-5001 if DB unavailable
 ```
@@ -871,10 +860,10 @@ Orchestrates the full crawl execution: selects the crawler, runs it, saves resul
 
 ```python
 class CrawlService:
-    CRAWLER_REGISTRY: dict[SourceName, type[BaseCrawler]] = {
-        SourceName.HKEX:     HKEXCrawler,
-        SourceName.MINGPAO:  MingPaoCrawler,
-        SourceName.AASTOCKS: AAStocksCrawler,
+    CRAWLER_REGISTRY: dict[CrawlSourceName, type[BaseCrawler]] = {
+        CrawlSourceName.HKEX:     HKEXCrawler,
+        CrawlSourceName.MINGPAO:  MingPaoCrawler,
+        CrawlSourceName.AASTOCKS: AAStocksCrawler,
         # YahooHKCrawler is NOT in the registry — it needs extra constructor args.
         # Use _create_crawler() which handles this case explicitly.
     }
@@ -900,11 +889,11 @@ Purpose : Instantiate the correct crawler for the given source.
 ```python
 def _create_crawler(
     self,
-    source_name: SourceName,
+    source_name: CrawlSourceName,
     crawl_date: Optional[date],
 ) -> BaseCrawler:
     source_config = self._config.sources[source_name.value]
-    if source_name == SourceName.YAHOO_HK:
+    if source_name == CrawlSourceName.YAHOO_HK:
         return YahooHKCrawler(source_config, self._page_crawler, crawl_date, self._db)
     crawler_cls = self.CRAWLER_REGISTRY[source_name]
     return crawler_cls(source_config, self._page_crawler, crawl_date)
@@ -916,8 +905,8 @@ def _create_crawler(
 Purpose : Run one full crawl execution end-to-end.
           Called as a background asyncio.Task from POST /v1/crawl.
           Never raises — all outcomes are signalled via stream:crawl_completed.
-Params  : execution_id — UUID echoed from POST /crawl request; used in stream signals
-          source_name  — SourceName enum value
+Params  : execution_id — str echoed from POST /crawl request; used in stream signals
+          source_name  — CrawlSourceName enum value
           crawl_date   — date for HKEX batch pull; None for all other sources
 ```
 
@@ -1759,7 +1748,7 @@ CREATE INDEX idx_cleaned_news_raw_id ON cleaned_news (raw_id);
 ```sql
 CREATE TABLE crawl_error_log (
     error_id        UUID PRIMARY KEY,
-    execution_id    UUID,
+    execution_id    VARCHAR(100),
     source_name     VARCHAR(50) NOT NULL,
     url             TEXT NOT NULL,
     error_type      VARCHAR(50) NOT NULL,

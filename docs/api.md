@@ -38,7 +38,7 @@ All services return a unified error response body on non-2xx responses:
 |---|---|---|
 | `error_code` | String | Structured error code; format `{SERVICE}-{CODE}` |
 | `message` | String | Human-readable error description |
-| `detail` | Object | Optional additional context (e.g. field validation failures); empty object `{}` if not applicable |
+| `detail` | String or Object | Optional additional context; a string for simple messages, an object for structured data (e.g. field validation failures); empty object `{}` if not applicable |
 
 ### 1.2 Error Code Format
 
@@ -147,15 +147,15 @@ Triggers a crawl execution for a single source asynchronously. SADI begins crawl
 {
     "execution_id": "550e8400-e29b-41d4-a716-446655440000",
     "source_name": "HKEX",
-    "date": "20260406"
+    "date": "2026-04-06"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `execution_id` | UUID | Yes | Correlation ID from Admin Scheduler; echoed back in `stream:crawl_completed` |
+| `execution_id` | String | Yes | Correlation ID from Admin Scheduler; echoed back in `stream:crawl_completed` |
 | `source_name` | String | Yes | Source identifier: `HKEX`, `MINGPAO`, `AASTOCKS`, `YAHOO_HK`. Must match a known Crawler class in SADI |
-| `date` | String (`YYYYMMDD`) | No | Target date for HKEX batch pull. Defaults to current date if omitted. Ignored for non-HKEX sources |
+| `date` | String (`YYYY-MM-DD`) | No | ISO 8601 date for HKEX batch pull. Defaults to current date if omitted. Ignored for non-HKEX sources |
 
 **Response `HTTP 202 Accepted`:**
 
@@ -168,7 +168,7 @@ Triggers a crawl execution for a single source asynchronously. SADI begins crawl
 
 | Field | Type | Description |
 |---|---|---|
-| `execution_id` | UUID | Echoed from request; used to match `stream:crawl_completed` signal |
+| `execution_id` | String | Echoed from request; used to match `stream:crawl_completed` signal |
 | `status` | String | Always `accepted` on HTTP 202 |
 
 **Error codes:**
