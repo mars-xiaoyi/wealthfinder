@@ -5,21 +5,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.crawler.source_name import CrawlSourceName
+
 
 # -- Enums --------------------------------------------------------------------
-
-class CrawlSourceName(str, Enum):
-    """
-    All known source identifiers. Adding a new source requires:
-    1. Adding a new member here.
-    2. Implementing the corresponding Crawler class in app/crawler/.
-    3. Registering it in CRAWLER_REGISTRY in app/api/routes/crawl.py.
-    """
-    HKEX = "HKEX"
-    MINGPAO = "MINGPAO"
-    AASTOCKS = "AASTOCKS"
-    YAHOO_HK = "YAHOO_HK"
-
 
 class CrawlStatus(str, Enum):
     ACCEPTED = "accepted"

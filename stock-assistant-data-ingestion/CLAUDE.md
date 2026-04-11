@@ -29,7 +29,7 @@ uv pip install -r requirements.txt
 Never install packages ad-hoc without updating `requirements.txt` first.
 
 ### 4. Write unit tests for every function created or updated
-After implementing or modifying any function, write a corresponding unit test. Tests live in `tests/` mirroring the `app/` structure (e.g. `app/cleaner/text_normaliser.py` → `tests/cleaner/test_text_normaliser.py`). Tests must cover:
+After implementing or modifying any function, write a corresponding unit test. Tests live in `tests/` mirroring the `app/` structure (e.g. `app/common/text_utils.py` → `tests/common/test_text_utils.py`). Tests must cover:
 - The happy path
 - Key failure/edge cases documented in `docs/implementation.md`
 
@@ -39,13 +39,12 @@ After implementing or modifying any function, write a corresponding unit test. T
 
 These are the non-obvious invariants most likely to be violated. Full rationale is in the impl doc.
 
-- **Crawlers never touch DB or Redis.** Fetching and parsing only. `CrawlService.execute()` handles all persistence and stream signals after `crawler.run()` returns.
+- **Crawlers never *write* to DB or Redis.** Fetching and parsing only. `CrawlService.execute()` handles all persistence and stream signals after `crawler.run()` returns. Crawlers may *read* from DB for the `crawl_error_log` pre-check (and `YahooHKCrawler` additionally reads previous crawl times for coverage gap detection); the `db` handle is on `BaseCrawler` so all four crawlers share one constructor signature.
 - **ACK only after both writes succeed.** `StreamHandler.ack()` must be called only after the `cleaned_news` row is committed AND `stream:raw_news_cleaned` is published. On DB failure: raise, leave unACKed, let `reclaim_loop` redeliver.
 - **`stream:crawl_completed` is always published** — SUCCESS or FAILED, even if zero records were saved.
 - **No magic stream name strings.** All stream names are constants in `app/redis/stream_client.py`. Import from there everywhere.
 - **`os.environ` only in `app/config.py`.** All other modules use `get_config()`.
 - **Routes never access `app.state` directly.** Use `Depends()` helpers from `app/api/dependencies.py`.
-- **`YahooHKCrawler` is the only crawler that takes `db` in its constructor.** `CrawlService._create_crawler()` handles this — callers never construct it directly.
 
 ---
 

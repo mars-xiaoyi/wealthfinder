@@ -94,20 +94,23 @@ sadi/
 │   ├── crawler/
 │   │   ├── crawl_service.py         # CrawlService: orchestration, DB save, stream signals
 │   │   ├── base_crawler.py          # Abstract base class; defines CrawlResult dataclass
+│   │   ├── source_name.py           # CrawlSourceName enum (crawler domain; imported by api/schemas.py)
 │   │   ├── hkex_crawler.py          # HKEXCrawler
 │   │   ├── mingpao_crawler.py       # MingPaoCrawler
 │   │   ├── aastocks_crawler.py      # AAStocksCrawler
 │   │   ├── yahoo_hk_crawler.py      # YahooHKCrawler
 │   │   ├── browser_manager.py       # Shared playwright Browser/BrowserContext lifecycle
 │   │   ├── feed_fetcher.py          # RSS feed parsing via feedparser
+│   │   ├── exceptions.py             # Shared crawler exceptions (CrawlSkippedError, CrawlNetworkError, CrawlBlockedError, CrawlFatalError)
 │   │   ├── page_crawler.py          # HTTP fetch with retry logic
-│   │   ├── html_parser.py           # trafilatura + BS4 CSS selector fallback
+│   │   ├── html_parser.py           # Auto-extraction + BS4 CSS selector fallback
 │   │   └── pdf_parser.py            # pymupdf primary + pdfminer.six fallback
 │   ├── cleaner/
 │   │   ├── cleaning_service.py      # Cleaning layer: queue management + 7-step pipeline
 │   │   ├── stream_handler.py        # Redis Streams consumer + producer
-│   │   ├── text_normaliser.py       # NFKC normalisation, whitespace cleaning
-│   │   └── dedup_service.py         # SHA-256 title hash deduplication
+│   │   └── dedup_service.py         # is_duplicate() — cross-source raw_hash lookup
+│   ├── common/
+│   │   └── text_utils.py            # normalise() + compute_hash() — pure text tools shared by crawl & clean layers
 │   ├── api/
 │   │   ├── routes/
 │   │   │   ├── crawl.py             # POST /v1/crawl
@@ -162,7 +165,7 @@ class RawNews:
     published_at: Optional[datetime]    # UTC; nullable if source doesn't provide it
     created_at: datetime                # UTC; set to now() on insert
     raw_hash: str                       # SHA-256 of normalised title (unique index in DB)
-    extra_metadata: Optional[dict]      # e.g. {"stock_code": "00700"} for HKEX; null for others
+    extra_metadata: Optional[dict]      # e.g. {"stock_code": ["00700"]} for HKEX (list — one row may list multiple short codes); null for others
     is_deleted: bool = False            # Soft delete flag set by cleaning layer
     deleted_reason: Optional[str] = None  # "EMPTY_FIELD" / "DUPLICATE_TITLE" / "BODY_TOO_SHORT"
 ```
@@ -210,6 +213,8 @@ class CrawlErrorLog:
 
 These are the request/response shapes for the FastAPI routes. Pydantic validates incoming JSON automatically.
 
+`CrawlSourceName` lives in the crawler domain (`app/crawler/source_name.py`), not in `app/api/schemas.py` — the API layer imports it from the crawler layer so the dependency direction stays API → domain. See §8.x for its definition.
+
 ```python
 from pydantic import BaseModel, Field
 from uuid import UUID
@@ -217,19 +222,9 @@ from typing import List, Optional, Union
 from datetime import datetime, date
 from enum import Enum
 
-# ── Enums ────────────────────────────────────────────────────────────────────
+from app.crawler.source_name import CrawlSourceName   # enum lives in the crawler domain
 
-class CrawlSourceName(str, Enum):
-    """
-    All known source identifiers. Adding a new source requires:
-    1. Adding a new member here.
-    2. Implementing the corresponding Crawler class in app/crawler/.
-    3. Registering it in CRAWLER_REGISTRY in app/api/routes/crawl.py.
-    """
-    HKEX      = "HKEX"
-    MINGPAO   = "MINGPAO"
-    AASTOCKS  = "AASTOCKS"
-    YAHOO_HK  = "YAHOO_HK"
+# ── Enums ────────────────────────────────────────────────────────────────────
 
 class CrawlStatus(str, Enum):
     ACCEPTED = "accepted"
@@ -677,9 +672,7 @@ def create_app() -> FastAPI:
 flowchart TD
     A([POST /v1/crawl]) --> B[Pydantic validates CrawlRequest\nCrawlSourceName enum rejects unknown source_name]
     B -->|Validation error| BE([HTTP 400 COMMON-4001])
-    B -->|Valid| C{Check DB + Redis connectivity}
-    C -->|Unavailable| CE([HTTP 503 COMMON-5001])
-    C -->|OK| F[asyncio.create_task:\ncrawl_service.execute]
+    B -->|Valid| F[asyncio.create_task:\ncrawl_service.execute]
     F --> G([HTTP 202 CrawlResponse])
     G -.->|Background| H[CrawlService.execute runs async]
     H --> I[stream:crawl_completed published]
@@ -693,7 +686,6 @@ Purpose : Validate the crawl request, launch the crawler as a background asyncio
           The crawl runs asynchronously — the HTTP response is sent before the crawl finishes.
 Returns : HTTP 202 with CrawlResponse (execution_id echoed, status="accepted")
 Errors  : HTTP 400 if source_name unknown or validation fails
-          HTTP 503 if DB or Redis unavailable (check connectivity before accepting)
 ```
 
 Implementation notes:
@@ -702,6 +694,7 @@ Implementation notes:
 - Attach an `add_done_callback` to the task to log any unhandled exceptions that escape `CrawlService`
 - `source_name` validation is handled by Pydantic (`CrawlSourceName` enum) before the handler is called — no manual registry lookup needed here
 - `CrawlService` is injected via `Depends(get_crawl_service)` from `app/api/dependencies.py`
+- **No inline DB/Redis connectivity pre-check.** Infra health is reported via `GET /v1/health` and enforced by the external health monitor (Kubernetes readiness probe, service mesh circuit breaker, or Admin-side client resilience). HTTP 202 commits only to "request accepted for processing", not to eventual success — if infra is down, `CrawlService.execute()` logs the failure internally and best-effort publishes `crawl_completed` FAILED; callers rely on their own timeouts to handle missing signals.
 
 ### 7.3 `app/api/routes/cleaned_news.py`
 
@@ -795,7 +788,8 @@ class CrawlSuccessItem:
     source_url: str                     # Original article URL; used as dedup key
     published_at: Optional[datetime]    # UTC; None if source does not provide it
     extra_metadata: Optional[dict] = None
-    # extra_metadata is only populated by HKEXCrawler: {"stock_code": "00700"}
+    # extra_metadata is only populated by HKEXCrawler: {"stock_code": ["00700", "00388"]}
+    # The list always contains at least one entry; multi-issuer rows produce multiple entries.
     # All other crawlers leave it None.
 
 @dataclass
@@ -815,11 +809,14 @@ class CrawlResult:
 
 All four crawler classes extend `BaseCrawler`. Crawlers are responsible only for **fetching and parsing** — they do not touch the database or Redis.
 
+> `CrawlFatalError` is defined in `app/crawler/exceptions.py` (see §8.5), alongside the other shared crawler exceptions — **not** in `base_crawler.py`. Crawler subclasses import it as `from app.crawler.exceptions import CrawlFatalError`.
+
 ```python
 from abc import ABC, abstractmethod
 from typing import Optional
 from datetime import date
 from app.config import CrawlSourceConfig
+from app.db.connection import DatabaseClient
 from app.crawler.page_crawler import PageCrawler
 from app.crawler.browser_manager import BrowserManager
 
@@ -828,10 +825,13 @@ class BaseCrawler(ABC):
         self,
         source_config: CrawlSourceConfig,
         page_crawler: PageCrawler,
+        db: DatabaseClient,                  # used for read-only crawl_error_log pre-check
+                                             # and (YahooHKCrawler only) coverage gap detection
         crawl_date: Optional[date] = None,   # only HKEXCrawler uses this
     ):
         self.source_config = source_config
         self.page_crawler = page_crawler
+        self.db = db
         self.crawl_date = crawl_date
 
     @abstractmethod
@@ -848,7 +848,7 @@ class BaseCrawler(ABC):
         ...
 ```
 
-> **Key contract:** `run()` only fetches and parses. It never writes to the database or publishes to Redis — that is `CrawlService`'s responsibility. Crawlers that need a browser (`HKEXCrawler`, `MingPaoCrawler`) manage the `BrowserManager` lifecycle entirely inside their own `run()` — `BaseCrawler` and `CrawlService` have no awareness of it.
+> **Key contract:** `run()` performs fetching, parsing, and read-only `crawl_error_log` lookups only. It never *writes* to the database or publishes to Redis — that is `CrawlService`'s responsibility. The `db` handle is provided so each crawler can check `crawl_error_log` before re-fetching a known-bad URL (and so `YahooHKCrawler` can read previous crawl times for coverage gap detection). Crawlers that need a browser (`HKEXCrawler`, `MingPaoCrawler`) manage the `BrowserManager` lifecycle entirely inside their own `run()` — `BaseCrawler` and `CrawlService` have no awareness of it.
 
 ---
 
@@ -864,8 +864,7 @@ class CrawlService:
         CrawlSourceName.HKEX:     HKEXCrawler,
         CrawlSourceName.MINGPAO:  MingPaoCrawler,
         CrawlSourceName.AASTOCKS: AAStocksCrawler,
-        # YahooHKCrawler is NOT in the registry — it needs extra constructor args.
-        # Use _create_crawler() which handles this case explicitly.
+        CrawlSourceName.YAHOO_HK: YahooHKCrawler,
     }
 
     def __init__(
@@ -882,8 +881,7 @@ class CrawlService:
 ```
 Purpose : Instantiate the correct crawler for the given source.
           Centralises constructor wiring — callers just pass source_name + crawl_date.
-          YahooHKCrawler is the only crawler that needs db; handled here so execute()
-          doesn't need to know about it.
+          All crawlers share the same constructor signature (BaseCrawler.__init__).
 ```
 
 ```python
@@ -892,11 +890,9 @@ def _create_crawler(
     source_name: CrawlSourceName,
     crawl_date: Optional[date],
 ) -> BaseCrawler:
-    source_config = self._config.sources[source_name.value]
-    if source_name == CrawlSourceName.YAHOO_HK:
-        return YahooHKCrawler(source_config, self._page_crawler, crawl_date, self._db)
+    source_config = self._config.crawl_sources[source_name.value]
     crawler_cls = self.CRAWLER_REGISTRY[source_name]
-    return crawler_cls(source_config, self._page_crawler, crawl_date)
+    return crawler_cls(source_config, self._page_crawler, self._db, crawl_date)
 ```
 
 #### Method: `execute(execution_id, source_name, crawl_date) -> None`
@@ -928,9 +924,10 @@ flowchart TD
 Implementation notes:
 - `BrowserManager` is created and torn down inside `HKEXCrawler.run()` and `MingPaoCrawler.run()` — `CrawlService` has no knowledge of it. If browser startup time becomes a bottleneck across many executions, `BrowserManager` can be promoted to a service-level singleton in `app.state`
 - `crawler.run()` returns `CrawlResult` — failures are articles that exhausted all retries inside `PageCrawler`; `CrawlService` writes them to `crawl_error_log` immediately with no further retry
-- Build `RawNews` from each `CrawlResult`: generate `raw_id = uuid4()`, set `source_name`, compute `raw_hash = compute_title_hash(normalise(title))`, set `created_at = datetime.utcnow()`
+- Build `RawNews` from each `CrawlResult`: generate `raw_id = uuid4()`, set `source_name`, compute `raw_hash = compute_hash(normalise(title))` using the pure text tools from `app/common/text_utils.py`, set `created_at = datetime.utcnow()`
 - `UniqueViolationError` on insert = duplicate record; treat as no-op, do not publish `stream:raw_news_inserted` for that record
-- `stream:crawl_completed` is always published — even if zero records were saved (e.g. all duplicates or all errors)
+- `stream:crawl_completed` is always published — even if zero records were saved (e.g. all duplicates or all errors). On SUCCESS the `error_detail` field is **omitted entirely** from the XADD payload (Redis Streams have no native NULL — absence IS the NULL representation); on FAILED the exception message is included.
+- Two module-level SQL constants live at the top of `crawl_service.py`: `_INSERT_RAW_NEWS_SQL` and `_INSERT_CRAWL_ERROR_LOG_SQL`. Neither query should be inlined inside a method body.
 
 ### 8.3 `app/crawler/browser_manager.py` — Playwright Browser Lifecycle
 
@@ -1003,26 +1000,70 @@ Implementation notes:
 - Parse `published` from `entry.published_parsed` (a `time.struct_time`); convert to UTC `datetime` using `calendar.timegm()`
 - If `published_parsed` is None, set `published_at = None` (do not default to now)
 
-### 8.5 `app/crawler/page_crawler.py` — HTTP Fetch with Retry
+### 8.5 `app/crawler/exceptions.py` — Shared Crawler Exceptions
+
+All crawler-layer exceptions are defined here and imported by `page_crawler.py`, crawl workers, and `CrawlService`.
+
+```python
+class CrawlSkippedError(Exception):
+    """URL is already in crawl_error_log — caller raises this after its own pre-check."""
+
+class CrawlNetworkError(Exception):
+    """All retries exhausted — caller adds to result.failures."""
+
+class CrawlBlockedError(Exception):
+    """HTTP 403 or 404 — immediate failure, caller adds to result.failures."""
+
+class CrawlFatalError(Exception):
+    """
+    Unrecoverable source-level failure (e.g. RSS unreachable after all retries,
+    HKEX search page playwright load failure). CrawlService catches this and
+    publishes crawl_completed FAILED.
+    """
+```
+
+> `CrawlFatalError` lives here (not in `base_crawler.py`) so the full set of crawler exceptions stays in a single module. All crawler subclasses and `CrawlService` import it from `app.crawler.exceptions`.
+
+### 8.5a `app/crawler/source_name.py` — CrawlSourceName Enum
+
+```python
+from enum import Enum
+
+class CrawlSourceName(str, Enum):
+    """
+    All known source identifiers. Owned by the crawler domain; imported by the
+    API layer (app/api/schemas.py) for request validation. Adding a new
+    source requires:
+      1. Adding a new member here.
+      2. Implementing the corresponding Crawler class in app/crawler/.
+      3. Registering it in CrawlService.CRAWLER_REGISTRY.
+    """
+    HKEX     = "HKEX"
+    MINGPAO  = "MINGPAO"
+    AASTOCKS = "AASTOCKS"
+    YAHOO_HK = "YAHOO_HK"
+```
+
+> This enum lives in the crawler domain — **not** `app/api/schemas.py` — so the dependency direction is API → domain (never the reverse). `schemas.py` does `from app.crawler.source_name import CrawlSourceName` and uses it as the `CrawlRequest.source_name` field type for Pydantic enum validation.
+
+### 8.6 `app/crawler/page_crawler.py` — HTTP Fetch with Retry
 
 #### Class: `PageCrawler`
 
 ```python
 class PageCrawler:
-    def __init__(self, client: httpx.AsyncClient, config: CrawlConfig, db: DatabaseClient): ...
+    def __init__(self, client: httpx.AsyncClient, config: CrawlConfig): ...
 ```
 
-Wraps the shared `httpx.AsyncClient` with pre-fetch error log check and retry logic. Does not own the client lifecycle — the client is created at service startup and shared across all crawlers (see Section 10).
+Wraps the shared `httpx.AsyncClient` with retry logic. Does not own the client lifecycle — the client is created at service startup and shared across all crawlers (see Section 10). `PageCrawler` is a pure HTTP tool — it has no database dependency.
 
 #### Method: `fetch(url: str) -> httpx.Response`
 
 ```
-Purpose : Check crawl_error_log first, then fetch the URL with exponential backoff retry.
+Purpose : Fetch the URL with exponential backoff retry.
 Params  : url — target URL
 Returns : httpx.Response on success
-Raises  : CrawlSkippedError if URL is already in crawl_error_log — caller silently skips,
-          does NOT add to result.failures (already recorded in a previous execution)
-          CrawlNetworkError after all retries exhausted — caller adds to result.failures
+Raises  : CrawlNetworkError after all retries exhausted — caller adds to result.failures
           CrawlBlockedError immediately on HTTP 403 or 404 — caller adds to result.failures
 ```
 
@@ -1030,9 +1071,7 @@ Raises  : CrawlSkippedError if URL is already in crawl_error_log — caller sile
 
 ```mermaid
 flowchart TD
-    A([fetch called]) --> B{URL in crawl_error_log?}
-    B -->|Yes| C([raise CrawlSkippedError])
-    B -->|No| D[attempt = 1]
+    A([fetch called]) --> D[attempt = 1]
     D --> E[httpx GET with timeout]
     E -->|HTTP 403 or 404| F([raise CrawlBlockedError immediately])
     E -->|HTTP 500 or timeout| G{attempt < MAX_RETRY?}
@@ -1043,19 +1082,20 @@ flowchart TD
 ```
 
 Implementation notes:
-- Error log check: `SELECT EXISTS(SELECT 1 FROM crawl_error_log WHERE url = $1)` — use `db.fetch_one()`
 - Retry config (`max_retry`, `retry_base_wait_ms`) comes from `self._config` — not passed per call
 - Add random jitter between requests: `await asyncio.sleep(random.randint(min_ms, max_ms) / 1000)`; use `self._config.sources[source_name]` interval values in the Crawler, not inside `fetch()`
 - Backoff formula: `wait_ms = config.retry_base_wait_ms × 2^(attempt - 1)`
 
-### 8.6 `app/crawler/html_parser.py` — HTML Body Extraction
+> **Error log pre-check:** The crawl_error_log lookup (`SELECT EXISTS(SELECT 1 FROM crawl_error_log WHERE url = $1)`) is business logic and belongs in the crawl worker, not in `PageCrawler`. Each crawler's `run()` should check the error log before calling `page_crawler.fetch()`, and raise `CrawlSkippedError` (from `app/crawler/exceptions.py`) if the URL is already recorded. This keeps `PageCrawler` as a pure HTTP tool with no database dependency.
 
-#### Function: `extract_body_trafilatura(html: str) -> Optional[str]`
+### 8.7 `app/crawler/html_parser.py` — HTML Body Extraction
+
+#### Function: `extract_body_auto(html: str) -> Optional[str]`
 
 ```
-Purpose : Extract the main article body from HTML using trafilatura auto-extraction.
+Purpose : Extract the main article body from HTML using auto-extraction (trafilatura).
 Params  : html — raw HTML string
-Returns : Extracted plain text, or None if trafilatura returns empty/None
+Returns : Extracted plain text, or None if extraction returns empty/None
 ```
 
 #### Function: `extract_body_css(html: str, selector: str) -> Optional[str]`
@@ -1070,9 +1110,10 @@ Returns : Extracted plain text from the matched element, or None if selector doe
 
 Implementation notes:
 - `extract_body_css` uses BeautifulSoup4: `soup.select_one(selector).get_text(separator=" ", strip=True)`
-- Always try `extract_body_trafilatura` first where applicable; only fall back to CSS selector if needed
+- Always try `extract_body_auto` first where applicable; only fall back to CSS selector if needed
+- Neither function catches exceptions internally — they are pure tools. If the underlying library raises (e.g. lxml error on malformed HTML), the exception propagates to the caller. Crawl workers must catch these and convert to `CrawlFailItem` with `error_type="PARSE"` — same pattern as `PdfEncryptedError`/`PdfParseError` in `HKEXCrawler`.
 
-### 8.7 `app/crawler/pdf_parser.py` — PDF Text Extraction
+### 8.8 `app/crawler/pdf_parser.py` — PDF Text Extraction
 
 #### Function: `parse_pdf(content: bytes) -> str`
 
@@ -1104,7 +1145,7 @@ Implementation notes:
 - pdfminer.six: use `pdfminer.high_level.extract_text(BytesIO(content))`
 - Both parsers are synchronous — wrap with `asyncio.to_thread()`
 
-### 8.8 `app/crawler/hkex_crawler.py` — HKEXCrawler
+### 8.9 `app/crawler/hkex_crawler.py` — HKEXCrawler
 
 #### Class: `HKEXCrawler(BaseCrawler)`
 
@@ -1139,11 +1180,12 @@ flowchart TD
     I --> J[Launch PDF fetch workers]
     J --> K{Queue empty?}
     K -->|No| L[Dequeue PDF URL + metadata]
-    L --> M[Acquire semaphore\npage_crawler.fetch PDF URL]
-    M -->|CrawlSkippedError| SKIP[Release semaphore\nsilently skip]
+    L --> CHK{URL in crawl_error_log?\ndb.fetch_one check}
+    CHK -->|Yes| SKIP[Release semaphore\nsilently skip]
+    CHK -->|No| M[Acquire semaphore\npage_crawler.fetch PDF URL]
     M --> N[parse_pdf bytes]
     N -->|PdfEncryptedError\nor PdfParseError after retries| O[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
-    N -->|OK| P[Build CrawlSuccessItem\nextra_metadata=stock_code\nAppend to result.successes\nRelease semaphore]
+    N -->|OK| P[Build CrawlSuccessItem\nextra_metadata={stock_code: list of codes}\nAppend to result.successes\nRelease semaphore]
     O & P --> K
     K -->|Done| S[BrowserManager.stop]
     S --> T([return CrawlResult])
@@ -1166,7 +1208,7 @@ Returns : (1471, 1471)
 Raises  : ValueError if regex match fails (indicates page structure changed — log warning)
 ```
 
-### 8.9 `app/crawler/mingpao_crawler.py` — MingPaoCrawler
+### 8.10 `app/crawler/mingpao_crawler.py` — MingPaoCrawler
 
 MingPao uses a producer-consumer model: RSS feed discovery → playwright browser fetch.
 
@@ -1194,9 +1236,9 @@ flowchart TD
     F --> G{Queue empty?}
     G -->|No| H[Dequeue URL + RSS entry]
     H --> I[Acquire semaphore]
-    I --> J[page_crawler pre-check\nURL in crawl_error_log?]
-    J -->|CrawlSkippedError| SKIP[Release semaphore\nsilently skip]
-    J -->|OK| JJ[playwright GET article URL\nwaitUntil=domcontentloaded]
+    I --> J{URL in crawl_error_log?\ndb.fetch_one check}
+    J -->|Yes| SKIP[Release semaphore\nsilently skip]
+    J -->|No| JJ[playwright GET article URL\nwaitUntil=domcontentloaded]
     JJ --> K[Extract article selector]
     K -->|Body empty after retries| L[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
     K -->|OK| M{published_at from RSS?}
@@ -1209,6 +1251,8 @@ flowchart TD
     S --> T([return CrawlResult])
 ```
 
+> **Crawl worker exception handling:** If the HTML body extraction raises an unexpected exception (e.g. lxml parse error), catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedError`/`PdfParseError` handling in `HKEXCrawler`.
+
 #### Helper: `_extract_published_at_from_page(page_html: str) -> Optional[datetime]`
 
 ```
@@ -1219,7 +1263,7 @@ Pattern : r"\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}:\d{2}[AP]M"
 Returns : UTC datetime, or None if not found
 ```
 
-### 8.10 `app/crawler/aastocks_crawler.py` — AAStocksCrawler
+### 8.11 `app/crawler/aastocks_crawler.py` — AAStocksCrawler
 
 #### Class: `AAStocksCrawler(BaseCrawler)`
 
@@ -1242,8 +1286,9 @@ flowchart TD
     E --> F[Launch crawl_worker coroutines]
     F --> G{Queue empty?}
     G -->|No| H[Dequeue URL]
-    H --> I[page_crawler.fetch article URL /tc/]
-    I -->|CrawlSkippedError| SKIP[Release semaphore\nsilently skip]
+    H --> CHK{URL in crawl_error_log?\ndb.fetch_one check}
+    CHK -->|Yes| SKIP[Release semaphore\nsilently skip]
+    CHK -->|No| I[page_crawler.fetch article URL /tc/]
     I -->|CrawlBlockedError 403/404\nor CrawlNetworkError after retries| J[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
     I -->|OK| K[CSS selector newscon\nExtract body]
     K -->|Empty| J
@@ -1253,6 +1298,8 @@ flowchart TD
     G -->|Done| R([return CrawlResult])
 ```
 
+> **Crawl worker exception handling:** If `extract_body_css()` raises an unexpected exception, catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedError`/`PdfParseError` handling in `HKEXCrawler`.
+
 #### Helper: `_parse_published_at(page_html: str) -> Optional[datetime]`
 
 ```
@@ -1261,24 +1308,11 @@ Pattern : r"\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}"  e.g. "2026/04/06 01:27"
 Returns : UTC datetime (convert from HKT by subtracting 8 hours), or None if not found
 ```
 
-### 8.11 `app/crawler/yahoo_hk_crawler.py` — YahooHKCrawler
+### 8.12 `app/crawler/yahoo_hk_crawler.py` — YahooHKCrawler
 
 #### Class: `YahooHKCrawler(BaseCrawler)`
 
-`YahooHKCrawler` is the only crawler that needs DB read access (for coverage gap detection). Its constructor takes one extra parameter compared to other crawlers:
-
-```python
-class YahooHKCrawler(BaseCrawler):
-    def __init__(
-        self,
-        source_config: CrawlSourceConfig,
-        page_crawler: PageCrawler,
-        crawl_date: Optional[date],
-        db: DatabaseClient,         # extra — for _get_previous_crawl_time()
-    ): ...
-```
-
-`CrawlService._create_crawler()` handles this special case — callers never construct `YahooHKCrawler` directly.
+`YahooHKCrawler` uses the same constructor as `BaseCrawler`. Like every crawler it receives `db` for the `crawl_error_log` pre-check; it additionally uses `db` to look up the previous crawl time for coverage gap detection (see `_get_previous_crawl_time` below).
 
 #### Method: `run() -> CrawlResult`
 
@@ -1300,16 +1334,19 @@ flowchart TD
     E -->|Yes| F[Log WARNING: potential coverage gap\nProceed anyway]
     E -->|No| G[Normal]
     F & G --> H[Create Queue + Semaphore max_concurrent=3]
-    H --> I[crawl_worker: page_crawler.fetch article]
-    I -->|CrawlSkippedError| SKIP[Release semaphore\nsilently skip]
+    H --> CHK{URL in crawl_error_log?\ndb.fetch_one check}
+    CHK -->|Yes| SKIP[Release semaphore\nsilently skip]
+    CHK -->|No| I[crawl_worker: page_crawler.fetch article]
     I -->|CrawlNetworkError after retries| J[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
-    I -->|OK| K[trafilatura extract body]
+    I -->|OK| K[extract_body_auto]
     K -->|Empty| J
     K -->|OK| L[Build CrawlSuccessItem\npublished_at from RSS UTC\nAppend to result.successes\nRelease semaphore]
     J & L --> N{More URLs?}
     N -->|Yes| I
     N -->|No| O([return CrawlResult])
 ```
+
+> **Crawl worker exception handling:** If `extract_body_auto()` raises an unexpected exception, catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedError`/`PdfParseError` handling in `HKEXCrawler`.
 
 > **Coverage gap:** Yahoo RSS only returns 5 entries. If the crawl runs too infrequently, entries may drop off the feed before being captured. This is a scheduling concern handled by Admin Service — SADI only logs the warning.
 
@@ -1320,23 +1357,21 @@ Purpose : Look up the most recent raw_news record time for YAHOO_HK.
           Used for coverage gap detection. See Section 8.12 for detail.
 ```
 
-### 8.12 `YahooHKCrawler` — DB helper
+### 8.13 `YahooHKCrawler` — DB helper
 
-#### Helper: `_get_previous_crawl_time(db: DatabaseClient) -> Optional[datetime]`
+#### Helper: `_get_previous_crawl_time() -> Optional[datetime]`
 
 ```
 Purpose : Look up the most recent raw_news record time for YAHOO_HK.
           Used for coverage gap detection inside YahooHKCrawler.run().
-          Note: db is available via self — this is an instance method, not a standalone function.
+          Note: db is available via self.db — this is an instance method.
 Query   : SELECT MAX(created_at) FROM raw_news WHERE source_name = 'YAHOO_HK'
 Returns : UTC datetime of most recent record, or None if no records exist
 ```
 
-> **Note:** `YahooHKCrawler` is the only crawler that needs DB read access — for the coverage gap check. Pass `db: DatabaseClient` into its constructor only.
-
 ---
 
-### 8.13 `CrawlService` — Persistence Logic Detail
+### 8.14 `CrawlService` — Persistence Logic Detail
 
 The SQL and stream signals that `CrawlService.execute()` uses when saving each `CrawlResult`:
 
@@ -1365,27 +1400,29 @@ await stream_client.publish(
 **`crawl_completed` signal — published once per execution:**
 ```python
 # On success (all records processed — even if count is zero):
+# error_detail is OMITTED entirely from the XADD payload — Redis Streams have no
+# native NULL, so "absence" is the NULL representation. Admin-side consumers
+# should check `"error_detail" in fields` rather than matching an empty string.
 await stream_client.publish(
     STREAM_CRAWL_COMPLETED,
     {
         "execution_id": str(execution_id),
         "status": "SUCCESS",
-        "error_detail": "",        # empty string; Admin side checks status field
     }
 )
 
-# On CrawlFatalError:
+# On CrawlFatalError or unexpected exception:
 await stream_client.publish(
     STREAM_CRAWL_COMPLETED,
     {
         "execution_id": str(execution_id),
         "status": "FAILED",
-        "error_detail": str(e),    # exception message for Admin complete_with_error()
+        "error_detail": str(e),    # only present on FAILED
     }
 )
 ```
 
-> **Field spec from Admin TAD §4:** Consumer group is `admin-scheduler`. Fields are `execution_id`, `status` (`SUCCESS`/`FAILED`), `error_detail`. Admin `CrawlHandler.execute()` filters by `execution_id` to match the right message.
+> **Field spec from Admin TAD §4:** Consumer group is `admin-scheduler`. Fields are `execution_id`, `status` (`SUCCESS`/`FAILED`), and (on FAILED only) `error_detail`. On SUCCESS the `error_detail` field is absent from the message — Admin's `CrawlHandler.execute()` must test membership (`"error_detail" in fields`) rather than comparing to an empty string. This matches the architecture TAD contract "`error_detail` is null on SUCCESS".
 
 **`save_crawl_error` — best-effort audit log:**
 ```
@@ -1398,7 +1435,9 @@ Purpose : Insert a CrawlErrorLog record for per-article failures encountered dur
 
 ## 9. Cleaning Layer — `app/cleaner/`
 
-### 9.1 `app/cleaner/text_normaliser.py`
+> **Pure text tools live in `app/common/text_utils.py`**, not under `app/cleaner/`. Both `normalise()` and `compute_hash()` are used by the crawl layer (to compute `raw_hash` at insert time) and the clean layer (to produce cleaned titles and for dedup lookups). Putting them in `app/cleaner/` would force the crawl layer to import from the clean layer, inverting the intended dependency direction. See §9.0 below for their definitions. `app/cleaner/` only holds cleaning-specific logic — query helpers, the streaming pipeline, and the cleaning service itself.
+
+### 9.0 `app/common/text_utils.py` — Shared Pure Text Tools
 
 #### Function: `normalise(text: str) -> str`
 
@@ -1422,35 +1461,40 @@ def normalise(text: str) -> str:
     return text.strip()
 ```
 
-### 9.2 `app/cleaner/dedup_service.py`
-
-#### Function: `compute_title_hash(normalised_title: str) -> str`
+#### Function: `compute_hash(text: str) -> str`
 
 ```
-Purpose : Compute SHA-256 hash of a normalised title for deduplication.
-Params  : normalised_title — already NFKC-normalised title string
-Returns : Hex-encoded SHA-256 hash string (64 characters)
+Purpose : Compute SHA-256 hex digest of an arbitrary string (typically an
+          already-normalised title, used as raw_news.raw_hash for dedup).
+Params  : text — input string
+Returns : 64-character lowercase hex string
 ```
 
 ```python
 import hashlib
 
-def compute_title_hash(normalised_title: str) -> str:
-    return hashlib.sha256(normalised_title.encode("utf-8")).hexdigest()
+def compute_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 ```
+
+> Both functions are pure — no DB, no I/O, no domain coupling. They are imported by `CrawlService._persist_successes` (crawl layer) and will be imported by `CleaningService` (clean layer) when Phase 7 lands. Do not re-implement these anywhere else.
+
+### 9.1 `app/cleaner/dedup_service.py`
+
+Cleaning-layer query helper. Pure hash/normalisation functions live in `app/common/text_utils.py` (see §9.0) — this module only holds the DB lookup.
 
 #### Function: `is_duplicate(raw_hash: str, db: DatabaseClient) -> bool`
 
 ```
 Purpose : Check if a raw_hash already exists in raw_news.
           Used by the cleaning layer to detect cross-source title duplicates.
-Params  : raw_hash — SHA-256 hex string
+Params  : raw_hash — SHA-256 hex string (produced by compute_hash from app.common.text_utils)
           db       — DatabaseClient instance
 Returns : True if a record with this hash already exists (and has is_deleted=False)
 Query   : SELECT EXISTS(SELECT 1 FROM raw_news WHERE raw_hash = $1 AND is_deleted = FALSE)
 ```
 
-### 9.3 `app/cleaner/stream_handler.py`
+### 9.2 `app/cleaner/stream_handler.py`
 
 #### Class: `StreamHandler`
 
@@ -1505,7 +1549,7 @@ Purpose : Publish to stream:raw_news_cleaned after a record is successfully clea
           SAPI NLP layer consumes this stream.
 ```
 
-### 9.4 `app/cleaner/cleaning_service.py` — Main Cleaning Loop
+### 9.3 `app/cleaner/cleaning_service.py` — Main Cleaning Loop
 
 #### Class: `CleaningService`
 
@@ -1656,7 +1700,7 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
         timeout=config.crawl.request_timeout_s,
     )
-    page_crawler = PageCrawler(http_client, config.crawl, db)
+    page_crawler = PageCrawler(http_client, config.crawl)
     crawl_service = CrawlService(db, stream_client, page_crawler, config.crawl)
 
     # Store in app.state so the Depends() helpers in dependencies.py can access them
@@ -1758,7 +1802,7 @@ CREATE TABLE crawl_error_log (
 );
 
 CREATE INDEX idx_crawl_error_log_url ON crawl_error_log (url);
--- PageCrawler.fetch() checks "SELECT EXISTS(... WHERE url = $1)" before every page fetch.
+-- Crawl workers check "SELECT EXISTS(... WHERE url = $1)" before every page fetch.
 -- Without this index the query becomes a full table scan as the error log grows.
 ```
 

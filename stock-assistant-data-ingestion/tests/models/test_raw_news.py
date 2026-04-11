@@ -16,7 +16,7 @@ class TestRawNews:
             published_at=now,
             created_at=now,
             raw_hash="abc123",
-            extra_metadata={"stock_code": "00700"},
+            extra_metadata={"stock_code": ["00700"]},
         )
         assert raw.source_name == "HKEX"
         assert raw.is_deleted is False

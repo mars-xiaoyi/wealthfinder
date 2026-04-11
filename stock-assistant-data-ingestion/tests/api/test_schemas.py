@@ -11,12 +11,12 @@ from app.api.schemas import (
     ComponentStatus,
     CrawlRequest,
     CrawlResponse,
-    CrawlSourceName,
     CrawlStatus,
     ErrorResponse,
     HealthResponse,
     HealthStatus,
 )
+from app.crawler.source_name import CrawlSourceName
 
 
 class TestCrawlSourceName:

@@ -1,6 +1,6 @@
 # SADI — Implementation Progress
 
-Last updated: 2026-04-09
+Last updated: 2026-04-10
 
 ---
 
@@ -35,26 +35,26 @@ Last updated: 2026-04-09
 
 ## Phase 5 — Crawler Utilities
 
-- [ ] `app/crawler/feed_fetcher.py` — `fetch_rss()`, `FeedEntry`
-- [ ] `app/crawler/html_parser.py` — `extract_body_trafilatura()`, `extract_body_css()`
-- [ ] `app/crawler/pdf_parser.py` — `parse_pdf()`, `PdfEncryptedError`, `PdfParseError`
-- [ ] `app/crawler/browser_manager.py` — `BrowserManager` (`start`, `stop`, `acquire_context`, `release_context`)
-- [ ] `app/crawler/page_crawler.py` — `PageCrawler.fetch()` with error log pre-check + retry, `CrawlSkippedError`, `CrawlNetworkError`, `CrawlBlockedError`
+- [x] `app/crawler/feed_fetcher.py` — `fetch_rss()`, `FeedEntry`
+- [x] `app/crawler/html_parser.py` — `extract_body_auto()`, `extract_body_css()`
+- [x] `app/crawler/pdf_parser.py` — `parse_pdf()`, `PdfEncryptedError`, `PdfParseError`
+- [x] `app/crawler/browser_manager.py` — `BrowserManager` (`start`, `stop`, `acquire_context`, `release_context`)
+- [x] `app/crawler/page_crawler.py` — `PageCrawler.fetch()` with error log pre-check + retry, `CrawlSkippedError`, `CrawlNetworkError`, `CrawlBlockedError`
 
 ## Phase 6 — Crawler Core
 
-- [ ] `app/crawler/base_crawler.py` — `BaseCrawler` ABC, `CrawlResult`, `CrawlSuccessItem`, `CrawlFailItem`, `CrawlFatalError`
-- [ ] `app/crawler/hkex_crawler.py` — `HKEXCrawler` (Phase 1 playwright pagination + Phase 2 parallel PDF fetch)
-- [ ] `app/crawler/mingpao_crawler.py` — `MingPaoCrawler` (RSS + playwright browser)
-- [ ] `app/crawler/aastocks_crawler.py` — `AAStocksCrawler` (list page + httpx)
-- [ ] `app/crawler/yahoo_hk_crawler.py` — `YahooHKCrawler` (RSS + trafilatura + coverage gap detection)
-- [ ] `app/crawler/crawl_service.py` — `CrawlService` (`_create_crawler`, `execute`, `_save_crawl_error`)
-- [ ] `app/api/routes/crawl.py` — `POST /v1/crawl`
+- [x] `app/crawler/base_crawler.py` — `BaseCrawler` ABC, `CrawlResult`, `CrawlSuccessItem`, `CrawlFailItem`, `CrawlFatalError`
+- [x] `app/crawler/hkex_crawler.py` — `HKEXCrawler` (Phase 1 playwright pagination + Phase 2 parallel PDF fetch)
+- [x] `app/crawler/mingpao_crawler.py` — `MingPaoCrawler` (RSS + playwright browser)
+- [x] `app/crawler/aastocks_crawler.py` — `AAStocksCrawler` (list page + httpx)
+- [x] `app/crawler/yahoo_hk_crawler.py` — `YahooHKCrawler` (RSS + trafilatura + coverage gap detection)
+- [x] `app/crawler/crawl_service.py` — `CrawlService` (`_create_crawler`, `execute`, `_save_crawl_error`)
+- [x] `app/api/routes/crawl.py` — `POST /v1/crawl`
 
 ## Phase 7 — Cleaning Layer
 
-- [ ] `app/cleaner/text_normaliser.py` — `normalise()`
-- [ ] `app/cleaner/dedup_service.py` — `compute_title_hash()`, `is_duplicate()`
+- [x] `app/common/text_utils.py` — `normalise()`, `compute_hash()` _(pure text tools pulled forward — shared by crawl & clean layers)_
+- [x] `app/cleaner/dedup_service.py` — `is_duplicate()` _(pulled forward — query helper used by Phase 7)_
 - [ ] `app/cleaner/stream_handler.py` — `StreamHandler` (`ensure_consumer_group`, `read_messages`, `reclaim_pending`, `ack`, `publish_cleaned`)
 - [ ] `app/cleaner/cleaning_service.py` — `CleaningService` (`start`, `process_record`, 7-step pipeline, `_mark_deleted`, `_fetch_raw_news`, `_insert_cleaned_news`)
 - [ ] `app/api/routes/cleaned_news.py` — `GET /v1/cleaned_news/{id}`, `POST /v1/cleaned_news/batch`

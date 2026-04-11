@@ -102,9 +102,9 @@ Crawl triggered with source_name:
 **SADI config file — per-source behaviour parameters:**
 
 ```yaml
-sources:
+crawl_sources:
   HKEX:
-    max_concurrent: 1
+    max_concurrent: 5
     request_interval_min_ms: 500
     request_interval_max_ms: 1000
   MINGPAO:
@@ -121,7 +121,7 @@ sources:
     request_interval_max_ms: 1000
 ```
 
-> **HKEX note:** `max_concurrent = 1` because the HKEX crawl is a sequential batch operation (LOAD MORE pagination in a single playwright session); parallel execution is not applicable.
+> **HKEX note:** HKEX crawls in two phases. **Phase 1** (LOAD MORE pagination in a single playwright session) is inherently sequential and ignores `max_concurrent`. **Phase 2** (parallel PDF fetch via httpx) uses `max_concurrent` to bound the number of concurrent PDF downloads.
 
 ### 2.3 Per-Source Implementation Guide
 
@@ -145,7 +145,7 @@ This section documents the implementation details for each source crawler. It is
 | PDF parsing | pymupdf (fitz) primary → pdfminer.six fallback for complex layouts. Two sub-types: standard text-layer PDF (most announcements) and XFA form PDF (e.g. Next Day Disclosure Returns). Encrypted or scanned PDFs: log error, discard |
 | `published_at` | Raw format: `DD/MM/YYYY HH:mm` (e.g. `02/04/2026 22:59`). Timezone: HKT (UTC+8). Convert to UTC before storing |
 | Deduplication | PDF URL (`source_url`). `newsId` is not available in search result HTML |
-| Stock code | Extracted from search result table (`td.stock-short-code`). Stored in `raw_news.extra_metadata` as `{"stock_code": "00700"}`. `body` is not modified |
+| Stock code | Extracted from search result table (`td.stock-short-code`). One row may list multiple short codes (multi-issuer announcement); store all of them in `raw_news.extra_metadata` as `{"stock_code": ["00700", "00388"]}` (always a list, even when only one code is present). `body` is not modified |
 | playwright instance | Shared with MINGPAO (same `Browser` process, separate `BrowserContext`). Context is created fresh per crawl execution and closed on completion |
 
 ---
@@ -335,7 +335,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | published_at | TIMESTAMPTZ | Article publish time UTC; nullable — consuming layers fall back to `created_at` when null |
 | created_at | TIMESTAMPTZ | Record creation time UTC |
 | raw_hash | VARCHAR(64) | SHA-256(normalised_title); unique index for cross-source deduplication |
-| extra_metadata | JSONB | Source-specific structured metadata; e.g. `{"stock_code": "00700"}` for HKEX. Nullable |
+| extra_metadata | JSONB | Source-specific structured metadata; e.g. `{"stock_code": ["00700", "00388"]}` for HKEX (always a list, even for single-issuer rows). Nullable |
 | is_deleted | BOOLEAN | Soft delete flag set by cleaning layer for rejected records; default false |
 | deleted_reason | VARCHAR(50) | EMPTY_FIELD / DUPLICATE_TITLE / BODY_TOO_SHORT; required when `is_deleted = true` |
 
@@ -592,8 +592,9 @@ sadi/
 │   ├── cleaner/
 │   │   ├── cleaning_service.py      # Cleaning layer main service, queue management
 │   │   ├── stream_handler.py        # Redis Streams consumer/producer
-│   │   ├── text_normaliser.py       # Fullwidth conversion, whitespace cleaning
-│   │   └── dedup_service.py         # Title hash deduplication logic
+│   │   └── dedup_service.py         # is_duplicate() — cross-source raw_hash lookup
+│   ├── common/
+│   │   └── text_utils.py            # normalise() + compute_hash() — pure text tools shared by crawl & clean layers
 │   ├── api/
 │   │   ├── routes/
 │   │   │   ├── crawl.py             # POST /crawl
@@ -629,7 +630,7 @@ sadi/
 | Q-4 | ~~Validate playwright async performance: can one browser instance handle MINGPAO's crawl volume within the scheduler time window?~~ | ~~MINGPAO crawl throughput~~ | ✅ **Resolved** — domContentLoaded = 2,226ms; 3 concurrent contexts cover 26 RSS entries in ~19s. Use `waitUntil='domcontentloaded'`; do not use `networkidle` (5,871ms, unnecessary). Per-source config updated accordingly |
 | Q-5 | ~~Confirm HKEX `homecat` JSON polling frequency: do endpoints update in real-time or on a fixed schedule?~~ | ~~HKEX data freshness~~ | ✅ **Resolved** — homecat insufficient for full coverage; replaced by `titlesearch.xhtml` daily batch pull |
 | Q-6 | ~~HKEX full coverage strategy~~ | ~~HKEX data completeness~~ | ✅ **Resolved** — daily `titlesearch.xhtml` batch pull adopted; see Section 2.3 |
-| Q-7 | ~~HKEX stock_code field ownership~~ | ~~Data model; SAPI EntityAnalysisSkill input format~~ | ✅ **Resolved** — `raw_news.extra_metadata JSONB` field added; stock_code stored as `{"stock_code": "00700"}`. `body` remains unmodified |
+| Q-7 | ~~HKEX stock_code field ownership~~ | ~~Data model; SAPI EntityAnalysisSkill input format~~ | ✅ **Resolved** — `raw_news.extra_metadata JSONB` field added; stock_code stored as a list, e.g. `{"stock_code": ["00700", "00388"]}` (always a list, even for single-issuer rows). `body` remains unmodified |
 
 ---
 
