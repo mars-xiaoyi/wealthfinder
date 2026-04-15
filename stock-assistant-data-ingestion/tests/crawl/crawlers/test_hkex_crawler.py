@@ -24,7 +24,7 @@ def make_page_crawler(max_retry: int = 3) -> MagicMock:
         max_retry=max_retry,
         retry_base_wait_ms=10,
         request_timeout_s=10,
-        browser_navigation_timeout_ms=30000,
+        browser_navigation_timeout_ms=15000,
         crawl_sources={},
     )
     pc.fetch = AsyncMock()
@@ -61,9 +61,19 @@ class TestParseReleaseTime:
         # 22:59 HKT = 14:59 UTC same day
         assert result == datetime(2026, 4, 2, 14, 59, tzinfo=timezone.utc)
 
+    def test_strips_release_time_label_prefix(self):
+        # Live HKEX cells render as ' Release Time: 14/04/2026 22:52' — the
+        # label must be tolerated, not rejected.
+        result = HKEXCrawler._parse_release_time(" Release Time: 14/04/2026 22:52")
+        assert result == datetime(2026, 4, 14, 14, 52, tzinfo=timezone.utc)
+
     def test_invalid_format_raises(self):
         with pytest.raises(ValueError):
             HKEXCrawler._parse_release_time("not a date")
+
+    def test_no_timestamp_pattern_raises(self):
+        with pytest.raises(ValueError, match="No timestamp pattern"):
+            HKEXCrawler._parse_release_time("Release Time:")
 
 
 class TestParsePaginationCounts:
@@ -265,9 +275,25 @@ class TestFetchPdfs:
 # _collect_announcements — Phase 1 pagination flow
 # ---------------------------------------------------------------------------
 
-def _make_fake_row(pdf_href: str, headline: str, release: str, stock: str):
-    pdf_el = AsyncMock()
-    pdf_el.get_attribute = AsyncMock(return_value=pdf_href)
+def _make_fake_row(
+    pdf_href: str | None,
+    headline: str = "",
+    release: str = "",
+    stock: str = "",
+    *,
+    inner_html: str = "<td>stub</td>",
+):
+    """
+    Build a playwright-row stub. Pass pdf_href=None to simulate a row with no
+    `.doc-link` PDF anchor; pass pdf_href="" to simulate an anchor with an
+    empty href attribute.
+    """
+    pdf_el: AsyncMock | None
+    if pdf_href is None:
+        pdf_el = None
+    else:
+        pdf_el = AsyncMock()
+        pdf_el.get_attribute = AsyncMock(return_value=pdf_href)
 
     headline_el = AsyncMock()
     headline_el.text_content = AsyncMock(return_value=headline)
@@ -291,6 +317,7 @@ def _make_fake_row(pdf_href: str, headline: str, release: str, stock: str):
 
     row = MagicMock()
     row.query_selector = AsyncMock(side_effect=query_selector)
+    row.inner_html = AsyncMock(return_value=inner_html)
     return row
 
 
@@ -298,7 +325,7 @@ def _make_fake_page(pagination_states: list[str], rows: list):
     page = MagicMock()
     page.goto = AsyncMock()
     page.click = AsyncMock()
-    page.wait_for_load_state = AsyncMock()
+    page.wait_for_function = AsyncMock()
     page.text_content = AsyncMock(side_effect=pagination_states)
     page.query_selector_all = AsyncMock(return_value=rows)
     return page
@@ -313,6 +340,61 @@ def _make_fake_browser_manager(page) -> MagicMock:
     bm.acquire_context = AsyncMock(return_value=context)
     bm.release_context = AsyncMock()
     return bm
+
+
+class TestExtractRow:
+    @pytest.mark.asyncio
+    async def test_ok_row_returns_announcement(self):
+        row = _make_fake_row(
+            pdf_href="/listedco/test.pdf",
+            headline="Title",
+            release="02/04/2026 22:59",
+            stock="00700",
+        )
+        crawler = make_crawler()
+
+        parsed, reason = await crawler._extract_row(row)
+
+        assert reason == "ok"
+        assert parsed is not None
+        assert parsed.pdf_url == "https://www1.hkexnews.hk/listedco/test.pdf"
+        assert parsed.published_at == datetime(2026, 4, 2, 14, 59, tzinfo=timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_drops_row_without_pdf_link(self):
+        row = _make_fake_row(pdf_href=None)
+        crawler = make_crawler()
+
+        parsed, reason = await crawler._extract_row(row)
+
+        assert parsed is None
+        assert reason == "no_pdf_link"
+
+    @pytest.mark.asyncio
+    async def test_drops_row_with_empty_href(self):
+        row = _make_fake_row(pdf_href="")
+        crawler = make_crawler()
+
+        parsed, reason = await crawler._extract_row(row)
+
+        assert parsed is None
+        assert reason == "no_href"
+
+    @pytest.mark.asyncio
+    async def test_ok_row_with_unparseable_release_time_keeps_announcement(self):
+        row = _make_fake_row(
+            pdf_href="/a.pdf",
+            headline="Title",
+            release="bogus date",
+            stock="00700",
+        )
+        crawler = make_crawler()
+
+        parsed, reason = await crawler._extract_row(row)
+
+        assert reason == "ok"
+        assert parsed is not None
+        assert parsed.published_at is None
 
 
 class TestCollectAnnouncements:
@@ -338,6 +420,37 @@ class TestCollectAnnouncements:
         page.click.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_logs_row_bucket_summary(self, caplog):
+        import logging as _logging
+
+        ok_row = _make_fake_row(
+            pdf_href="/a.pdf",
+            headline="T",
+            release="02/04/2026 10:00",
+            stock="00700",
+        )
+        no_link_row = _make_fake_row(pdf_href=None)
+        no_href_row = _make_fake_row(pdf_href="")
+        page = _make_fake_page(
+            pagination_states=["Showing 3 of 3 records"],
+            rows=[ok_row, no_link_row, no_href_row],
+        )
+        bm = _make_fake_browser_manager(page)
+        crawler = make_crawler()
+
+        with caplog.at_level(_logging.INFO, logger="app.crawl.crawlers.hkex_crawler"):
+            announcements = await crawler._collect_announcements(bm, date(2026, 4, 2))
+
+        assert len(announcements) == 1
+        summary = next(
+            r.getMessage() for r in caplog.records if "row buckets" in r.getMessage()
+        )
+        assert "total=3" in summary
+        assert "parsed=1" in summary
+        assert "'no_pdf_link': 1" in summary
+        assert "'no_href': 1" in summary
+
+    @pytest.mark.asyncio
     async def test_clicks_load_more_until_complete(self):
         row = _make_fake_row(
             pdf_href="https://www1.hkexnews.hk/abs.pdf",
@@ -359,6 +472,9 @@ class TestCollectAnnouncements:
         await crawler._collect_announcements(bm, date(2026, 4, 2))
 
         assert page.click.call_count == 2  # clicked twice before reaching 3 of 3
+        # Each click must be followed by wait_for_function polling the counter;
+        # domcontentloaded is not a reliable signal for the LOAD MORE XHR.
+        assert page.wait_for_function.call_count == 2
 
 
 # ---------------------------------------------------------------------------

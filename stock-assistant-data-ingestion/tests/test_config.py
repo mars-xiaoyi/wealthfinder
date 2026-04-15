@@ -71,7 +71,7 @@ class TestLoadConfig:
         assert config.crawl.max_retry == 3
         assert config.crawl.retry_base_wait_ms == 500
         assert config.crawl.request_timeout_s == 10
-        assert config.crawl.browser_navigation_timeout_ms == 30000
+        assert config.crawl.browser_navigation_timeout_ms == 15000
         assert config.clean.worker_concurrency == 5
         assert config.clean.body_min_length == 50
         assert config.clean.stream_claim_timeout_ms == 30000

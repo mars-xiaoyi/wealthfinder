@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -126,8 +127,22 @@ class HKEXCrawler(BaseCrawler):
                     break
                 logger.debug("[hkex_crawler] Clicking LOAD MORE (#%d)", click_idx + 1)
                 await page.click(LOAD_MORE_SELECTOR, timeout=nav_timeout_ms)
-                await page.wait_for_load_state(
-                    "domcontentloaded", timeout=nav_timeout_ms
+                # LOAD MORE fires an XHR invisible to load/domcontentloaded events.
+                # Poll the pagination counter until it advances past the pre-click
+                # value — otherwise the next iteration reads stale text and re-clicks
+                # a detached button mid-rerender, hanging until timeout.
+                await page.wait_for_function(
+                    """
+                    ({selector, prev}) => {
+                        const el = document.querySelector(selector);
+                        if (!el) return false;
+                        const m = (el.textContent || '').match(/(\\d+)\\D+(\\d+)/);
+                        if (!m) return false;
+                        return parseInt(m[1], 10) > prev;
+                    }
+                    """,
+                    arg={"selector": PAGINATION_SELECTOR, "prev": showing},
+                    timeout=nav_timeout_ms,
                 )
             else:
                 logger.warning(
@@ -137,21 +152,55 @@ class HKEXCrawler(BaseCrawler):
 
             row_elements = await page.query_selector_all(ROW_SELECTOR)
             announcements: list[HKEXAnnouncement] = []
+            drop_reasons: Counter[str] = Counter()
             for row in row_elements:
-                parsed = await self._extract_row(row)
+                parsed, reason = await self._extract_row(row)
                 if parsed is not None:
                     announcements.append(parsed)
+                else:
+                    drop_reasons[reason] += 1
+            logger.info(
+                "[hkex_crawler] Phase 1 row buckets: total=%d parsed=%d drops=%s",
+                len(row_elements),
+                len(announcements),
+                dict(drop_reasons),
+            )
             return announcements
         finally:
             await browser_manager.release_context(context)
 
-    async def _extract_row(self, row) -> Optional[HKEXAnnouncement]:
+    async def _extract_row(
+        self, row
+    ) -> tuple[Optional[HKEXAnnouncement], str]:
+        """
+        Returns (announcement | None, reason). Reason is one of:
+        "ok", "no_pdf_link", "no_href". On a drop, logs the row's inner HTML
+        at DEBUG so dropped rows can be spot-checked.
+        """
         pdf_el = await row.query_selector(PDF_LINK_SELECTOR)
         if pdf_el is None:
-            return None
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    html = await row.inner_html()
+                except Exception:
+                    html = "<inner_html unavailable>"
+                logger.debug(
+                    "[hkex_crawler] Drop row (no_pdf_link); html[:200]=%s",
+                    html[:200],
+                )
+            return None, "no_pdf_link"
         href = await pdf_el.get_attribute("href")
         if not href:
-            return None
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    html = await row.inner_html()
+                except Exception:
+                    html = "<inner_html unavailable>"
+                logger.debug(
+                    "[hkex_crawler] Drop row (no_href); html[:200]=%s",
+                    html[:200],
+                )
+            return None, "no_href"
         pdf_url = href if href.startswith("http") else HKEX_BASE_URL + href
 
         headline_el = await row.query_selector(HEADLINE_SELECTOR)
@@ -174,11 +223,14 @@ class HKEXCrawler(BaseCrawler):
         stock_raw = (await stock_el.text_content() if stock_el else "") or ""
         stock_codes = self._parse_stock_codes(stock_raw)
 
-        return HKEXAnnouncement(
-            pdf_url=pdf_url,
-            title=title,
-            published_at=published_at,
-            stock_codes=stock_codes,
+        return (
+            HKEXAnnouncement(
+                pdf_url=pdf_url,
+                title=title,
+                published_at=published_at,
+                stock_codes=stock_codes,
+            ),
+            "ok",
         )
 
     # --------------------------------------------------------- Phase 2
@@ -284,13 +336,20 @@ class HKEXCrawler(BaseCrawler):
 
     # --------------------------------------------------------- helpers
 
-    @staticmethod
-    def _parse_release_time(raw: str) -> datetime:
+    _RELEASE_TIME_PATTERN = re.compile(r"(\d{2}/\d{2}/\d{4} \d{2}:\d{2})")
+
+    @classmethod
+    def _parse_release_time(cls, raw: str) -> datetime:
         """
-        Parse 'DD/MM/YYYY HH:mm' (HKT) → UTC datetime.
-        Raises ValueError if the format does not match.
+        Parse 'DD/MM/YYYY HH:mm' (HKT) → UTC datetime. The cell text may be
+        wrapped in a label prefix like 'Release Time: 14/04/2026 22:52' on
+        live pages, so we regex-extract the datetime substring first.
+        Raises ValueError if no timestamp pattern is found.
         """
-        hkt = datetime.strptime(raw, "%d/%m/%Y %H:%M")
+        match = cls._RELEASE_TIME_PATTERN.search(raw)
+        if match is None:
+            raise ValueError(f"No timestamp pattern in {raw!r}")
+        hkt = datetime.strptime(match.group(1), "%d/%m/%Y %H:%M")
         # HKT is UTC+8; convert to UTC
         utc = hkt.replace(tzinfo=timezone(timedelta(hours=8))).astimezone(timezone.utc)
         return utc

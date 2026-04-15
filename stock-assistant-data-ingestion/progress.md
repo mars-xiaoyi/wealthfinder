@@ -1,6 +1,6 @@
 # SADI — Implementation Progress
 
-Last updated: 2026-04-15
+Last updated: 2026-04-16
 
 ---
 
@@ -79,8 +79,10 @@ Last updated: 2026-04-15
 
 ## TODO
 
-- [ ] Time a real HKEX Phase 1 run (`page.goto` + LOAD MORE loop) to pick a reasonable default for `CRAWL_BROWSER_NAV_TIMEOUT_MS`; current 30000 is a guess.
-- [ ] Run integration tests against live sources for all 4 crawlers (HKEX, Ming Pao, AAStocks, Yahoo HK) to confirm the code works end-to-end in the real world.
+- [x] Time a real HKEX Phase 1 run (`page.goto` + LOAD MORE loop) to pick a reasonable default for `CRAWL_BROWSER_NAV_TIMEOUT_MS`. _Measured 2026-04-15 via `poc/sadi/time_hkex_phase1.py` against 2026-04-14 (560 filings, 5 LOAD MORE clicks). Per-op p95: `page.goto` 3656 ms, `click` 155 ms, XHR-wait 625 ms, `query_selector_all` 482 ms. Default lowered 30000 → 15000 ms (~4× worst-op p95). Also fixed a latent bug: `_collect_announcements` was using `wait_for_load_state("domcontentloaded")` which returns before the LOAD MORE XHR completes, causing detached-element hangs — replaced with `page.wait_for_function` polling the pagination counter._
+- [x] Run integration tests against live sources for all 4 crawlers. _Added `tests/integration/crawlers/` opt-in via `pytest -m live` (registered in `pytest.ini`; skipped by default). Stub DB satisfies the error-log and coverage-gap reads; real httpx + real playwright exercise fetch/parse. Results on 2026-04-15: **Yahoo HK** ✅ 5 successes / 0 failures (2.6 s), **AAStocks** ✅ 21 / 0 (12 s), **HKEX** ✅ 379 / 0 for 2026-04-14 (94 s, Phase 1 560 rows → 379 parsed, rest were empty-body skips), **Ming Pao** ❌ 0 / 0 — blocked by Cloudflare (see follow-up)._
+- [x] **MingPaoCrawler blocked by Cloudflare.** _Fixed 2026-04-15 in shared `BrowserManager`: `launch(channel="chromium", args=["--disable-blink-features=AutomationControlled"])` (forces the full Chromium build over `chromium_headless_shell`, hides the `navigator.webdriver` tell) and `new_context(user_agent=<desktop Chrome UA>, locale="zh-HK", extra_http_headers={"Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8"})`. Live results 2026-04-15: **MingPao** 88 / 0 (148 s), **HKEX** regression-check 379 / 0 (97 s, unchanged). Deployment note: needs `playwright install chromium` (full build), not just `chromium-headless-shell`._
+- [x] **HKEX data-quality spot checks.** _Investigated 2026-04-16 by adding row-bucket instrumentation to `_collect_announcements` (drop reasons: `no_pdf_link`, `no_href`). Live re-run on 2026-04-14 showed `total=560 parsed=379 drops={'no_pdf_link': 181}` — the 181 "missing" rows are not PDF-parse failures or empty bodies, they are legitimate drops at `_extract_row` for rows without a `td > div.doc-link > a[href$='.pdf']` anchor (multi-document filings, HTML-only notices, non-PDF forms). The empty-body branch at `hkex_crawler.py:285-287` is effectively dead code given `parse_pdf`'s contract — left in place as a defensive guard. Separately, the `published_at=None` issue was **100% of successes, not "at least one"**: live `td.release-time` cells render as ` Release Time: DD/MM/YYYY HH:MM` and the bare `strptime("%d/%m/%Y %H:%M")` rejected every one. Fixed by regex-extracting the datetime substring in `_parse_release_time`. Post-fix live run: 379/379 successes carry `published_at`, 0 warnings._
 
 ---
 
@@ -89,4 +91,4 @@ Last updated: 2026-04-15
 | # | Question | Status |
 |---|---|---|
 | Q-2 | Validate `CLEAN_BODY_MIN_LENGTH = 50` against real crawl data | Unresolved — do not implement workarounds |
-| Q-3 | Audit `_parse_published_at` in all crawlers — current `re.search` over full page HTML is fragile (can match sidebar dates, footer copyright, embedded scripts). Scope regex to a CSS-selected DOM element instead. Needs sample article HTML from each source to identify the correct timestamp selector. | Unresolved — follow-up after live fetch |
+| Q-3 | Audit `_parse_published_at` in all crawlers — current `re.search` over full page HTML is fragile (can match sidebar dates, footer copyright, embedded scripts). Scope regex to a CSS-selected DOM element instead. Needs sample article HTML from each source to identify the correct timestamp selector. | Resolved 2026-04-16. Sampled live HTML from both affected sources. **AAStocks**: timestamp sits in `div.newstime5` (skip the `newshead-Source` sibling), inside a `document.write(ConvertToLocalTime({dt:'YYYY/MM/DD HH:MM'}))` JS call — `_parse_published_at` now scopes the existing regex to that div's inner HTML. **Ming Pao**: timestamp sits in `div.date.color2nd` (e.g. `2026年4月15日 星期三　6:04AM`); the `div.date[itemprop="datePublished"]` sibling only carries the date with no time and is avoided — `_extract_published_at_from_page` now reads `get_text()` off the scoped node. HKEX (`td.release-time`) and Yahoo HK (RSS `pubDate` only) were already CSS-scoped / not affected. Unit tests added for noise-rejection (sidebar/footer dates, date-only sibling); live re-run: AAStocks 19/0, MingPao 88/0, both with populated timestamps. |

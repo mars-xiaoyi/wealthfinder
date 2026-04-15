@@ -977,6 +977,8 @@ finally:
 
 > **Why shared browser?** Starting a playwright Chromium instance takes ~1–2 seconds. HKEX and MingPao may run concurrently, so sharing avoids the overhead of two startup sequences.
 
+> **Anti-fingerprint defaults (do not strip).** `start()` must launch with `channel="chromium"` (forces the full Chromium build — `chromium_headless_shell` is aggressively fingerprinted by Cloudflare) and `args=["--disable-blink-features=AutomationControlled"]` (hides the `navigator.webdriver` automation tell). `acquire_context()` must set a realistic desktop Chrome `user_agent`, `locale="zh-HK"`, and `extra_http_headers={"Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8"}`. MingPao's live crawl returns a CF "Attention Required" interstitial for 100% of articles without these. HKEX does not require them but tolerates them.
+
 ### 8.4 `app/crawl/fetchers/feed_fetcher.py` — RSS Feed Parsing
 
 #### Function: `fetch_rss(url: str) -> list[FeedEntry]`
@@ -1233,7 +1235,7 @@ flowchart TD
     D --> E{Showing N of N?}
     E -->|No| F[Click a.component-loadmore__link\nwait domcontentloaded]
     F --> D
-    E -->|Yes| H[Extract all rows: table tbody tr\nFor each: PDF link, headline, stock_code, release_time]
+    E -->|Yes| H[Extract all rows: table tbody tr\nFor each: PDF link, headline, stock_code, release_time\nDrop rows without a PDF link; log bucket summary total/parsed/drops]
     H --> I[Phase 2: Create asyncio.Queue + Semaphore max_concurrent]
     I --> J[Launch PDF fetch workers]
     J --> K{Queue empty?}
@@ -1252,9 +1254,13 @@ flowchart TD
 #### Helper: `_parse_release_time(raw: str) -> datetime`
 
 ```
-Purpose : Parse HKEX release time string to UTC datetime.
-Input   : "02/04/2026 22:59" (format: DD/MM/YYYY HH:mm, HKT timezone)
-Returns : UTC datetime (subtract 8 hours from HKT)
+Purpose : Parse HKEX release time cell text to UTC datetime.
+Input   : text_content of td.release-time. Live pages render a label prefix,
+          e.g. " Release Time: 14/04/2026 22:52". A bare "02/04/2026 22:59"
+          also occurs in some layouts — both must parse.
+Strategy: Regex-extract the "DD/MM/YYYY HH:mm" substring (HKT), then strptime.
+Returns : UTC datetime (convert from HKT by subtracting 8 hours).
+Raises  : ValueError if no timestamp pattern is present.
 ```
 
 #### Helper: `_parse_pagination_counts(text: str) -> tuple[int, int]`
@@ -1300,7 +1306,7 @@ flowchart TD
     JJ --> K[Extract article selector]
     K -->|Body empty after retries| L[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
     K -->|OK| M{published_at from RSS?}
-    M -->|No| N[Extract from page time element\nregex parse]
+    M -->|No| N[Extract from div.date.color2nd\nregex parse]
     M -->|Yes| O[Use RSS published_at UTC]
     N --> O
     O --> P[Build CrawlSuccessItem\nAppend to result.successes\nRelease semaphore]
@@ -1315,10 +1321,13 @@ flowchart TD
 
 ```
 Purpose : Fallback published_at extraction from article HTML when RSS field is missing.
-          Searches for a <time> element and parses its innerText.
-Input   : Raw HTML string of the article page
-Pattern : r"\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}:\d{2}[AP]M"
-Returns : UTC datetime, or None if not found
+Scope   : CSS selector "div.date.color2nd" (live markup renders
+          "2026年4月15日 星期三　6:04AM"). The `div.date[itemprop="datePublished"]`
+          sibling only carries the date (no time) and is deliberately avoided.
+          Full-HTML regex is forbidden — footer/copyright/sidebar dates can match.
+Pattern : r"\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}:\d{2}[AP]M" applied to get_text()
+          of the scoped node.
+Returns : UTC datetime, or None if the selector or pattern is missing.
 ```
 
 ### 8.11 `app/crawl/crawlers/aastocks_crawler.py` — AAStocksCrawler
@@ -1350,7 +1359,7 @@ flowchart TD
     I -->|CrawlBlockedError 403/404\nor CrawlNetworkError after retries| J[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
     I -->|OK| K[CSS selector newscon\nExtract body]
     K -->|Empty| J
-    K -->|OK| M[Regex extract published_at\nfrom page text\nConvert HKT → UTC]
+    K -->|OK| M[Extract published_at\nfrom div.newstime5 (skip newshead-Source sibling)\nConvert HKT → UTC]
     M --> N[Build CrawlSuccessItem\nAppend to result.successes\nRelease semaphore]
     J & N --> G
     G -->|Done| R([return CrawlResult])
@@ -1361,9 +1370,16 @@ flowchart TD
 #### Helper: `_parse_published_at(page_html: str) -> Optional[datetime]`
 
 ```
-Purpose : Extract published_at from AAStocks article page visible text.
-Pattern : r"\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}"  e.g. "2026/04/06 01:27"
-Returns : UTC datetime (convert from HKT by subtracting 8 hours), or None if not found
+Purpose : Extract published_at from the AAStocks article header.
+Scope   : CSS selector "div.newstime5", skipping the sibling that also carries
+          the `newshead-Source` class (that one holds the source label, not
+          the time). The timestamp itself lives inside a JS call rendered by
+          the page: `document.write(ConvertToLocalTime({dt:'YYYY/MM/DD HH:MM'}))`,
+          so the regex runs on the div's inner HTML (str(div)), not its text.
+          Full-HTML regex is forbidden — sidebar/related-story dates can match.
+Pattern : r"(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2})"  e.g. "2026/04/06 01:27"
+Returns : UTC datetime (convert from HKT by subtracting 8 hours), or None if
+          the selector or pattern is missing.
 ```
 
 ### 8.12 `app/crawl/crawlers/yahoo_hk_crawler.py` — YahooHKCrawler

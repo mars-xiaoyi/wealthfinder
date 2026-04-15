@@ -88,7 +88,7 @@ def load_config() -> AppConfig:
         retry_base_wait_ms=int(os.environ.get("CRAWL_RETRY_BASE_WAIT_MS", "500")),
         request_timeout_s=int(os.environ.get("CRAWL_REQUEST_TIMEOUT_S", "10")),
         browser_navigation_timeout_ms=int(
-            os.environ.get("CRAWL_BROWSER_NAV_TIMEOUT_MS", "30000")
+            os.environ.get("CRAWL_BROWSER_NAV_TIMEOUT_MS", "15000")
         ),
         crawl_sources=crawl_sources,
     )

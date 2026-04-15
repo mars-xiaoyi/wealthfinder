@@ -23,7 +23,11 @@ async def test_start_launches_browser():
         await manager.start()
 
     assert manager._browser is mock_browser
-    mock_pw.chromium.launch.assert_called_once_with(headless=True)
+    mock_pw.chromium.launch.assert_called_once_with(
+        channel="chromium",
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
 
 
 @pytest.mark.asyncio
@@ -64,6 +68,10 @@ async def test_acquire_context_creates_new_context():
 
     assert ctx is mock_context
     mock_browser.new_context.assert_called_once()
+    _, kwargs = mock_browser.new_context.call_args
+    assert "Chrome" in kwargs["user_agent"]
+    assert kwargs["locale"] == "zh-HK"
+    assert kwargs["extra_http_headers"]["Accept-Language"].startswith("zh-HK")
 
 
 @pytest.mark.asyncio

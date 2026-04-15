@@ -4,6 +4,8 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+from bs4 import BeautifulSoup
+
 from app.config import CrawlSourceConfig
 from app.crawl.crawlers.base_crawler import (
     BaseCrawler,
@@ -24,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 MINGPAO_RSS_URL = "https://news.mingpao.com/rss/pns/s00004.xml"
 ARTICLE_BODY_SELECTOR = "article"
+# Article header date cell, e.g. "2026年4月15日 星期三　6:04AM". The sibling
+# `div.date[itemprop="datePublished"]` only carries the date (no time), so
+# we avoid it.
+PUBLISHED_AT_SELECTOR = "div.date.color2nd"
 
 # Fallback published_at pattern (e.g. "2026年4月6日 星期一 06:00AM")
 _PUBLISHED_AT_PATTERN = re.compile(
@@ -160,11 +166,15 @@ class MingPaoCrawler(BaseCrawler):
     @staticmethod
     def _extract_published_at_from_page(page_html: str) -> Optional[datetime]:
         """
-        Fallback parser for the article page <time> element. The MingPao layout
-        renders dates like '2026年4月6日 星期一 06:00AM' (HKT). Returns UTC datetime,
-        or None if no match.
+        Fallback parser — reads the article header date cell
+        (`div.date.color2nd`, e.g. "2026年4月15日 星期三　6:04AM"). Returns UTC
+        datetime, or None if the cell or timestamp pattern is missing.
         """
-        match = _PUBLISHED_AT_PATTERN.search(page_html)
+        soup = BeautifulSoup(page_html, "html.parser")
+        date_div = soup.select_one(PUBLISHED_AT_SELECTOR)
+        if date_div is None:
+            return None
+        match = _PUBLISHED_AT_PATTERN.search(date_div.get_text())
         if match is None:
             return None
         year, month, day, hour, minute, ampm = match.groups()

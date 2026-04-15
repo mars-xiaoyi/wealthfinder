@@ -161,7 +161,7 @@ This section documents the implementation details for each source crawler. It is
 | Article fetch | playwright headless browser required — httpx returns HTTP 403 due to TLS fingerprint detection. No paywall, no login required |
 | playwright `waitUntil` | `domcontentloaded` (~2,226ms). Do not use `networkidle` (~5,871ms) — unnecessary overhead; `<article>` is available at domContentLoaded |
 | Article body selector | `article` — captures full article body (~950 chars average) |
-| `published_at` fallback | If RSS `published` field is missing, extract from article page `<time>` element innerText using regex `\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}:\d{2}[AP]M` |
+| `published_at` fallback | If RSS `published` field is missing, extract from the CSS-scoped header cell `div.date.color2nd` (e.g. `"2026年4月15日 星期三　6:04AM"`) using regex `\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}:\d{2}[AP]M`. Do NOT scan the full page HTML — the sibling `div.date[itemprop="datePublished"]` carries only the date (no time), and footer/copyright dates can otherwise match |
 | playwright instance | Shared with HKEX (same `Browser` process, separate `BrowserContext`). Multiple page workers within MINGPAO share the same `BrowserContext`. Context is created fresh per crawl execution and closed on completion |
 
 ---
@@ -369,9 +369,9 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | **HKEX** — titlesearch batch | playwright GET `titlesearch.xhtml?from={date}&to={date}` (date format: `YYYYMMDD`); click LOAD MORE until regex extracts equal integers from `.component-loadmore-leftPart__container` (≤15 clicks, ~44s total); extract all rows: PDF link, headline, stock code, release time | Full PDF link list for the day |
 | **HKEX** — PDF fetch | httpx GET each PDF URL (direct link, no auth, no cookie); pymupdf → pdfminer.six fallback; dedup by PDF URL; write stock code to `extra_metadata.stock_code` | Plain text body + metadata |
 | **MINGPAO** — RSS fetch | feedparser GET RSS (bare request, no auth); returns ~26 entries; `published_at` from RFC 822 `published` field converted to UTC | Article list (title, url, published_at) |
-| **MINGPAO** — Browser crawl | playwright headless browser GET article URL (`waitUntil='domcontentloaded'`); extract with `article` CSS selector; fallback `published_at` from `<time>` innerText if RSS field missing | Plain text body |
+| **MINGPAO** — Browser crawl | playwright headless browser GET article URL (`waitUntil='domcontentloaded'`); extract with `article` CSS selector; fallback `published_at` from CSS-scoped `div.date.color2nd` (not the date-only `div[itemprop="datePublished"]` sibling) if RSS field missing | Plain text body |
 | **AASTOCKS** — List fetch | httpx GET list page (`/tc/` prefix); CSS selector `a[href*='/aafn-con/NOW.']` extracts 9 article URLs | Article URL list |
-| **AASTOCKS** — Article crawl | httpx GET article URL (`/tc/` prefix); CSS selector `[class*='newscon']` extracts body; regex extracts `published_at` from visible text (format: `YYYY/MM/DD HH:mm`); convert HKT→UTC | Plain text body |
+| **AASTOCKS** — Article crawl | httpx GET article URL (`/tc/` prefix); CSS selector `[class*='newscon']` extracts body; `published_at` extracted from CSS-scoped `div.newstime5` (skipping its `newshead-Source` sibling that holds the source label), where the timestamp is embedded inside a `document.write(ConvertToLocalTime({dt:'YYYY/MM/DD HH:MM'}))` JS call — regex against the div's inner HTML, then HKT→UTC | Plain text body |
 | **YAHOO_HK** — RSS fetch | feedparser GET RSS; apply `url_prefix_filter` (`hk.finance.yahoo.com/news/`) to discard ad URLs; returns ≤5 real entries; `published_at` from RSS `published` field converted to UTC | Article list (title, url, published_at) |
 | **YAHOO_HK** — Coverage check | If oldest entry `published_at` > previous crawl execution time: log warning (potential gap) | Warning log entry |
 | **YAHOO_HK** — Article crawl | httpx GET article URL; trafilatura auto-extraction | Plain text body |

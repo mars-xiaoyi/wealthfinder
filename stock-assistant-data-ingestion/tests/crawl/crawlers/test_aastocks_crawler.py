@@ -88,14 +88,48 @@ class TestExtractArticleUrls:
 # ---------------------------------------------------------------------------
 
 class TestParsePublishedAt:
-    def test_converts_hkt_to_utc(self):
-        html = "<p>Published 2026/04/06 01:27 some text</p>"
+    def test_converts_hkt_to_utc_from_newstime5_div(self):
+        html = (
+            "<div class='float_l newstime5'>"
+            "<script type='text/javascript'>"
+            "document.write(ConvertToLocalTime({dt:'2026/04/06 01:27'}));"
+            "</script></div>"
+        )
         result = AAStocksCrawler._parse_published_at(html)
         # 01:27 HKT = 17:27 previous day UTC
         assert result == datetime(2026, 4, 5, 17, 27, tzinfo=timezone.utc)
 
-    def test_returns_none_when_no_match(self):
-        assert AAStocksCrawler._parse_published_at("nothing") is None
+    def test_ignores_dates_outside_newstime5(self):
+        # A sidebar/related-stories date must NOT be picked up: before the
+        # CSS scoping, the regex would greedily match anywhere in the page.
+        html = (
+            "<div class='sidebar'>Related: 2020/01/01 00:00</div>"
+            "<div class='float_l newstime5'>"
+            "<script>document.write(ConvertToLocalTime({dt:'2026/04/06 09:00'}));</script>"
+            "</div>"
+        )
+        result = AAStocksCrawler._parse_published_at(html)
+        # Must pick up 09:00 HKT (01:00 UTC), not 2020-01-01.
+        assert result == datetime(2026, 4, 6, 1, 0, tzinfo=timezone.utc)
+
+    def test_skips_newshead_source_sibling(self):
+        # The source-label cell shares the `newstime5` class but is marked
+        # `newshead-Source`; it must not be treated as the timestamp cell.
+        html = (
+            "<div class='float_l newstime5 newshead-Source'>AASTOCKS 2020/01/01 00:00</div>"
+            "<div class='float_l newstime5'>"
+            "<script>document.write(ConvertToLocalTime({dt:'2026/04/06 09:00'}));</script>"
+            "</div>"
+        )
+        result = AAStocksCrawler._parse_published_at(html)
+        assert result == datetime(2026, 4, 6, 1, 0, tzinfo=timezone.utc)
+
+    def test_returns_none_when_selector_missing(self):
+        assert AAStocksCrawler._parse_published_at("<p>nothing</p>") is None
+
+    def test_returns_none_when_selector_present_but_no_pattern(self):
+        html = "<div class='float_l newstime5'>no timestamp here</div>"
+        assert AAStocksCrawler._parse_published_at(html) is None
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +143,9 @@ class TestFetchOneArticle:
         html = (
             "<html><head><title>Some Title</title></head>"
             "<body><div class='newscontent5 fLevel3'>article body here</div>"
-            "<p>2026/04/06 01:27</p></body></html>"
+            "<div class='float_l newstime5'>"
+            "<script>document.write(ConvertToLocalTime({dt:'2026/04/06 01:27'}));</script>"
+            "</div></body></html>"
         )
         pc.fetch.return_value = make_response(html)
         crawler = make_crawler(page_crawler=pc)
@@ -222,7 +258,9 @@ class TestRun:
         article_html = (
             "<html><head><title>T</title></head>"
             "<body><div class='newscontent5'>body</div>"
-            "<p>2026/04/06 12:00</p></body></html>"
+            "<div class='float_l newstime5'>"
+            "<script>document.write(ConvertToLocalTime({dt:'2026/04/06 12:00'}));</script>"
+            "</div></body></html>"
         )
         pc.fetch.side_effect = [make_response(list_html), make_response(article_html)]
         crawler = make_crawler(page_crawler=pc)

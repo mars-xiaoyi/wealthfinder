@@ -59,20 +59,41 @@ def _make_fake_context(html: str | Exception = "<html><article>body text</articl
 # ---------------------------------------------------------------------------
 
 class TestExtractPublishedAtFromPage:
-    def test_parses_morning_time(self):
-        html = "<time>2026年4月6日 星期一 06:00AM</time>"
+    def test_parses_morning_time_from_date_color2nd(self):
+        html = "<div class='date color2nd'>2026年4月6日 星期一　06:00AM</div>"
         result = MingPaoCrawler._extract_published_at_from_page(html)
         # 06:00 HKT = 22:00 previous day UTC
         assert result == datetime(2026, 4, 5, 22, 0, tzinfo=timezone.utc)
 
     def test_parses_evening_time(self):
-        html = "<time>2026年4月6日 星期一 06:00PM</time>"
+        html = "<div class='date color2nd'>2026年4月6日 星期一　06:00PM</div>"
         result = MingPaoCrawler._extract_published_at_from_page(html)
         # 18:00 HKT = 10:00 UTC same day
         assert result == datetime(2026, 4, 6, 10, 0, tzinfo=timezone.utc)
 
-    def test_no_match_returns_none(self):
+    def test_ignores_dates_outside_date_color2nd(self):
+        # A footer/copyright date elsewhere on the page must not be picked up.
+        html = (
+            "<footer>Copyright 2020年1月1日 星期三 12:00AM</footer>"
+            "<div class='date color2nd'>2026年4月6日 星期一　06:00AM</div>"
+        )
+        result = MingPaoCrawler._extract_published_at_from_page(html)
+        assert result == datetime(2026, 4, 5, 22, 0, tzinfo=timezone.utc)
+
+    def test_ignores_date_only_datepublished_sibling(self):
+        # `div.date[itemprop="datePublished"]` only carries the date (no time)
+        # and must not be used.
+        html = (
+            "<div class='date' itemprop='datePublished'>2026年4月6日星期一</div>"
+        )
+        assert MingPaoCrawler._extract_published_at_from_page(html) is None
+
+    def test_no_selector_returns_none(self):
         assert MingPaoCrawler._extract_published_at_from_page("<html></html>") is None
+
+    def test_selector_present_but_no_pattern_returns_none(self):
+        html = "<div class='date color2nd'>2026年4月6日 星期一</div>"
+        assert MingPaoCrawler._extract_published_at_from_page(html) is None
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +122,7 @@ class TestFetchOneArticle:
         crawler = make_crawler()
         html = (
             "<html><article>some body content</article>"
-            "<time>2026年4月6日 06:00PM</time></html>"
+            "<div class='date color2nd'>2026年4月6日 星期一　06:00PM</div></html>"
         )
         context, _ = _make_fake_context(html)
         result = CrawlResult()

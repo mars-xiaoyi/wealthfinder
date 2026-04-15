@@ -26,6 +26,10 @@ AASTOCKS_LIST_URL = "https://www.aastocks.com/tc/stocks/news/aafn/latest-news"
 AASTOCKS_BASE_URL = "https://www.aastocks.com"
 ARTICLE_LINK_SELECTOR = "a[href*='/aafn-con/NOW.']"
 ARTICLE_BODY_SELECTOR = "[class*='newscon']"
+# Article header cell containing the timestamp (rendered by
+# `document.write(ConvertToLocalTime({dt:'YYYY/MM/DD HH:MM'}))`). The sibling
+# `div.newstime5.newshead-Source` holds the source label and is skipped.
+PUBLISHED_AT_SELECTOR = "div.newstime5"
 
 _PUBLISHED_AT_PATTERN = re.compile(r"(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2})")
 _HKT = timezone(timedelta(hours=8))
@@ -171,9 +175,22 @@ class AAStocksCrawler(BaseCrawler):
 
     @staticmethod
     def _parse_published_at(page_html: str) -> Optional[datetime]:
-        match = _PUBLISHED_AT_PATTERN.search(page_html)
-        if match is None:
-            return None
-        year, month, day, hour, minute = (int(g) for g in match.groups())
-        hkt = datetime(year, month, day, hour, minute, tzinfo=_HKT)
-        return hkt.astimezone(timezone.utc)
+        """
+        Extract the article timestamp from `div.newstime5` (skipping the
+        `newshead-Source` sibling which carries the source label). The date
+        lives inside a JS call — `document.write(ConvertToLocalTime({dt:
+        'YYYY/MM/DD HH:MM'}))` — so we regex the div's raw HTML, not its text.
+        Returns UTC datetime, or None if the cell or pattern is missing.
+        """
+        soup = BeautifulSoup(page_html, "html.parser")
+        for div in soup.select(PUBLISHED_AT_SELECTOR):
+            classes = div.get("class") or []
+            if "newshead-Source" in classes:
+                continue
+            match = _PUBLISHED_AT_PATTERN.search(str(div))
+            if match is None:
+                continue
+            year, month, day, hour, minute = (int(g) for g in match.groups())
+            hkt = datetime(year, month, day, hour, minute, tzinfo=_HKT)
+            return hkt.astimezone(timezone.utc)
+        return None
