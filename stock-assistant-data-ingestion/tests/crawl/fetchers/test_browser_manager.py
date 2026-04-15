@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.crawler.browser_manager import BrowserManager
+from app.crawl.fetchers.browser_manager import BrowserManager
 
 
 # ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ async def test_start_launches_browser():
     mock_pw_cm = AsyncMock()
     mock_pw_cm.start = AsyncMock(return_value=mock_pw)
 
-    with patch("app.crawler.browser_manager.async_playwright", return_value=mock_pw_cm):
+    with patch("app.crawl.fetchers.browser_manager.async_playwright", return_value=mock_pw_cm):
         await manager.start()
 
     assert manager._browser is mock_browser

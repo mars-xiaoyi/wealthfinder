@@ -5,18 +5,19 @@ import asyncpg
 import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
-from app.crawler.aastocks_crawler import AAStocksCrawler
-from app.crawler.base_crawler import (
+from app.crawl.crawlers.aastocks_crawler import AAStocksCrawler
+from app.crawl.crawlers.base_crawler import (
     CrawlFailItem,
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawler.crawl_service import CrawlService
-from app.crawler.exceptions import CrawlFatalError
-from app.crawler.hkex_crawler import HKEXCrawler
-from app.crawler.mingpao_crawler import MingPaoCrawler
-from app.crawler.source_name import CrawlSourceName
-from app.crawler.yahoo_hk_crawler import YahooHKCrawler
+from app.crawl.crawl_service import CrawlService
+from app.common.error_codes import NetworkErrorCode
+from app.crawl.exceptions import CrawlFatalError
+from app.crawl.crawlers.hkex_crawler import HKEXCrawler
+from app.crawl.crawlers.mingpao_crawler import MingPaoCrawler
+from app.crawl.source_name import CrawlSourceName
+from app.crawl.crawlers.yahoo_hk_crawler import YahooHKCrawler
 from app.redis.stream_client import (
     STREAM_CRAWL_COMPLETED,
     STREAM_RAW_NEWS_INSERTED,
@@ -36,6 +37,7 @@ def make_config() -> CrawlConfig:
         max_retry=3,
         retry_base_wait_ms=10,
         request_timeout_s=10,
+        browser_navigation_timeout_ms=30000,
         crawl_sources=sources,
     )
 
@@ -69,8 +71,8 @@ def make_success(url="https://x/1") -> CrawlSuccessItem:
 def make_failure(url="https://x/bad") -> CrawlFailItem:
     return CrawlFailItem(
         source_url=url,
-        error_type="NETWORK",
-        error_code="HTTP_403",
+        error_type=NetworkErrorCode.HTTP_403.error_type,
+        error_code=NetworkErrorCode.HTTP_403.error_code,
         attempt_count=1,
     )
 

@@ -3,13 +3,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.crawler.base_crawler import (
+from app.crawl.crawlers.base_crawler import (
     BaseCrawler,
     CrawlFailItem,
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawler.exceptions import CrawlFatalError
+from app.crawl.exceptions import CrawlFatalError
 
 
 # ---------------------------------------------------------------------------

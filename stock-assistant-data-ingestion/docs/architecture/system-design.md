@@ -578,17 +578,23 @@ Backoff formula: `wait = DB_RETRY_BASE_WAIT_MS × 2^(attempt - 1)`
 ```
 sadi/
 ├── app/
-│   ├── crawler/
-│   │   ├── base_crawler.py          # Abstract base class for all Crawler implementations
-│   │   ├── hkex_crawler.py          # HKEXCrawler — playwright batch, PDF fetch
-│   │   ├── mingpao_crawler.py       # MingPaoCrawler — RSS + playwright browser
-│   │   ├── aastocks_crawler.py      # AAStocksCrawler — list page + httpx
-│   │   ├── yahoo_hk_crawler.py      # YahooHKCrawler — RSS + trafilatura
-│   │   ├── browser_manager.py       # playwright Browser/BrowserContext lifecycle (shared HKEX + MINGPAO)
-│   │   ├── feed_fetcher.py          # RSS parsing via feedparser
-│   │   ├── page_crawler.py          # HTTP fetch via httpx, crawl_with_retry()
-│   │   ├── html_parser.py           # trafilatura extraction + BS4/CSS selector fallback
-│   │   └── pdf_parser.py            # pymupdf primary + pdfminer.six fallback
+│   ├── crawl/
+│   │   ├── crawl_service.py         # CrawlService: orchestration, DB save, stream signals
+│   │   ├── source_name.py           # CrawlSourceName enum (imported by api/schemas.py)
+│   │   ├── exceptions.py            # Shared crawler exceptions
+│   │   ├── crawlers/                # BaseCrawler ABC + one module per source
+│   │   │   ├── base_crawler.py      # Abstract base class for all Crawler implementations
+│   │   │   ├── hkex_crawler.py      # HKEXCrawler — playwright batch, PDF fetch
+│   │   │   ├── mingpao_crawler.py   # MingPaoCrawler — RSS + playwright browser
+│   │   │   ├── aastocks_crawler.py  # AAStocksCrawler — list page + httpx
+│   │   │   └── yahoo_hk_crawler.py  # YahooHKCrawler — RSS + trafilatura
+│   │   ├── fetchers/                # "How bytes are fetched from the network"
+│   │   │   ├── page_crawler.py      # HTTP fetch via httpx, crawl_with_retry()
+│   │   │   ├── browser_manager.py   # playwright Browser/BrowserContext lifecycle (shared HKEX + MINGPAO)
+│   │   │   └── feed_fetcher.py      # RSS parsing via feedparser
+│   │   └── parsers/                 # "How bytes become text"
+│   │       ├── html_parser.py       # trafilatura extraction + BS4/CSS selector fallback
+│   │       └── pdf_parser.py        # pymupdf primary + pdfminer.six fallback
 │   ├── cleaner/
 │   │   ├── cleaning_service.py      # Cleaning layer main service, queue management
 │   │   ├── stream_handler.py        # Redis Streams consumer/producer

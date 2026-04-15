@@ -8,7 +8,7 @@ class CrawlSourceName(str, Enum):
     source requires:
 
     1. Adding a new member here.
-    2. Implementing the corresponding Crawler class in ``app/crawler/``.
+    2. Implementing the corresponding Crawler class in ``app/crawl/``.
     3. Registering it in ``CrawlService.CRAWLER_REGISTRY``.
     """
 

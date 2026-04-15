@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.crawler.source_name import CrawlSourceName
+from app.crawl.source_name import CrawlSourceName
 
 
 # -- Enums --------------------------------------------------------------------

@@ -19,7 +19,7 @@
 5. [Database Layer — `app/db/`](#5-database-layer--appdb)
 6. [Redis Layer — `app/redis/`](#6-redis-layer--appredis)
 7. [API Layer — `app/api/`](#7-api-layer--appapi)
-8. [Crawler Layer — `app/crawler/`](#8-crawler-layer--appcrawler)
+8. [Crawler Layer — `app/crawl/`](#8-crawler-layer--appcrawl)
 9. [Cleaning Layer — `app/cleaner/`](#9-cleaning-layer--appcleaner)
 10. [Service Entry Point — `app/main.py`](#10-service-entry-point--appmainpy)
 11. [Database Migrations — `alembic/`](#11-database-migrations--alembic)
@@ -91,26 +91,30 @@ STREAM_CLAIM_TIMEOUT_MS=30000
 ```
 sadi/
 ├── app/
-│   ├── crawler/
+│   ├── crawl/
 │   │   ├── crawl_service.py         # CrawlService: orchestration, DB save, stream signals
-│   │   ├── base_crawler.py          # Abstract base class; defines CrawlResult dataclass
 │   │   ├── source_name.py           # CrawlSourceName enum (crawler domain; imported by api/schemas.py)
-│   │   ├── hkex_crawler.py          # HKEXCrawler
-│   │   ├── mingpao_crawler.py       # MingPaoCrawler
-│   │   ├── aastocks_crawler.py      # AAStocksCrawler
-│   │   ├── yahoo_hk_crawler.py      # YahooHKCrawler
-│   │   ├── browser_manager.py       # Shared playwright Browser/BrowserContext lifecycle
-│   │   ├── feed_fetcher.py          # RSS feed parsing via feedparser
-│   │   ├── exceptions.py             # Shared crawler exceptions (CrawlSkippedError, CrawlNetworkError, CrawlBlockedError, CrawlFatalError)
-│   │   ├── page_crawler.py          # HTTP fetch with retry logic
-│   │   ├── html_parser.py           # Auto-extraction + BS4 CSS selector fallback
-│   │   └── pdf_parser.py            # pymupdf primary + pdfminer.six fallback
+│   │   ├── exceptions.py            # Shared crawler exceptions (CrawlSkippedError, CrawlNetworkError, CrawlBlockedError, CrawlFatalError)
+│   │   ├── crawlers/                # BaseCrawler ABC + one module per source
+│   │   │   ├── base_crawler.py      # Abstract base class; defines CrawlResult dataclass
+│   │   │   ├── hkex_crawler.py      # HKEXCrawler
+│   │   │   ├── mingpao_crawler.py   # MingPaoCrawler
+│   │   │   ├── aastocks_crawler.py  # AAStocksCrawler
+│   │   │   └── yahoo_hk_crawler.py  # YahooHKCrawler
+│   │   ├── fetchers/                # "How bytes are fetched from the network"
+│   │   │   ├── page_crawler.py      # HTTP fetch with retry logic
+│   │   │   ├── browser_manager.py   # Shared playwright Browser/BrowserContext lifecycle
+│   │   │   └── feed_fetcher.py      # RSS feed parsing via feedparser
+│   │   └── parsers/                 # "How bytes become text"
+│   │       ├── html_parser.py       # Auto-extraction + BS4 CSS selector fallback
+│   │       └── pdf_parser.py        # pymupdf primary + pdfminer.six fallback
 │   ├── cleaner/
 │   │   ├── cleaning_service.py      # Cleaning layer: queue management + 7-step pipeline
 │   │   ├── stream_handler.py        # Redis Streams consumer + producer
 │   │   └── dedup_service.py         # is_duplicate() — cross-source raw_hash lookup
 │   ├── common/
-│   │   └── text_utils.py            # normalise() + compute_hash() — pure text tools shared by crawl & clean layers
+│   │   ├── text_utils.py            # normalise() + compute_hash() — pure text tools shared by crawl & clean layers
+│   │   └── error_codes.py           # ErrorCode base + NetworkErrorCode / DocumentParseErrorCode catalogs (SADI-6xxx)
 │   ├── api/
 │   │   ├── routes/
 │   │   │   ├── crawl.py             # POST /v1/crawl
@@ -213,7 +217,7 @@ class CrawlErrorLog:
 
 These are the request/response shapes for the FastAPI routes. Pydantic validates incoming JSON automatically.
 
-`CrawlSourceName` lives in the crawler domain (`app/crawler/source_name.py`), not in `app/api/schemas.py` — the API layer imports it from the crawler layer so the dependency direction stays API → domain. See §8.x for its definition.
+`CrawlSourceName` lives in the crawler domain (`app/crawl/source_name.py`), not in `app/api/schemas.py` — the API layer imports it from the crawler layer so the dependency direction stays API → domain. See §8.x for its definition.
 
 ```python
 from pydantic import BaseModel, Field
@@ -222,7 +226,7 @@ from typing import List, Optional, Union
 from datetime import datetime, date
 from enum import Enum
 
-from app.crawler.source_name import CrawlSourceName   # enum lives in the crawler domain
+from app.crawl.source_name import CrawlSourceName   # enum lives in the crawler domain
 
 # ── Enums ────────────────────────────────────────────────────────────────────
 
@@ -309,7 +313,8 @@ Config for the crawler layer. Passed to all Crawler classes and `page_crawler.py
 class CrawlConfig:
     max_retry: int                # Max retry attempts per URL fetch (env: CRAWL_MAX_RETRY)
     retry_base_wait_ms: int       # Base wait for exponential backoff (env: CRAWL_RETRY_BASE_WAIT_MS)
-    request_timeout_s: int        # Single page fetch timeout in seconds (env: CRAWL_REQUEST_TIMEOUT_S)
+    request_timeout_s: int        # Single httpx page fetch timeout in seconds (env: CRAWL_REQUEST_TIMEOUT_S)
+    browser_navigation_timeout_ms: int  # Playwright navigation/click/wait timeout in ms — used by HKEX & Ming Pao crawlers (env: CRAWL_BROWSER_NAV_TIMEOUT_MS)
     crawl_sources: dict[str, CrawlSourceConfig]  # Per-source behaviour; loaded from crawl_sources.yaml
 ```
 
@@ -772,9 +777,9 @@ Health status rules:
 
 ---
 
-## 8. Crawler Layer — `app/crawler/`
+## 8. Crawler Layer — `app/crawl/`
 
-### 8.1 `app/crawler/base_crawler.py` — Abstract Base Class and CrawlResult
+### 8.1 `app/crawl/crawlers/base_crawler.py` — Abstract Base Class and CrawlResult
 
 #### Dataclasses: `CrawlSuccessItem`, `CrawlFailItem`, `CrawlResult`
 
@@ -795,8 +800,8 @@ class CrawlSuccessItem:
 @dataclass
 class CrawlFailItem:
     source_url: str   # URL that failed — always present; RSS-level failures are never CrawlFailItems
-    error_type: str   # "NETWORK" / "PARSE"
-    error_code: str       # e.g. "HTTP_403", "PDF_ENCRYPTED", "TIMEOUT"
+    error_type: str   # "NETWORK" / "PARSE" — use ErrorCode catalog constants from app/common/error_codes.py
+    error_code: str       # e.g. "SADI-6101" — use ErrorCode catalog constants from app/common/error_codes.py
     attempt_count: int    # Total attempts made before giving up
 
 @dataclass
@@ -809,7 +814,7 @@ class CrawlResult:
 
 All four crawler classes extend `BaseCrawler`. Crawlers are responsible only for **fetching and parsing** — they do not touch the database or Redis.
 
-> `CrawlFatalError` is defined in `app/crawler/exceptions.py` (see §8.5), alongside the other shared crawler exceptions — **not** in `base_crawler.py`. Crawler subclasses import it as `from app.crawler.exceptions import CrawlFatalError`.
+> `CrawlFatalError` is defined in `app/crawl/exceptions.py` (see §8.5), alongside the other shared crawler exceptions — **not** in `base_crawler.py`. Crawler subclasses import it as `from app.crawl.exceptions import CrawlFatalError`.
 
 ```python
 from abc import ABC, abstractmethod
@@ -817,8 +822,8 @@ from typing import Optional
 from datetime import date
 from app.config import CrawlSourceConfig
 from app.db.connection import DatabaseClient
-from app.crawler.page_crawler import PageCrawler
-from app.crawler.browser_manager import BrowserManager
+from app.crawl.fetchers.page_crawler import PageCrawler
+from app.crawl.fetchers.browser_manager import BrowserManager
 
 class BaseCrawler(ABC):
     def __init__(
@@ -852,7 +857,7 @@ class BaseCrawler(ABC):
 
 ---
 
-### 8.2 `app/crawler/crawl_service.py` — CrawlService
+### 8.2 `app/crawl/crawl_service.py` — CrawlService
 
 Orchestrates the full crawl execution: selects the crawler, runs it, saves results, and publishes stream signals.
 
@@ -929,7 +934,7 @@ Implementation notes:
 - `stream:crawl_completed` is always published — even if zero records were saved (e.g. all duplicates or all errors). On SUCCESS the `error_detail` field is **omitted entirely** from the XADD payload (Redis Streams have no native NULL — absence IS the NULL representation); on FAILED the exception message is included.
 - Two module-level SQL constants live at the top of `crawl_service.py`: `_INSERT_RAW_NEWS_SQL` and `_INSERT_CRAWL_ERROR_LOG_SQL`. Neither query should be inlined inside a method body.
 
-### 8.3 `app/crawler/browser_manager.py` — Playwright Browser Lifecycle
+### 8.3 `app/crawl/fetchers/browser_manager.py` — Playwright Browser Lifecycle
 
 HKEX and MingPao both use playwright. They share one `Browser` process but use separate `BrowserContext` instances.
 
@@ -972,7 +977,7 @@ finally:
 
 > **Why shared browser?** Starting a playwright Chromium instance takes ~1–2 seconds. HKEX and MingPao may run concurrently, so sharing avoids the overhead of two startup sequences.
 
-### 8.4 `app/crawler/feed_fetcher.py` — RSS Feed Parsing
+### 8.4 `app/crawl/fetchers/feed_fetcher.py` — RSS Feed Parsing
 
 #### Function: `fetch_rss(url: str) -> list[FeedEntry]`
 
@@ -1000,7 +1005,7 @@ Implementation notes:
 - Parse `published` from `entry.published_parsed` (a `time.struct_time`); convert to UTC `datetime` using `calendar.timegm()`
 - If `published_parsed` is None, set `published_at = None` (do not default to now)
 
-### 8.5 `app/crawler/exceptions.py` — Shared Crawler Exceptions
+### 8.5 `app/crawl/exceptions.py` — Shared Crawler Exceptions
 
 All crawler-layer exceptions are defined here and imported by `page_crawler.py`, crawl workers, and `CrawlService`.
 
@@ -1022,9 +1027,9 @@ class CrawlFatalError(Exception):
     """
 ```
 
-> `CrawlFatalError` lives here (not in `base_crawler.py`) so the full set of crawler exceptions stays in a single module. All crawler subclasses and `CrawlService` import it from `app.crawler.exceptions`.
+> `CrawlFatalError` lives here (not in `base_crawler.py`) so the full set of crawler exceptions stays in a single module. All crawler subclasses and `CrawlService` import it from `app.crawl.exceptions`.
 
-### 8.5a `app/crawler/source_name.py` — CrawlSourceName Enum
+### 8.5a `app/crawl/source_name.py` — CrawlSourceName Enum
 
 ```python
 from enum import Enum
@@ -1035,7 +1040,7 @@ class CrawlSourceName(str, Enum):
     API layer (app/api/schemas.py) for request validation. Adding a new
     source requires:
       1. Adding a new member here.
-      2. Implementing the corresponding Crawler class in app/crawler/.
+      2. Implementing the corresponding Crawler class in app/crawl/.
       3. Registering it in CrawlService.CRAWLER_REGISTRY.
     """
     HKEX     = "HKEX"
@@ -1044,9 +1049,62 @@ class CrawlSourceName(str, Enum):
     YAHOO_HK = "YAHOO_HK"
 ```
 
-> This enum lives in the crawler domain — **not** `app/api/schemas.py` — so the dependency direction is API → domain (never the reverse). `schemas.py` does `from app.crawler.source_name import CrawlSourceName` and uses it as the `CrawlRequest.source_name` field type for Pydantic enum validation.
+> This enum lives in the crawler domain — **not** `app/api/schemas.py` — so the dependency direction is API → domain (never the reverse). `schemas.py` does `from app.crawl.source_name import CrawlSourceName` and uses it as the `CrawlRequest.source_name` field type for Pydantic enum validation.
 
-### 8.6 `app/crawler/page_crawler.py` — HTTP Fetch with Retry
+### 8.5b `app/common/error_codes.py` — Error Code Catalog
+
+Single source of truth for all SADI internal crawl error codes. Codes follow the unified MWP error format `{SERVICE}-{CODE}` defined in `docs/api.md` §1.2. The `6xxx` range is reserved for internal classification codes (not exposed via HTTP).
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class ErrorCode:
+    """Base error code record. One frozen instance per distinct code."""
+    error_type: str    # Category: "NETWORK" | "PARSE"
+    error_code: str    # Unique identifier, e.g. "SADI-6101"
+    dev_message: str   # Technical description for devs/ops (logs, debugging)
+    message: str       # Short human-readable summary (dashboards, ops alerts)
+
+
+class NetworkErrorCode:
+    """SADI-61xx — crawler NETWORK errors (fetch itself failed)."""
+    HTTP_403             = ErrorCode("NETWORK", "SADI-6101", ...)
+    HTTP_404             = ErrorCode("NETWORK", "SADI-6102", ...)
+    NETWORK_ERROR        = ErrorCode("NETWORK", "SADI-6103", ...)
+    BROWSER_FETCH_FAILED = ErrorCode("NETWORK", "SADI-6104", ...)
+
+
+class DocumentParseErrorCode:
+    """SADI-62xx — crawler PARSE errors (fetch ok, content unusable)."""
+    PARSE_ERROR     = ErrorCode("PARSE", "SADI-6201", ...)
+    PDF_ENCRYPTED   = ErrorCode("PARSE", "SADI-6202", ...)
+    PDF_PARSE_ERROR = ErrorCode("PARSE", "SADI-6203", ...)
+```
+
+Usage in crawlers:
+
+```python
+from app.common.error_codes import NetworkErrorCode
+
+code = NetworkErrorCode.HTTP_403
+result.failures.append(
+    CrawlFailItem(
+        source_url=url,
+        error_type=code.error_type,
+        error_code=code.error_code,
+        attempt_count=1,
+    )
+)
+```
+
+> **Rules:**
+> - Crawlers must never use raw error code/type strings — always reference the catalog constants.
+> - Adding a new error code = one line in the appropriate class. Pick the next available number in the range.
+> - `NetworkErrorCode` and `DocumentParseErrorCode` are namespace classes holding constants — they are NOT exception classes and are never raised/caught.
+> - **Empty body is not a failure.** When a fetched page yields an empty body after extraction, crawlers log a warning and skip (return without appending to `result.failures`). Empty body is a content-level non-result, not a crawl error. It is not recorded in `crawl_error_log` — this avoids permanently skipping URLs that may have been empty due to transient rendering issues.
+
+### 8.6 `app/crawl/fetchers/page_crawler.py` — HTTP Fetch with Retry
 
 #### Class: `PageCrawler`
 
@@ -1086,9 +1144,9 @@ Implementation notes:
 - Add random jitter between requests: `await asyncio.sleep(random.randint(min_ms, max_ms) / 1000)`; use `self._config.sources[source_name]` interval values in the Crawler, not inside `fetch()`
 - Backoff formula: `wait_ms = config.retry_base_wait_ms × 2^(attempt - 1)`
 
-> **Error log pre-check:** The crawl_error_log lookup (`SELECT EXISTS(SELECT 1 FROM crawl_error_log WHERE url = $1)`) is business logic and belongs in the crawl worker, not in `PageCrawler`. Each crawler's `run()` should check the error log before calling `page_crawler.fetch()`, and raise `CrawlSkippedError` (from `app/crawler/exceptions.py`) if the URL is already recorded. This keeps `PageCrawler` as a pure HTTP tool with no database dependency.
+> **Error log pre-check:** The crawl_error_log lookup (`SELECT EXISTS(SELECT 1 FROM crawl_error_log WHERE url = $1)`) is business logic and belongs in the crawl worker, not in `PageCrawler`. Each crawler's `run()` should check the error log before calling `page_crawler.fetch()`, and raise `CrawlSkippedError` (from `app/crawl/exceptions.py`) if the URL is already recorded. This keeps `PageCrawler` as a pure HTTP tool with no database dependency.
 
-### 8.7 `app/crawler/html_parser.py` — HTML Body Extraction
+### 8.7 `app/crawl/parsers/html_parser.py` — HTML Body Extraction
 
 #### Function: `extract_body_auto(html: str) -> Optional[str]`
 
@@ -1113,7 +1171,7 @@ Implementation notes:
 - Always try `extract_body_auto` first where applicable; only fall back to CSS selector if needed
 - Neither function catches exceptions internally — they are pure tools. If the underlying library raises (e.g. lxml error on malformed HTML), the exception propagates to the caller. Crawl workers must catch these and convert to `CrawlFailItem` with `error_type="PARSE"` — same pattern as `PdfEncryptedError`/`PdfParseError` in `HKEXCrawler`.
 
-### 8.8 `app/crawler/pdf_parser.py` — PDF Text Extraction
+### 8.8 `app/crawl/parsers/pdf_parser.py` — PDF Text Extraction
 
 #### Function: `parse_pdf(content: bytes) -> str`
 
@@ -1145,7 +1203,7 @@ Implementation notes:
 - pdfminer.six: use `pdfminer.high_level.extract_text(BytesIO(content))`
 - Both parsers are synchronous — wrap with `asyncio.to_thread()`
 
-### 8.9 `app/crawler/hkex_crawler.py` — HKEXCrawler
+### 8.9 `app/crawl/crawlers/hkex_crawler.py` — HKEXCrawler
 
 #### Class: `HKEXCrawler(BaseCrawler)`
 
@@ -1208,7 +1266,7 @@ Returns : (1471, 1471)
 Raises  : ValueError if regex match fails (indicates page structure changed — log warning)
 ```
 
-### 8.10 `app/crawler/mingpao_crawler.py` — MingPaoCrawler
+### 8.10 `app/crawl/crawlers/mingpao_crawler.py` — MingPaoCrawler
 
 MingPao uses a producer-consumer model: RSS feed discovery → playwright browser fetch.
 
@@ -1263,7 +1321,7 @@ Pattern : r"\d{4}年\d{1,2}月\d{1,2}日.*?\d{1,2}:\d{2}[AP]M"
 Returns : UTC datetime, or None if not found
 ```
 
-### 8.11 `app/crawler/aastocks_crawler.py` — AAStocksCrawler
+### 8.11 `app/crawl/crawlers/aastocks_crawler.py` — AAStocksCrawler
 
 #### Class: `AAStocksCrawler(BaseCrawler)`
 
@@ -1308,7 +1366,7 @@ Pattern : r"\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}"  e.g. "2026/04/06 01:27"
 Returns : UTC datetime (convert from HKT by subtracting 8 hours), or None if not found
 ```
 
-### 8.12 `app/crawler/yahoo_hk_crawler.py` — YahooHKCrawler
+### 8.12 `app/crawl/crawlers/yahoo_hk_crawler.py` — YahooHKCrawler
 
 #### Class: `YahooHKCrawler(BaseCrawler)`
 
@@ -1681,8 +1739,8 @@ from fastapi import FastAPI
 from app.config import load_config
 from app.db.connection import create_db_client
 from app.redis.stream_client import create_stream_client
-from app.crawler.page_crawler import PageCrawler
-from app.crawler.crawl_service import CrawlService
+from app.crawl.fetchers.page_crawler import PageCrawler
+from app.crawl.crawl_service import CrawlService
 from app.cleaner.cleaning_service import CleaningService
 from app.cleaner.stream_handler import StreamHandler
 from app.api.main import create_app

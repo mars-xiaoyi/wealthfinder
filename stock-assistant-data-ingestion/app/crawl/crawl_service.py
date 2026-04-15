@@ -8,19 +8,19 @@ import asyncpg
 
 from app.common.text_utils import compute_hash, normalise
 from app.config import CrawlConfig
-from app.crawler.aastocks_crawler import AAStocksCrawler
-from app.crawler.base_crawler import (
+from app.crawl.crawlers.aastocks_crawler import AAStocksCrawler
+from app.crawl.crawlers.base_crawler import (
     BaseCrawler,
     CrawlFailItem,
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawler.exceptions import CrawlFatalError
-from app.crawler.hkex_crawler import HKEXCrawler
-from app.crawler.mingpao_crawler import MingPaoCrawler
-from app.crawler.page_crawler import PageCrawler
-from app.crawler.source_name import CrawlSourceName
-from app.crawler.yahoo_hk_crawler import YahooHKCrawler
+from app.crawl.exceptions import CrawlFatalError
+from app.crawl.crawlers.hkex_crawler import HKEXCrawler
+from app.crawl.crawlers.mingpao_crawler import MingPaoCrawler
+from app.crawl.fetchers.page_crawler import PageCrawler
+from app.crawl.source_name import CrawlSourceName
+from app.crawl.crawlers.yahoo_hk_crawler import YahooHKCrawler
 from app.db.connection import DatabaseClient
 from app.redis.stream_client import (
     STREAM_CRAWL_COMPLETED,

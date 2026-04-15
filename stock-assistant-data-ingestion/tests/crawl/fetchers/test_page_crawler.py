@@ -4,8 +4,8 @@ import httpx
 import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
-from app.crawler.exceptions import CrawlBlockedError, CrawlNetworkError
-from app.crawler.page_crawler import PageCrawler
+from app.crawl.exceptions import CrawlBlockedError, CrawlNetworkError
+from app.crawl.fetchers.page_crawler import PageCrawler
 
 
 def make_config(**overrides) -> CrawlConfig:
@@ -13,6 +13,7 @@ def make_config(**overrides) -> CrawlConfig:
         max_retry=3,
         retry_base_wait_ms=100,
         request_timeout_s=10,
+        browser_navigation_timeout_ms=30000,
         crawl_sources={},
     )
     return CrawlConfig(**{**defaults, **overrides})

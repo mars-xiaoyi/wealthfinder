@@ -1,6 +1,6 @@
 # SADI — Implementation Progress
 
-Last updated: 2026-04-10
+Last updated: 2026-04-15
 
 ---
 
@@ -35,20 +35,21 @@ Last updated: 2026-04-10
 
 ## Phase 5 — Crawler Utilities
 
-- [x] `app/crawler/feed_fetcher.py` — `fetch_rss()`, `FeedEntry`
-- [x] `app/crawler/html_parser.py` — `extract_body_auto()`, `extract_body_css()`
-- [x] `app/crawler/pdf_parser.py` — `parse_pdf()`, `PdfEncryptedError`, `PdfParseError`
-- [x] `app/crawler/browser_manager.py` — `BrowserManager` (`start`, `stop`, `acquire_context`, `release_context`)
-- [x] `app/crawler/page_crawler.py` — `PageCrawler.fetch()` with error log pre-check + retry, `CrawlSkippedError`, `CrawlNetworkError`, `CrawlBlockedError`
+- [x] `app/crawl/fetchers/feed_fetcher.py` — `fetch_rss()`, `FeedEntry`
+- [x] `app/crawl/parsers/html_parser.py` — `extract_body_auto()`, `extract_body_css()`
+- [x] `app/crawl/parsers/pdf_parser.py` — `parse_pdf()`, `PdfEncryptedError`, `PdfParseError`
+- [x] `app/crawl/fetchers/browser_manager.py` — `BrowserManager` (`start`, `stop`, `acquire_context`, `release_context`)
+- [x] `app/crawl/fetchers/page_crawler.py` — `PageCrawler.fetch()` with error log pre-check + retry, `CrawlSkippedError`, `CrawlNetworkError`, `CrawlBlockedError`
+- [x] `app/common/error_codes.py` — `ErrorCode` base, `NetworkErrorCode` (SADI-61xx), `DocumentParseErrorCode` (SADI-62xx)
 
 ## Phase 6 — Crawler Core
 
-- [x] `app/crawler/base_crawler.py` — `BaseCrawler` ABC, `CrawlResult`, `CrawlSuccessItem`, `CrawlFailItem`, `CrawlFatalError`
-- [x] `app/crawler/hkex_crawler.py` — `HKEXCrawler` (Phase 1 playwright pagination + Phase 2 parallel PDF fetch)
-- [x] `app/crawler/mingpao_crawler.py` — `MingPaoCrawler` (RSS + playwright browser)
-- [x] `app/crawler/aastocks_crawler.py` — `AAStocksCrawler` (list page + httpx)
-- [x] `app/crawler/yahoo_hk_crawler.py` — `YahooHKCrawler` (RSS + trafilatura + coverage gap detection)
-- [x] `app/crawler/crawl_service.py` — `CrawlService` (`_create_crawler`, `execute`, `_save_crawl_error`)
+- [x] `app/crawl/crawlers/base_crawler.py` — `BaseCrawler` ABC, `CrawlResult`, `CrawlSuccessItem`, `CrawlFailItem`, `CrawlFatalError`
+- [x] `app/crawl/crawlers/hkex_crawler.py` — `HKEXCrawler` (Phase 1 playwright pagination + Phase 2 parallel PDF fetch)
+- [x] `app/crawl/crawlers/mingpao_crawler.py` — `MingPaoCrawler` (RSS + playwright browser)
+- [x] `app/crawl/crawlers/aastocks_crawler.py` — `AAStocksCrawler` (list page + httpx)
+- [x] `app/crawl/crawlers/yahoo_hk_crawler.py` — `YahooHKCrawler` (RSS + trafilatura + coverage gap detection)
+- [x] `app/crawl/crawl_service.py` — `CrawlService` (`_create_crawler`, `execute`, `_save_crawl_error`)
 - [x] `app/api/routes/crawl.py` — `POST /v1/crawl`
 
 ## Phase 7 — Cleaning Layer
@@ -76,8 +77,16 @@ Last updated: 2026-04-10
 
 ---
 
+## TODO
+
+- [ ] Time a real HKEX Phase 1 run (`page.goto` + LOAD MORE loop) to pick a reasonable default for `CRAWL_BROWSER_NAV_TIMEOUT_MS`; current 30000 is a guess.
+- [ ] Run integration tests against live sources for all 4 crawlers (HKEX, Ming Pao, AAStocks, Yahoo HK) to confirm the code works end-to-end in the real world.
+
+---
+
 ## Open Questions
 
 | # | Question | Status |
 |---|---|---|
 | Q-2 | Validate `CLEAN_BODY_MIN_LENGTH = 50` against real crawl data | Unresolved — do not implement workarounds |
+| Q-3 | Audit `_parse_published_at` in all crawlers — current `re.search` over full page HTML is fragile (can match sidebar dates, footer copyright, embedded scripts). Scope regex to a CSS-selected DOM element instead. Needs sample article HTML from each source to identify the correct timestamp selector. | Unresolved — follow-up after live fetch |

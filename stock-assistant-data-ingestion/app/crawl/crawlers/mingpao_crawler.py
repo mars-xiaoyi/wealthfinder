@@ -5,17 +5,18 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from app.config import CrawlSourceConfig
-from app.crawler.base_crawler import (
+from app.crawl.crawlers.base_crawler import (
     BaseCrawler,
     CrawlFailItem,
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawler.browser_manager import BrowserManager
-from app.crawler.exceptions import CrawlFatalError
-from app.crawler.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
-from app.crawler.html_parser import extract_body_css
-from app.crawler.page_crawler import PageCrawler
+from app.crawl.fetchers.browser_manager import BrowserManager
+from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
+from app.crawl.exceptions import CrawlFatalError
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
+from app.crawl.parsers.html_parser import extract_body_css
+from app.crawl.fetchers.page_crawler import PageCrawler
 from app.db.connection import DatabaseClient
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,11 @@ class MingPaoCrawler(BaseCrawler):
         try:
             page = await context.new_page()
             try:
-                await page.goto(url, wait_until="domcontentloaded")
+                await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=self.page_crawler._config.browser_navigation_timeout_ms,
+                )
                 html = await page.content()
             finally:
                 await page.close()
@@ -114,8 +119,8 @@ class MingPaoCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="NETWORK",
-                    error_code="BROWSER_FETCH_FAILED",
+                    error_type=NetworkErrorCode.BROWSER_FETCH_FAILED.error_type,
+                    error_code=NetworkErrorCode.BROWSER_FETCH_FAILED.error_code,
                     attempt_count=1,
                 )
             )
@@ -128,23 +133,15 @@ class MingPaoCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="PARSE",
-                    error_code="PARSE_ERROR",
+                    error_type=DocumentParseErrorCode.PARSE_ERROR.error_type,
+                    error_code=DocumentParseErrorCode.PARSE_ERROR.error_code,
                     attempt_count=1,
                 )
             )
             return
 
         if not body or not body.strip():
-            logger.warning("[mingpao_crawler] empty body for %s", url)
-            result.failures.append(
-                CrawlFailItem(
-                    source_url=url,
-                    error_type="PARSE",
-                    error_code="EMPTY_BODY",
-                    attempt_count=1,
-                )
-            )
+            logger.warning("[mingpao_crawler] Empty body for %s — skipping", url)
             return
 
         published_at = entry.published_at or self._extract_published_at_from_page(html)

@@ -1,4 +1,4 @@
-from app.crawler.html_parser import extract_body_css, extract_body_auto
+from app.crawl.parsers.html_parser import extract_body_css, extract_body_auto
 
 
 # ---------------------------------------------------------------------------

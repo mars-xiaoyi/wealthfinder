@@ -7,15 +7,16 @@ from typing import Optional
 from bs4 import BeautifulSoup
 
 from app.config import CrawlSourceConfig
-from app.crawler.base_crawler import (
+from app.crawl.crawlers.base_crawler import (
     BaseCrawler,
     CrawlFailItem,
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawler.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
-from app.crawler.html_parser import extract_body_css
-from app.crawler.page_crawler import PageCrawler
+from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
+from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.crawl.parsers.html_parser import extract_body_css
+from app.crawl.fetchers.page_crawler import PageCrawler
 from app.db.connection import DatabaseClient
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,6 @@ AASTOCKS_LIST_URL = "https://www.aastocks.com/tc/stocks/news/aafn/latest-news"
 AASTOCKS_BASE_URL = "https://www.aastocks.com"
 ARTICLE_LINK_SELECTOR = "a[href*='/aafn-con/NOW.']"
 ARTICLE_BODY_SELECTOR = "[class*='newscon']"
-MAX_ARTICLES_PER_RUN = 9
 
 _PUBLISHED_AT_PATTERN = re.compile(r"(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2})")
 _HKT = timezone(timedelta(hours=8))
@@ -86,8 +86,6 @@ class AAStocksCrawler(BaseCrawler):
                 continue
             seen.add(full)
             urls.append(full)
-            if len(urls) >= MAX_ARTICLES_PER_RUN:
-                break
         return urls
 
     # --------------------------------------------------------- workers
@@ -109,13 +107,13 @@ class AAStocksCrawler(BaseCrawler):
         try:
             response = await self.page_crawler.fetch(url)
         except CrawlBlockedError as exc:
-            code = "HTTP_403" if "403" in str(exc) else "HTTP_404"
+            code = NetworkErrorCode.HTTP_403 if "403" in str(exc) else NetworkErrorCode.HTTP_404
             logger.warning("[aastocks_crawler] Blocked %s: %s", url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="NETWORK",
-                    error_code=code,
+                    error_type=code.error_type,
+                    error_code=code.error_code,
                     attempt_count=1,
                 )
             )
@@ -125,8 +123,8 @@ class AAStocksCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="NETWORK",
-                    error_code="NETWORK_ERROR",
+                    error_type=NetworkErrorCode.NETWORK_ERROR.error_type,
+                    error_code=NetworkErrorCode.NETWORK_ERROR.error_code,
                     attempt_count=max_retry,
                 )
             )
@@ -139,23 +137,15 @@ class AAStocksCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="PARSE",
-                    error_code="PARSE_ERROR",
+                    error_type=DocumentParseErrorCode.PARSE_ERROR.error_type,
+                    error_code=DocumentParseErrorCode.PARSE_ERROR.error_code,
                     attempt_count=1,
                 )
             )
             return
 
         if not body or not body.strip():
-            logger.warning("[aastocks_crawler] empty body for %s", url)
-            result.failures.append(
-                CrawlFailItem(
-                    source_url=url,
-                    error_type="PARSE",
-                    error_code="EMPTY_BODY",
-                    attempt_count=1,
-                )
-            )
+            logger.warning("[aastocks_crawler] Empty body for %s — skipping", url)
             return
 
         title = self._extract_title(response.text) or ""

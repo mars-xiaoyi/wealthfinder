@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_crawl_service
 from app.api.schemas import CrawlRequest, CrawlResponse, CrawlStatus
-from app.crawler.crawl_service import CrawlService
+from app.crawl.crawl_service import CrawlService
 
 logger = logging.getLogger(__name__)
 

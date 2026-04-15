@@ -16,7 +16,7 @@ from app.api.schemas import (
     HealthResponse,
     HealthStatus,
 )
-from app.crawler.source_name import CrawlSourceName
+from app.crawl.source_name import CrawlSourceName
 
 
 class TestCrawlSourceName:

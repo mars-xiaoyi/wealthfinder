@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.api.routes.crawl import _log_task_exception, router
-from app.crawler.crawl_service import CrawlService
+from app.crawl.crawl_service import CrawlService
 
 
 # ---------------------------------------------------------------------------

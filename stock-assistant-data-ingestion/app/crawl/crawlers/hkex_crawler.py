@@ -1,20 +1,22 @@
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from app.config import CrawlSourceConfig
-from app.crawler.base_crawler import (
+from app.crawl.crawlers.base_crawler import (
     BaseCrawler,
     CrawlFailItem,
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawler.browser_manager import BrowserManager
-from app.crawler.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
-from app.crawler.page_crawler import PageCrawler
-from app.crawler.pdf_parser import PdfEncryptedError, PdfParseError, parse_pdf
+from app.crawl.fetchers.browser_manager import BrowserManager
+from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
+from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.crawl.fetchers.page_crawler import PageCrawler
+from app.crawl.parsers.pdf_parser import PdfEncryptedError, PdfParseError, parse_pdf
 from app.db.connection import DatabaseClient
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,16 @@ RELEASE_TIME_SELECTOR = "td.release-time"
 STOCK_CODE_SELECTOR = "td.stock-short-code"
 
 MAX_LOAD_MORE_CLICKS = 30  # safety upper bound; ~14 expected in practice
+
+
+@dataclass
+class HKEXAnnouncement:
+    """One HKEXnews disclosure entry parsed from the filings table."""
+
+    pdf_url: str
+    title: str
+    published_at: Optional[datetime]
+    stock_codes: list[str]
 
 
 class HKEXCrawler(BaseCrawler):
@@ -65,7 +77,7 @@ class HKEXCrawler(BaseCrawler):
         await browser_manager.start()
         try:
             try:
-                rows = await self._collect_rows(browser_manager, target_date)
+                announcements = await self._collect_announcements(browser_manager, target_date)
             except CrawlFatalError:
                 raise
             except Exception as exc:
@@ -76,9 +88,11 @@ class HKEXCrawler(BaseCrawler):
         finally:
             await browser_manager.stop()
 
-        logger.info("[hkex_crawler] Phase 1 collected %d rows", len(rows))
+        logger.info(
+            "[hkex_crawler] Phase 1 collected %d announcements", len(announcements)
+        )
 
-        await self._fetch_pdfs(rows, result)
+        await self._fetch_pdfs(announcements, result)
         logger.info(
             "[hkex_crawler] Completed: %d successes, %d failures",
             len(result.successes),
@@ -88,17 +102,18 @@ class HKEXCrawler(BaseCrawler):
 
     # --------------------------------------------------------- Phase 1
 
-    async def _collect_rows(
+    async def _collect_announcements(
         self,
         browser_manager: BrowserManager,
         target_date: date,
-    ) -> list[dict]:
+    ) -> list[HKEXAnnouncement]:
         url = HKEX_SEARCH_URL_TEMPLATE.format(date=target_date.strftime("%Y%m%d"))
+        nav_timeout_ms = self.page_crawler._config.browser_navigation_timeout_ms
         context = await browser_manager.acquire_context()
         try:
             page = await context.new_page()
             logger.info("[hkex_crawler] Loading search page %s", url)
-            await page.goto(url, wait_until="domcontentloaded")
+            await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
 
             for click_idx in range(MAX_LOAD_MORE_CLICKS):
                 pagination_text = await page.text_content(PAGINATION_SELECTOR) or ""
@@ -110,8 +125,10 @@ class HKEXCrawler(BaseCrawler):
                     logger.info("[hkex_crawler] All %d rows visible", total)
                     break
                 logger.debug("[hkex_crawler] Clicking LOAD MORE (#%d)", click_idx + 1)
-                await page.click(LOAD_MORE_SELECTOR)
-                await page.wait_for_load_state("domcontentloaded")
+                await page.click(LOAD_MORE_SELECTOR, timeout=nav_timeout_ms)
+                await page.wait_for_load_state(
+                    "domcontentloaded", timeout=nav_timeout_ms
+                )
             else:
                 logger.warning(
                     "[hkex_crawler] Reached MAX_LOAD_MORE_CLICKS=%d without termination",
@@ -119,16 +136,16 @@ class HKEXCrawler(BaseCrawler):
                 )
 
             row_elements = await page.query_selector_all(ROW_SELECTOR)
-            rows: list[dict] = []
+            announcements: list[HKEXAnnouncement] = []
             for row in row_elements:
                 parsed = await self._extract_row(row)
                 if parsed is not None:
-                    rows.append(parsed)
-            return rows
+                    announcements.append(parsed)
+            return announcements
         finally:
             await browser_manager.release_context(context)
 
-    async def _extract_row(self, row) -> Optional[dict]:
+    async def _extract_row(self, row) -> Optional[HKEXAnnouncement]:
         pdf_el = await row.query_selector(PDF_LINK_SELECTOR)
         if pdf_el is None:
             return None
@@ -157,43 +174,48 @@ class HKEXCrawler(BaseCrawler):
         stock_raw = (await stock_el.text_content() if stock_el else "") or ""
         stock_codes = self._parse_stock_codes(stock_raw)
 
-        return {
-            "pdf_url": pdf_url,
-            "title": title,
-            "published_at": published_at,
-            "stock_codes": stock_codes,
-        }
+        return HKEXAnnouncement(
+            pdf_url=pdf_url,
+            title=title,
+            published_at=published_at,
+            stock_codes=stock_codes,
+        )
 
     # --------------------------------------------------------- Phase 2
 
-    async def _fetch_pdfs(self, rows: list[dict], result: CrawlResult) -> None:
-        if not rows:
+    async def _fetch_pdfs(
+        self, announcements: list[HKEXAnnouncement], result: CrawlResult
+    ) -> None:
+        if not announcements:
             return
         semaphore = asyncio.Semaphore(self.source_config.max_concurrent)
 
-        async def worker(row: dict) -> None:
-            pdf_url = row["pdf_url"]
-            if await self._is_url_in_error_log(pdf_url):
-                logger.info("[hkex_crawler] Skipping URL in error log: %s", pdf_url)
+        async def worker(announcement: HKEXAnnouncement) -> None:
+            if await self._is_url_in_error_log(announcement.pdf_url):
+                logger.info(
+                    "[hkex_crawler] Skipping URL in error log: %s", announcement.pdf_url
+                )
                 return
             async with semaphore:
-                await self._fetch_one_pdf(row, result)
+                await self._fetch_one_pdf(announcement, result)
 
-        await asyncio.gather(*(worker(row) for row in rows))
+        await asyncio.gather(*(worker(a) for a in announcements))
 
-    async def _fetch_one_pdf(self, row: dict, result: CrawlResult) -> None:
-        pdf_url = row["pdf_url"]
+    async def _fetch_one_pdf(
+        self, announcement: HKEXAnnouncement, result: CrawlResult
+    ) -> None:
+        pdf_url = announcement.pdf_url
         max_retry = self.page_crawler._config.max_retry
         try:
             response = await self.page_crawler.fetch(pdf_url)
         except CrawlBlockedError as exc:
-            code = "HTTP_403" if "403" in str(exc) else "HTTP_404"
+            code = NetworkErrorCode.HTTP_403 if "403" in str(exc) else NetworkErrorCode.HTTP_404
             logger.warning("[hkex_crawler] Blocked %s: %s", pdf_url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
-                    error_type="NETWORK",
-                    error_code=code,
+                    error_type=code.error_type,
+                    error_code=code.error_code,
                     attempt_count=1,
                 )
             )
@@ -203,8 +225,8 @@ class HKEXCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
-                    error_type="NETWORK",
-                    error_code="NETWORK_ERROR",
+                    error_type=NetworkErrorCode.NETWORK_ERROR.error_type,
+                    error_code=NetworkErrorCode.NETWORK_ERROR.error_code,
                     attempt_count=max_retry,
                 )
             )
@@ -217,8 +239,8 @@ class HKEXCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
-                    error_type="PARSE",
-                    error_code="PDF_ENCRYPTED",
+                    error_type=DocumentParseErrorCode.PDF_ENCRYPTED.error_type,
+                    error_code=DocumentParseErrorCode.PDF_ENCRYPTED.error_code,
                     attempt_count=1,
                 )
             )
@@ -228,8 +250,8 @@ class HKEXCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
-                    error_type="PARSE",
-                    error_code="PDF_PARSE_ERROR",
+                    error_type=DocumentParseErrorCode.PDF_PARSE_ERROR.error_type,
+                    error_code=DocumentParseErrorCode.PDF_PARSE_ERROR.error_code,
                     attempt_count=1,
                 )
             )
@@ -239,32 +261,24 @@ class HKEXCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
-                    error_type="PARSE",
-                    error_code="PARSE_ERROR",
+                    error_type=DocumentParseErrorCode.PARSE_ERROR.error_type,
+                    error_code=DocumentParseErrorCode.PARSE_ERROR.error_code,
                     attempt_count=1,
                 )
             )
             return
 
         if not body or not body.strip():
-            logger.warning("[hkex_crawler] PDF body empty %s", pdf_url)
-            result.failures.append(
-                CrawlFailItem(
-                    source_url=pdf_url,
-                    error_type="PARSE",
-                    error_code="EMPTY_BODY",
-                    attempt_count=1,
-                )
-            )
+            logger.warning("[hkex_crawler] Empty PDF body for %s — skipping", pdf_url)
             return
 
         result.successes.append(
             CrawlSuccessItem(
-                title=row["title"],
+                title=announcement.title,
                 body=body.strip(),
                 source_url=pdf_url,
-                published_at=row["published_at"],
-                extra_metadata={"stock_code": row["stock_codes"]},
+                published_at=announcement.published_at,
+                extra_metadata={"stock_code": announcement.stock_codes},
             )
         )
 

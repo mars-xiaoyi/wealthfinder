@@ -4,7 +4,7 @@ import logging
 import httpx
 
 from app.config import CrawlConfig
-from app.crawler.exceptions import CrawlBlockedError, CrawlNetworkError
+from app.crawl.exceptions import CrawlBlockedError, CrawlNetworkError
 
 logger = logging.getLogger(__name__)
 

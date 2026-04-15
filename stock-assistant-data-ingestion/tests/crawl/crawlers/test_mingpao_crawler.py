@@ -4,10 +4,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.config import CrawlSourceConfig
-from app.crawler.base_crawler import CrawlResult
-from app.crawler.exceptions import CrawlFatalError
-from app.crawler.feed_fetcher import FeedEntry, FeedFetchError
-from app.crawler.mingpao_crawler import MingPaoCrawler
+from app.crawl.crawlers.base_crawler import CrawlResult
+from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
+from app.crawl.exceptions import CrawlFatalError
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError
+from app.crawl.crawlers.mingpao_crawler import MingPaoCrawler
 
 
 def make_source_config() -> CrawlSourceConfig:
@@ -121,19 +122,19 @@ class TestFetchOneArticle:
         await crawler._fetch_one_article(context, make_entry(), result)
 
         assert len(result.failures) == 1
-        assert result.failures[0].error_code == "BROWSER_FETCH_FAILED"
-        assert result.failures[0].error_type == "NETWORK"
+        assert result.failures[0].error_code == NetworkErrorCode.BROWSER_FETCH_FAILED.error_code
+        assert result.failures[0].error_type == NetworkErrorCode.BROWSER_FETCH_FAILED.error_type
 
     @pytest.mark.asyncio
-    async def test_empty_body_creates_fail_item(self):
+    async def test_empty_body_skips_without_failure(self):
         crawler = make_crawler()
         context, _ = _make_fake_context(html="<html><article></article></html>")
         result = CrawlResult()
 
         await crawler._fetch_one_article(context, make_entry(), result)
 
-        assert result.failures[0].error_code == "EMPTY_BODY"
-        assert result.failures[0].error_type == "PARSE"
+        assert result.successes == []
+        assert result.failures == []
 
     @pytest.mark.asyncio
     async def test_parse_exception_creates_fail_item(self):
@@ -142,13 +143,13 @@ class TestFetchOneArticle:
         result = CrawlResult()
 
         with patch(
-            "app.crawler.mingpao_crawler.extract_body_css",
+            "app.crawl.crawlers.mingpao_crawler.extract_body_css",
             side_effect=RuntimeError("lxml exploded"),
         ):
             await crawler._fetch_one_article(context, make_entry(), result)
 
-        assert result.failures[0].error_code == "PARSE_ERROR"
-        assert result.failures[0].error_type == "PARSE"
+        assert result.failures[0].error_code == DocumentParseErrorCode.PARSE_ERROR.error_code
+        assert result.failures[0].error_type == DocumentParseErrorCode.PARSE_ERROR.error_type
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +179,7 @@ class TestRun:
     async def test_rss_failure_raises_fatal(self):
         crawler = make_crawler()
         with patch(
-            "app.crawler.mingpao_crawler.fetch_rss",
+            "app.crawl.crawlers.mingpao_crawler.fetch_rss",
             new=AsyncMock(side_effect=FeedFetchError("dead")),
         ):
             with pytest.raises(CrawlFatalError, match="MingPao RSS"):
@@ -200,10 +201,10 @@ class TestRun:
 
         with (
             patch(
-                "app.crawler.mingpao_crawler.fetch_rss",
+                "app.crawl.crawlers.mingpao_crawler.fetch_rss",
                 new=AsyncMock(return_value=[entry]),
             ),
-            patch("app.crawler.mingpao_crawler.BrowserManager", return_value=bm),
+            patch("app.crawl.crawlers.mingpao_crawler.BrowserManager", return_value=bm),
         ):
             result = await crawler.run()
 
@@ -215,7 +216,7 @@ class TestRun:
     async def test_empty_rss_returns_empty_result(self):
         crawler = make_crawler()
         with patch(
-            "app.crawler.mingpao_crawler.fetch_rss",
+            "app.crawl.crawlers.mingpao_crawler.fetch_rss",
             new=AsyncMock(return_value=[]),
         ):
             result = await crawler.run()

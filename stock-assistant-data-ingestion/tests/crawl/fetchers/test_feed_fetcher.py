@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.crawler.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
 
 
 def _make_feed(entries=None, bozo=False, bozo_exception=None):
@@ -38,7 +38,7 @@ async def test_fetch_rss_returns_entries():
     entries = [_make_entry(published_parsed=struct_time)]
     feed = _make_feed(entries=entries)
 
-    with patch("app.crawler.feed_fetcher.feedparser.parse", return_value=feed):
+    with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
         result = await fetch_rss("https://example.com/rss")
 
     assert len(result) == 1
@@ -54,7 +54,7 @@ async def test_fetch_rss_no_published_at():
     entries = [_make_entry(published_parsed=None)]
     feed = _make_feed(entries=entries)
 
-    with patch("app.crawler.feed_fetcher.feedparser.parse", return_value=feed):
+    with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
         result = await fetch_rss("https://example.com/rss")
 
     assert len(result) == 1
@@ -69,7 +69,7 @@ async def test_fetch_rss_no_published_at():
 async def test_fetch_rss_bozo_no_entries_raises():
     feed = _make_feed(entries=[], bozo=True, bozo_exception=Exception("bad xml"))
 
-    with patch("app.crawler.feed_fetcher.feedparser.parse", return_value=feed):
+    with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
         with pytest.raises(FeedFetchError, match="Failed to parse"):
             await fetch_rss("https://example.com/rss")
 
@@ -78,7 +78,7 @@ async def test_fetch_rss_bozo_no_entries_raises():
 async def test_fetch_rss_empty_entries_raises():
     feed = _make_feed(entries=[])
 
-    with patch("app.crawler.feed_fetcher.feedparser.parse", return_value=feed):
+    with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
         with pytest.raises(FeedFetchError, match="returned no entries"):
             await fetch_rss("https://example.com/rss")
 
@@ -95,7 +95,7 @@ async def test_fetch_rss_skips_entry_with_empty_title():
     ]
     feed = _make_feed(entries=entries)
 
-    with patch("app.crawler.feed_fetcher.feedparser.parse", return_value=feed):
+    with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
         result = await fetch_rss("https://example.com/rss")
 
     assert len(result) == 1

@@ -4,9 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
-from app.crawler.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
-from app.crawler.hkex_crawler import HKEXCrawler
-from app.crawler.pdf_parser import PdfEncryptedError, PdfParseError
+from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
+from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.crawl.crawlers.hkex_crawler import HKEXAnnouncement, HKEXCrawler
+from app.crawl.parsers.pdf_parser import PdfEncryptedError, PdfParseError
 
 
 def make_source_config(max_concurrent: int = 5) -> CrawlSourceConfig:
@@ -23,6 +24,7 @@ def make_page_crawler(max_retry: int = 3) -> MagicMock:
         max_retry=max_retry,
         retry_base_wait_ms=10,
         request_timeout_s=10,
+        browser_navigation_timeout_ms=30000,
         crawl_sources={},
     )
     pc.fetch = AsyncMock()
@@ -101,15 +103,15 @@ class TestParseStockCodes:
 # Phase 2 — _fetch_one_pdf branches
 # ---------------------------------------------------------------------------
 
-def _row(
+def _announcement(
     pdf_url: str = "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0402/test.pdf",
-):
-    return {
-        "pdf_url": pdf_url,
-        "title": "Sample Title",
-        "published_at": datetime(2026, 4, 2, 14, 59, tzinfo=timezone.utc),
-        "stock_codes": ["00700"],
-    }
+) -> HKEXAnnouncement:
+    return HKEXAnnouncement(
+        pdf_url=pdf_url,
+        title="Sample Title",
+        published_at=datetime(2026, 4, 2, 14, 59, tzinfo=timezone.utc),
+        stock_codes=["00700"],
+    )
 
 
 class TestFetchOnePdf:
@@ -121,14 +123,14 @@ class TestFetchOnePdf:
         pc.fetch.return_value = response
         crawler = make_crawler(page_crawler=pc)
 
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
         with patch(
-            "app.crawler.hkex_crawler.parse_pdf",
+            "app.crawl.crawlers.hkex_crawler.parse_pdf",
             new=AsyncMock(return_value="extracted body"),
         ):
-            await crawler._fetch_one_pdf(_row(), result)
+            await crawler._fetch_one_pdf(_announcement(), result)
 
         assert len(result.successes) == 1
         assert len(result.failures) == 0
@@ -142,27 +144,27 @@ class TestFetchOnePdf:
         pc = make_page_crawler()
         pc.fetch.side_effect = CrawlBlockedError("HTTP 403 for x")
         crawler = make_crawler(page_crawler=pc)
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
-        await crawler._fetch_one_pdf(_row(), result)
+        await crawler._fetch_one_pdf(_announcement(), result)
 
         assert len(result.failures) == 1
         f = result.failures[0]
-        assert f.error_type == "NETWORK"
-        assert f.error_code == "HTTP_403"
+        assert f.error_type == NetworkErrorCode.HTTP_403.error_type
+        assert f.error_code == NetworkErrorCode.HTTP_403.error_code
 
     @pytest.mark.asyncio
     async def test_network_error_uses_max_retry(self):
         pc = make_page_crawler(max_retry=4)
         pc.fetch.side_effect = CrawlNetworkError("retries exhausted")
         crawler = make_crawler(page_crawler=pc)
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
-        await crawler._fetch_one_pdf(_row(), result)
+        await crawler._fetch_one_pdf(_announcement(), result)
 
-        assert result.failures[0].error_code == "NETWORK_ERROR"
+        assert result.failures[0].error_code == NetworkErrorCode.NETWORK_ERROR.error_code
         assert result.failures[0].attempt_count == 4
 
     @pytest.mark.asyncio
@@ -172,49 +174,50 @@ class TestFetchOnePdf:
         response.content = b"%PDF"
         pc.fetch.return_value = response
         crawler = make_crawler(page_crawler=pc)
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
         with patch(
-            "app.crawler.hkex_crawler.parse_pdf",
+            "app.crawl.crawlers.hkex_crawler.parse_pdf",
             new=AsyncMock(side_effect=PdfEncryptedError("encrypted")),
         ):
-            await crawler._fetch_one_pdf(_row(), result)
+            await crawler._fetch_one_pdf(_announcement(), result)
 
-        assert result.failures[0].error_code == "PDF_ENCRYPTED"
-        assert result.failures[0].error_type == "PARSE"
+        assert result.failures[0].error_code == DocumentParseErrorCode.PDF_ENCRYPTED.error_code
+        assert result.failures[0].error_type == DocumentParseErrorCode.PDF_ENCRYPTED.error_type
 
     @pytest.mark.asyncio
     async def test_pdf_parse_error(self):
         pc = make_page_crawler()
         pc.fetch.return_value = MagicMock(content=b"%PDF")
         crawler = make_crawler(page_crawler=pc)
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
         with patch(
-            "app.crawler.hkex_crawler.parse_pdf",
+            "app.crawl.crawlers.hkex_crawler.parse_pdf",
             new=AsyncMock(side_effect=PdfParseError("bad")),
         ):
-            await crawler._fetch_one_pdf(_row(), result)
+            await crawler._fetch_one_pdf(_announcement(), result)
 
-        assert result.failures[0].error_code == "PDF_PARSE_ERROR"
+        assert result.failures[0].error_code == DocumentParseErrorCode.PDF_PARSE_ERROR.error_code
 
     @pytest.mark.asyncio
-    async def test_empty_body(self):
+    async def test_empty_body_skips_without_failure(self):
         pc = make_page_crawler()
         pc.fetch.return_value = MagicMock(content=b"%PDF")
         crawler = make_crawler(page_crawler=pc)
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
         with patch(
-            "app.crawler.hkex_crawler.parse_pdf",
+            "app.crawl.crawlers.hkex_crawler.parse_pdf",
             new=AsyncMock(return_value="   "),
         ):
-            await crawler._fetch_one_pdf(_row(), result)
+            await crawler._fetch_one_pdf(_announcement(), result)
 
-        assert result.failures[0].error_code == "EMPTY_BODY"
+        assert result.successes == []
+        assert result.failures == []
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +232,10 @@ class TestFetchPdfs:
             page_crawler=pc,
             db=make_db(in_error_log=True),
         )
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
-        await crawler._fetch_pdfs([_row()], result)
+        await crawler._fetch_pdfs([_announcement()], result)
 
         pc.fetch.assert_not_called()
         assert result.successes == []
@@ -246,20 +249,20 @@ class TestFetchPdfs:
             page_crawler=pc,
             db=make_db(in_error_log=False),
         )
-        from app.crawler.base_crawler import CrawlResult
+        from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
         with patch(
-            "app.crawler.hkex_crawler.parse_pdf",
+            "app.crawl.crawlers.hkex_crawler.parse_pdf",
             new=AsyncMock(return_value="body"),
         ):
-            await crawler._fetch_pdfs([_row()], result)
+            await crawler._fetch_pdfs([_announcement()], result)
 
         assert len(result.successes) == 1
 
 
 # ---------------------------------------------------------------------------
-# _collect_rows — Phase 1 pagination flow
+# _collect_announcements — Phase 1 pagination flow
 # ---------------------------------------------------------------------------
 
 def _make_fake_row(pdf_href: str, headline: str, release: str, stock: str):
@@ -312,7 +315,7 @@ def _make_fake_browser_manager(page) -> MagicMock:
     return bm
 
 
-class TestCollectRows:
+class TestCollectAnnouncements:
     @pytest.mark.asyncio
     async def test_terminates_on_equal_counts(self):
         row = _make_fake_row(
@@ -327,11 +330,11 @@ class TestCollectRows:
         bm = _make_fake_browser_manager(page)
         crawler = make_crawler()
 
-        rows = await crawler._collect_rows(bm, date(2026, 4, 2))
+        announcements = await crawler._collect_announcements(bm, date(2026, 4, 2))
 
-        assert len(rows) == 1
-        assert rows[0]["pdf_url"].startswith("https://www1.hkexnews.hk/")
-        assert rows[0]["stock_codes"] == ["00700"]
+        assert len(announcements) == 1
+        assert announcements[0].pdf_url.startswith("https://www1.hkexnews.hk/")
+        assert announcements[0].stock_codes == ["00700"]
         page.click.assert_not_called()
 
     @pytest.mark.asyncio
@@ -353,7 +356,7 @@ class TestCollectRows:
         bm = _make_fake_browser_manager(page)
         crawler = make_crawler()
 
-        await crawler._collect_rows(bm, date(2026, 4, 2))
+        await crawler._collect_announcements(bm, date(2026, 4, 2))
 
         assert page.click.call_count == 2  # clicked twice before reaching 3 of 3
 
@@ -371,7 +374,7 @@ class TestRun:
         bm.stop = AsyncMock()
         bm.acquire_context = AsyncMock(side_effect=RuntimeError("playwright kaboom"))
 
-        with patch("app.crawler.hkex_crawler.BrowserManager", return_value=bm):
+        with patch("app.crawl.crawlers.hkex_crawler.BrowserManager", return_value=bm):
             with pytest.raises(CrawlFatalError, match="Phase 1"):
                 await crawler.run()
 
@@ -395,9 +398,9 @@ class TestRun:
         crawler = make_crawler(page_crawler=pc)
 
         with (
-            patch("app.crawler.hkex_crawler.BrowserManager", return_value=bm),
+            patch("app.crawl.crawlers.hkex_crawler.BrowserManager", return_value=bm),
             patch(
-                "app.crawler.hkex_crawler.parse_pdf",
+                "app.crawl.crawlers.hkex_crawler.parse_pdf",
                 new=AsyncMock(return_value="body content"),
             ),
         ):

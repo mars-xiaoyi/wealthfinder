@@ -27,6 +27,7 @@ OPTIONAL_ENV = {
     "CRAWL_MAX_RETRY": "3",
     "CRAWL_RETRY_BASE_WAIT_MS": "500",
     "CRAWL_REQUEST_TIMEOUT_S": "10",
+    "CRAWL_BROWSER_NAV_TIMEOUT_MS": "30000",
     "CLEAN_WORKER_CONCURRENCY": "5",
     "CLEAN_BODY_MIN_LENGTH": "50",
     "STREAM_CLAIM_TIMEOUT_MS": "30000",
@@ -70,6 +71,7 @@ class TestLoadConfig:
         assert config.crawl.max_retry == 3
         assert config.crawl.retry_base_wait_ms == 500
         assert config.crawl.request_timeout_s == 10
+        assert config.crawl.browser_navigation_timeout_ms == 30000
         assert config.clean.worker_concurrency == 5
         assert config.clean.body_min_length == 50
         assert config.clean.stream_claim_timeout_ms == 30000

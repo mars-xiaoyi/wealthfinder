@@ -5,7 +5,7 @@ from typing import Optional
 
 from app.config import CrawlSourceConfig
 from app.db.connection import DatabaseClient
-from app.crawler.page_crawler import PageCrawler
+from app.crawl.fetchers.page_crawler import PageCrawler
 
 
 @dataclass
@@ -22,8 +22,8 @@ class CrawlSuccessItem:
 @dataclass
 class CrawlFailItem:
     source_url: str       # URL that failed — always present; RSS-level failures are never CrawlFailItems
-    error_type: str       # "NETWORK" / "PARSE"
-    error_code: str       # e.g. "HTTP_403", "PDF_ENCRYPTED", "TIMEOUT"
+    error_type: str       # "NETWORK" / "PARSE" — use ErrorCode constants from app/common/error_codes.py
+    error_code: str       # e.g. "SADI-6101" — use ErrorCode constants from app/common/error_codes.py
     attempt_count: int    # Total attempts made before giving up
 
 

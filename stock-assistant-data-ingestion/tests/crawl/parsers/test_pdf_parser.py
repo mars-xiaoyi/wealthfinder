@@ -1,7 +1,7 @@
 import fitz
 import pytest
 
-from app.crawler.pdf_parser import PdfEncryptedError, PdfParseError, parse_pdf
+from app.crawl.parsers.pdf_parser import PdfEncryptedError, PdfParseError, parse_pdf
 
 
 def _make_pdf(text: str = "Hello PDF world") -> bytes:

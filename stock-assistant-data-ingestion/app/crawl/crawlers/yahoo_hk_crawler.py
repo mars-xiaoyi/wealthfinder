@@ -4,16 +4,17 @@ from datetime import date, datetime
 from typing import Optional
 
 from app.config import CrawlSourceConfig
-from app.crawler.base_crawler import (
+from app.crawl.crawlers.base_crawler import (
     BaseCrawler,
     CrawlFailItem,
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawler.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
-from app.crawler.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
-from app.crawler.html_parser import extract_body_auto
-from app.crawler.page_crawler import PageCrawler
+from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
+from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
+from app.crawl.parsers.html_parser import extract_body_auto
+from app.crawl.fetchers.page_crawler import PageCrawler
 from app.db.connection import DatabaseClient
 
 logger = logging.getLogger(__name__)
@@ -130,13 +131,13 @@ class YahooHKCrawler(BaseCrawler):
         try:
             response = await self.page_crawler.fetch(url)
         except CrawlBlockedError as exc:
-            code = "HTTP_403" if "403" in str(exc) else "HTTP_404"
+            code = NetworkErrorCode.HTTP_403 if "403" in str(exc) else NetworkErrorCode.HTTP_404
             logger.warning("[yahoo_hk_crawler] Blocked %s: %s", url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="NETWORK",
-                    error_code=code,
+                    error_type=code.error_type,
+                    error_code=code.error_code,
                     attempt_count=1,
                 )
             )
@@ -146,8 +147,8 @@ class YahooHKCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="NETWORK",
-                    error_code="NETWORK_ERROR",
+                    error_type=NetworkErrorCode.NETWORK_ERROR.error_type,
+                    error_code=NetworkErrorCode.NETWORK_ERROR.error_code,
                     attempt_count=max_retry,
                 )
             )
@@ -160,23 +161,15 @@ class YahooHKCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type="PARSE",
-                    error_code="PARSE_ERROR",
+                    error_type=DocumentParseErrorCode.PARSE_ERROR.error_type,
+                    error_code=DocumentParseErrorCode.PARSE_ERROR.error_code,
                     attempt_count=1,
                 )
             )
             return
 
         if not body or not body.strip():
-            logger.warning("[yahoo_hk_crawler] empty body for %s", url)
-            result.failures.append(
-                CrawlFailItem(
-                    source_url=url,
-                    error_type="PARSE",
-                    error_code="EMPTY_BODY",
-                    attempt_count=1,
-                )
-            )
+            logger.warning("[yahoo_hk_crawler] Empty body for %s — skipping", url)
             return
 
         result.successes.append(

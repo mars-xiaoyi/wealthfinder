@@ -4,9 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
-from app.crawler.aastocks_crawler import AAStocksCrawler
-from app.crawler.base_crawler import CrawlResult
-from app.crawler.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.crawl.crawlers.aastocks_crawler import AAStocksCrawler
+from app.crawl.crawlers.base_crawler import CrawlResult
+from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
+from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
 
 
 def make_source_config() -> CrawlSourceConfig:
@@ -23,6 +24,7 @@ def make_page_crawler(max_retry: int = 3) -> MagicMock:
         max_retry=max_retry,
         retry_base_wait_ms=10,
         request_timeout_s=10,
+        browser_navigation_timeout_ms=30000,
         crawl_sources={},
     )
     pc.fetch = AsyncMock()
@@ -73,12 +75,12 @@ class TestExtractArticleUrls:
         urls = AAStocksCrawler._extract_article_urls(html)
         assert len(urls) == 1
 
-    def test_caps_at_max(self):
+    def test_returns_all_matching_links(self):
         links = "".join(
             f'<a href="/en/stocks/news/aafn-con/NOW.{i}/x">x</a>' for i in range(20)
         )
         urls = AAStocksCrawler._extract_article_urls(links)
-        assert len(urls) == 9
+        assert len(urls) == 20
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +132,7 @@ class TestFetchOneArticle:
 
         await crawler._fetch_one_article("https://x", result)
 
-        assert result.failures[0].error_code == "HTTP_404"
+        assert result.failures[0].error_code == NetworkErrorCode.HTTP_404.error_code
 
     @pytest.mark.asyncio
     async def test_network_error(self):
@@ -141,11 +143,11 @@ class TestFetchOneArticle:
 
         await crawler._fetch_one_article("https://x", result)
 
-        assert result.failures[0].error_code == "NETWORK_ERROR"
+        assert result.failures[0].error_code == NetworkErrorCode.NETWORK_ERROR.error_code
         assert result.failures[0].attempt_count == 2
 
     @pytest.mark.asyncio
-    async def test_empty_body(self):
+    async def test_empty_body_skips_without_failure(self):
         pc = make_page_crawler()
         pc.fetch.return_value = make_response("<html><body></body></html>")
         crawler = make_crawler(page_crawler=pc)
@@ -153,7 +155,8 @@ class TestFetchOneArticle:
 
         await crawler._fetch_one_article("https://x", result)
 
-        assert result.failures[0].error_code == "EMPTY_BODY"
+        assert result.successes == []
+        assert result.failures == []
 
     @pytest.mark.asyncio
     async def test_parse_exception(self):
@@ -163,12 +166,12 @@ class TestFetchOneArticle:
         result = CrawlResult()
 
         with patch(
-            "app.crawler.aastocks_crawler.extract_body_css",
+            "app.crawl.crawlers.aastocks_crawler.extract_body_css",
             side_effect=RuntimeError("lxml exploded"),
         ):
             await crawler._fetch_one_article("https://x", result)
 
-        assert result.failures[0].error_code == "PARSE_ERROR"
+        assert result.failures[0].error_code == DocumentParseErrorCode.PARSE_ERROR.error_code
 
 
 # ---------------------------------------------------------------------------
