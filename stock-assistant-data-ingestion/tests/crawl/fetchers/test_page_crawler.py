@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
-from app.crawl.exceptions import CrawlBlockedError, CrawlNetworkError
+from app.crawl.exceptions import CrawlBlockedException, CrawlRateLimitedException
 from app.crawl.fetchers.page_crawler import PageCrawler
 
 
@@ -49,7 +49,7 @@ async def test_fetch_success():
 
 
 # ---------------------------------------------------------------------------
-# fetch — HTTP 403 raises CrawlBlockedError immediately
+# fetch — HTTP 403 raises CrawlBlockedException immediately
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -58,7 +58,7 @@ async def test_fetch_blocked_on_403():
     resp = _ok_response(status_code=403)
     client.get = AsyncMock(return_value=resp)
 
-    with pytest.raises(CrawlBlockedError, match="HTTP 403"):
+    with pytest.raises(CrawlBlockedException, match="HTTP 403"):
         await crawler.fetch("https://example.com/blocked")
 
     # Should not retry — only one call
@@ -71,29 +71,45 @@ async def test_fetch_blocked_on_404():
     resp = _ok_response(status_code=404)
     client.get = AsyncMock(return_value=resp)
 
-    with pytest.raises(CrawlBlockedError, match="HTTP 404"):
+    with pytest.raises(CrawlBlockedException, match="HTTP 404"):
         await crawler.fetch("https://example.com/notfound")
 
     assert client.get.call_count == 1
 
 
 # ---------------------------------------------------------------------------
-# fetch — retries on network error then raises CrawlNetworkError
+# fetch — retries on network error then raises CrawlBlockedException
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fetch_retries_then_raises_network_error():
+async def test_fetch_retries_then_raises_blocked_error():
     config = make_config(max_retry=3, retry_base_wait_ms=10)
     crawler, client = make_page_crawler(config=config)
     client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-        with pytest.raises(CrawlNetworkError, match="All 3 retries exhausted"):
+        with pytest.raises(CrawlBlockedException, match="All 3 retries exhausted"):
             await crawler.fetch("https://example.com/slow")
 
     assert client.get.call_count == 3
     # Backoff: 10ms, 20ms (attempt 3 fails without sleeping)
     assert mock_sleep.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# fetch — HTTP 429 raises CrawlRateLimitedException immediately
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_rate_limited_on_429():
+    crawler, client = make_page_crawler()
+    resp = _ok_response(status_code=429)
+    client.get = AsyncMock(return_value=resp)
+
+    with pytest.raises(CrawlRateLimitedException, match="HTTP 429"):
+        await crawler.fetch("https://example.com/throttled")
+
+    assert client.get.call_count == 1
 
 
 # ---------------------------------------------------------------------------

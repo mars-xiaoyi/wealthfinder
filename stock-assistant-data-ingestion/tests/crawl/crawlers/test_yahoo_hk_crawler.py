@@ -5,9 +5,9 @@ import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
 from app.crawl.crawlers.base_crawler import CrawlResult
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
-from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlBlockedException, CrawlFatalException
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchException
 from app.crawl.crawlers.yahoo_hk_crawler import YahooHKCrawler
 
 
@@ -146,21 +146,21 @@ class TestFetchOneArticle:
     @pytest.mark.asyncio
     async def test_blocked(self):
         pc = make_page_crawler()
-        pc.fetch.side_effect = CrawlBlockedError("HTTP 403")
+        pc.fetch.side_effect = CrawlBlockedException("HTTP 403")
         crawler = make_crawler(page_crawler=pc)
         result = CrawlResult()
         await crawler._fetch_one_article(make_entry(), result)
-        assert result.failures[0].error_code == NetworkErrorCode.HTTP_403.error_code
+        assert result.failures[0].error_code == CrawlErrorCode.URL_GET_FAILED.error_code
 
     @pytest.mark.asyncio
     async def test_network_error(self):
         pc = make_page_crawler(max_retry=4)
-        pc.fetch.side_effect = CrawlNetworkError("dead")
+        pc.fetch.side_effect = CrawlBlockedException("dead")
         crawler = make_crawler(page_crawler=pc)
         result = CrawlResult()
         await crawler._fetch_one_article(make_entry(), result)
         assert result.failures[0].attempt_count == 4
-        assert result.failures[0].error_code == NetworkErrorCode.NETWORK_ERROR.error_code
+        assert result.failures[0].error_code == CrawlErrorCode.URL_GET_FAILED.error_code
 
     @pytest.mark.asyncio
     async def test_empty_body_skips_without_failure(self):
@@ -229,9 +229,9 @@ class TestRun:
         crawler = make_crawler()
         with patch(
             "app.crawl.crawlers.yahoo_hk_crawler.fetch_rss",
-            new=AsyncMock(side_effect=FeedFetchError("dead")),
+            new=AsyncMock(side_effect=FeedFetchException("dead")),
         ):
-            with pytest.raises(CrawlFatalError, match="Yahoo HK RSS"):
+            with pytest.raises(CrawlFatalException, match="Yahoo HK RSS"):
                 await crawler.run()
 
     @pytest.mark.asyncio

@@ -14,9 +14,9 @@ from app.crawl.crawlers.base_crawler import (
     CrawlSuccessItem,
 )
 from app.crawl.fetchers.browser_manager import BrowserManager
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlFatalError
-from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlFatalException
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchException, fetch_rss
 from app.crawl.parsers.html_parser import extract_body_css
 from app.crawl.fetchers.page_crawler import PageCrawler
 from app.db.connection import DatabaseClient
@@ -61,9 +61,9 @@ class MingPaoCrawler(BaseCrawler):
         logger.info("[mingpao_crawler] Starting crawl")
         try:
             entries = await fetch_rss(MINGPAO_RSS_URL)
-        except FeedFetchError as exc:
+        except FeedFetchException as exc:
             logger.exception("[mingpao_crawler] RSS fetch failed")
-            raise CrawlFatalError(f"MingPao RSS fetch failed: {exc}") from exc
+            raise CrawlFatalException(f"MingPao RSS fetch failed: {exc}") from exc
 
         logger.info("[mingpao_crawler] RSS returned %d entries", len(entries))
 
@@ -125,8 +125,8 @@ class MingPaoCrawler(BaseCrawler):
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type=NetworkErrorCode.BROWSER_FETCH_FAILED.error_type,
-                    error_code=NetworkErrorCode.BROWSER_FETCH_FAILED.error_code,
+                    error_type=CrawlErrorCode.BROWSER_FETCH_FAILED.error_type,
+                    error_code=CrawlErrorCode.BROWSER_FETCH_FAILED.error_code,
                     attempt_count=1,
                 )
             )

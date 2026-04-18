@@ -66,7 +66,7 @@ class BaseCrawler(ABC):
               - failures:  one CrawlFailItem per article that failed after all retries
 
         Raises:
-            CrawlFatalError on unrecoverable source-level failure.
+            CrawlFatalException on unrecoverable source-level failure.
         """
         ...
 

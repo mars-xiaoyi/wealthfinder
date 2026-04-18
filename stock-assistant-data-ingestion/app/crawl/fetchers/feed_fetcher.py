@@ -10,7 +10,7 @@ import feedparser
 logger = logging.getLogger(__name__)
 
 
-class FeedFetchError(Exception):
+class FeedFetchException(Exception):
     """Raised when feedparser fails or returns an empty/invalid feed."""
 
 
@@ -26,18 +26,18 @@ async def fetch_rss(url: str) -> list[FeedEntry]:
     Fetch and parse an RSS feed. Returns a list of structured entries.
     Uses feedparser — synchronous library wrapped in asyncio.to_thread().
 
-    Raises FeedFetchError if feedparser fails or returns an empty/invalid feed.
+    Raises FeedFetchException if feedparser fails or returns an empty/invalid feed.
     """
     logger.info("[fetch_rss] Fetching RSS feed: %s", url)
     feed = await asyncio.to_thread(feedparser.parse, url)
 
     if feed.bozo and not feed.entries:
-        raise FeedFetchError(
+        raise FeedFetchException(
             f"Failed to parse RSS feed at {url}: {feed.bozo_exception}"
         )
 
     if not feed.entries:
-        raise FeedFetchError(f"RSS feed at {url} returned no entries")
+        raise FeedFetchException(f"RSS feed at {url} returned no entries")
 
     logger.info("[fetch_rss] Feed returned %d raw entries from %s", len(feed.entries), url)
 

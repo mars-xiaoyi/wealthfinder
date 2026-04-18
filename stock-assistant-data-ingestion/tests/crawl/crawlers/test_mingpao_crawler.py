@@ -5,9 +5,9 @@ import pytest
 
 from app.config import CrawlSourceConfig
 from app.crawl.crawlers.base_crawler import CrawlResult
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlFatalError
-from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlFatalException
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchException
 from app.crawl.crawlers.mingpao_crawler import MingPaoCrawler
 
 
@@ -143,8 +143,8 @@ class TestFetchOneArticle:
         await crawler._fetch_one_article(context, make_entry(), result)
 
         assert len(result.failures) == 1
-        assert result.failures[0].error_code == NetworkErrorCode.BROWSER_FETCH_FAILED.error_code
-        assert result.failures[0].error_type == NetworkErrorCode.BROWSER_FETCH_FAILED.error_type
+        assert result.failures[0].error_code == CrawlErrorCode.BROWSER_FETCH_FAILED.error_code
+        assert result.failures[0].error_type == CrawlErrorCode.BROWSER_FETCH_FAILED.error_type
 
     @pytest.mark.asyncio
     async def test_empty_body_skips_without_failure(self):
@@ -201,9 +201,9 @@ class TestRun:
         crawler = make_crawler()
         with patch(
             "app.crawl.crawlers.mingpao_crawler.fetch_rss",
-            new=AsyncMock(side_effect=FeedFetchError("dead")),
+            new=AsyncMock(side_effect=FeedFetchException("dead")),
         ):
-            with pytest.raises(CrawlFatalError, match="MingPao RSS"):
+            with pytest.raises(CrawlFatalException, match="MingPao RSS"):
                 await crawler.run()
 
     @pytest.mark.asyncio

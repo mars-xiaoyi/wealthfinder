@@ -94,7 +94,7 @@ sadi/
 │   ├── crawl/
 │   │   ├── crawl_service.py         # CrawlService: orchestration, DB save, stream signals
 │   │   ├── source_name.py           # CrawlSourceName enum (crawler domain; imported by api/schemas.py)
-│   │   ├── exceptions.py            # Shared crawler exceptions (CrawlSkippedError, CrawlNetworkError, CrawlBlockedError, CrawlFatalError)
+│   │   ├── exceptions.py            # Shared crawler exceptions (CrawlBlockedException, CrawlRateLimitedException, CrawlFatalException)
 │   │   ├── crawlers/                # BaseCrawler ABC + one module per source
 │   │   │   ├── base_crawler.py      # Abstract base class; defines CrawlResult dataclass
 │   │   │   ├── hkex_crawler.py      # HKEXCrawler
@@ -114,7 +114,7 @@ sadi/
 │   │   └── dedup_service.py         # is_duplicate() — cross-source raw_hash lookup
 │   ├── common/
 │   │   ├── text_utils.py            # normalise() + compute_hash() — pure text tools shared by crawl & clean layers
-│   │   └── error_codes.py           # ErrorCode base + NetworkErrorCode / DocumentParseErrorCode catalogs (SADI-6xxx)
+│   │   └── error_codes.py           # ErrorCode base + CommonErrorCode / CrawlErrorCode / DocumentParseErrorCode catalogs
 │   ├── api/
 │   │   ├── routes/
 │   │   │   ├── crawl.py             # POST /v1/crawl
@@ -208,7 +208,7 @@ class CrawlErrorLog:
     source_name: str            # e.g. "HKEX"
     url: str                    # Failed article URL; always present — only URL-level failures are logged here
     error_type: str             # "NETWORK" / "PARSE" / "STORAGE"
-    error_code: str             # e.g. "HTTP_403", "PDF_ENCRYPTED", "TIMEOUT"
+    error_code: str             # e.g. "SADI-6101", "SADI-6202" — use ErrorCode catalog constants
     attempt_count: int          # Total attempts made before giving up
     created_at: datetime        # UTC
 ```
@@ -800,7 +800,7 @@ class CrawlSuccessItem:
 @dataclass
 class CrawlFailItem:
     source_url: str   # URL that failed — always present; RSS-level failures are never CrawlFailItems
-    error_type: str   # "NETWORK" / "PARSE" — use ErrorCode catalog constants from app/common/error_codes.py
+    error_type: str   # "CRAWL" / "PARSE" — use ErrorCode catalog constants from app/common/error_codes.py
     error_code: str       # e.g. "SADI-6101" — use ErrorCode catalog constants from app/common/error_codes.py
     attempt_count: int    # Total attempts made before giving up
 
@@ -814,7 +814,7 @@ class CrawlResult:
 
 All four crawler classes extend `BaseCrawler`. Crawlers are responsible only for **fetching and parsing** — they do not touch the database or Redis.
 
-> `CrawlFatalError` is defined in `app/crawl/exceptions.py` (see §8.5), alongside the other shared crawler exceptions — **not** in `base_crawler.py`. Crawler subclasses import it as `from app.crawl.exceptions import CrawlFatalError`.
+> `CrawlFatalException` is defined in `app/crawl/exceptions.py` (see §8.5), alongside the other shared crawler exceptions — **not** in `base_crawler.py`. Crawler subclasses import it as `from app.crawl.exceptions import CrawlFatalException`.
 
 ```python
 from abc import ABC, abstractmethod
@@ -847,7 +847,7 @@ class BaseCrawler(ABC):
           - successes: one CrawlSuccessItem per successfully parsed article
           - failures:  one CrawlFailItem per article that failed after all retries exhausted;
                        CrawlService writes these to crawl_error_log immediately — no further retry.
-        Raises CrawlFatalError on unrecoverable source-level failure (e.g. RSS unreachable
+        Raises CrawlFatalException on unrecoverable source-level failure (e.g. RSS unreachable
         after all retries) — CrawlService catches this and publishes crawl_completed FAILED.
         """
         ...
@@ -917,7 +917,7 @@ Params  : execution_id — str echoed from POST /crawl request; used in stream s
 flowchart TD
     A([execute called]) --> B[_create_crawler source_name crawl_date]
     B --> C[crawler.run\nBrowserManager lifecycle managed inside run if needed]
-    C -->|CrawlFatalError| D[log error]
+    C -->|CrawlFatalException| D[log error]
     D --> E[publish crawl_completed FAILED]
     C -->|CrawlResult| F[For each item in result.failures:\nwrite crawl_error_log immediately\nno retry — retries already exhausted]
     F --> G[For each item in result.successes:\nbuild RawNews\ndb.execute INSERT ON CONFLICT DO NOTHING\npublish stream:raw_news_inserted]
@@ -988,7 +988,7 @@ Purpose : Fetch and parse an RSS feed. Returns a list of structured entries.
           Uses feedparser — synchronous library wrapped in asyncio.to_thread().
 Params  : url — full RSS URL
 Returns : List of FeedEntry dataclasses (title, url, published_at)
-Raises  : FeedFetchError if feedparser fails or returns an empty/invalid feed
+Raises  : FeedFetchException if feedparser fails or returns an empty/invalid feed
           (caller should retry per crawl retry config)
 ```
 
@@ -1012,16 +1012,13 @@ Implementation notes:
 All crawler-layer exceptions are defined here and imported by `page_crawler.py`, crawl workers, and `CrawlService`.
 
 ```python
-class CrawlSkippedError(Exception):
-    """URL is already in crawl_error_log — caller raises this after its own pre-check."""
+class CrawlBlockedException(Exception):
+    """Page fetch failed — HTTP error, network failure, or all retries exhausted."""
 
-class CrawlNetworkError(Exception):
-    """All retries exhausted — caller adds to result.failures."""
+class CrawlRateLimitedException(Exception):
+    """HTTP 429 — transient, do not persist to crawl_error_log."""
 
-class CrawlBlockedError(Exception):
-    """HTTP 403 or 404 — immediate failure, caller adds to result.failures."""
-
-class CrawlFatalError(Exception):
+class CrawlFatalException(Exception):
     """
     Unrecoverable source-level failure (e.g. RSS unreachable after all retries,
     HKEX search page playwright load failure). CrawlService catches this and
@@ -1029,7 +1026,7 @@ class CrawlFatalError(Exception):
     """
 ```
 
-> `CrawlFatalError` lives here (not in `base_crawler.py`) so the full set of crawler exceptions stays in a single module. All crawler subclasses and `CrawlService` import it from `app.crawl.exceptions`.
+> `CrawlFatalException` lives here (not in `base_crawler.py`) so the full set of crawler exceptions stays in a single module. All crawler subclasses and `CrawlService` import it from `app.crawl.exceptions`.
 
 ### 8.5a `app/crawl/source_name.py` — CrawlSourceName Enum
 
@@ -1055,7 +1052,10 @@ class CrawlSourceName(str, Enum):
 
 ### 8.5b `app/common/error_codes.py` — Error Code Catalog
 
-Single source of truth for all SADI internal crawl error codes. Codes follow the unified MWP error format `{SERVICE}-{CODE}` defined in `docs/api.md` §1.2. The `6xxx` range is reserved for internal classification codes (not exposed via HTTP).
+Single source of truth for all SADI error codes. Codes follow the unified MWP error format `{SERVICE}-{CODE}` defined in `docs/api.md` §1.2.
+
+- `COMMON-4xxx` / `COMMON-5xxx` = shared HTTP error responses (all services).
+- `SADI-61xx` = crawler fetch errors. `SADI-62xx` = crawler parse errors.
 
 ```python
 from dataclasses import dataclass
@@ -1063,18 +1063,28 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ErrorCode:
     """Base error code record. One frozen instance per distinct code."""
-    error_type: str    # Category: "NETWORK" | "PARSE"
+    error_type: str    # Category: "COMMON" | "CRAWL" | "PARSE"
     error_code: str    # Unique identifier, e.g. "SADI-6101"
     dev_message: str   # Technical description for devs/ops (logs, debugging)
     message: str       # Short human-readable summary (dashboards, ops alerts)
 
 
-class NetworkErrorCode:
-    """SADI-61xx — crawler NETWORK errors (fetch itself failed)."""
-    HTTP_403             = ErrorCode("NETWORK", "SADI-6101", ...)
-    HTTP_404             = ErrorCode("NETWORK", "SADI-6102", ...)
-    NETWORK_ERROR        = ErrorCode("NETWORK", "SADI-6103", ...)
-    BROWSER_FETCH_FAILED = ErrorCode("NETWORK", "SADI-6104", ...)
+class CommonErrorCode:
+    """COMMON-4xxx / COMMON-5xxx — shared HTTP error responses."""
+    MALFORMED_REQUEST    = ErrorCode("COMMON", "COMMON-4000", ...)
+    VALIDATION_FAILED    = ErrorCode("COMMON", "COMMON-4001", ...)
+    NOT_FOUND            = ErrorCode("COMMON", "COMMON-4004", ...)
+    METHOD_NOT_ALLOWED   = ErrorCode("COMMON", "COMMON-4005", ...)
+    RATE_LIMITED          = ErrorCode("COMMON", "COMMON-4029", ...)
+    INTERNAL_ERROR       = ErrorCode("COMMON", "COMMON-5000", ...)
+    SERVICE_UNAVAILABLE  = ErrorCode("COMMON", "COMMON-5001", ...)
+    UPSTREAM_UNAVAILABLE = ErrorCode("COMMON", "COMMON-5002", ...)
+
+
+class CrawlErrorCode:
+    """SADI-61xx — crawler errors (fetch itself failed)."""
+    URL_GET_FAILED       = ErrorCode("CRAWL", "SADI-6101", ...)
+    BROWSER_FETCH_FAILED = ErrorCode("CRAWL", "SADI-6104", ...)
 
 
 class DocumentParseErrorCode:
@@ -1087,15 +1097,15 @@ class DocumentParseErrorCode:
 Usage in crawlers:
 
 ```python
-from app.common.error_codes import NetworkErrorCode
+from app.common.error_codes import CrawlErrorCode
 
-code = NetworkErrorCode.HTTP_403
+code = CrawlErrorCode.URL_GET_FAILED
 result.failures.append(
     CrawlFailItem(
         source_url=url,
         error_type=code.error_type,
         error_code=code.error_code,
-        attempt_count=1,
+        attempt_count=max_retry,
     )
 )
 ```
@@ -1103,7 +1113,7 @@ result.failures.append(
 > **Rules:**
 > - Crawlers must never use raw error code/type strings — always reference the catalog constants.
 > - Adding a new error code = one line in the appropriate class. Pick the next available number in the range.
-> - `NetworkErrorCode` and `DocumentParseErrorCode` are namespace classes holding constants — they are NOT exception classes and are never raised/caught.
+> - `CommonErrorCode`, `CrawlErrorCode`, and `DocumentParseErrorCode` are namespace classes holding constants — they are NOT exception classes and are never raised/caught.
 > - **Empty body is not a failure.** When a fetched page yields an empty body after extraction, crawlers log a warning and skip (return without appending to `result.failures`). Empty body is a content-level non-result, not a crawl error. It is not recorded in `crawl_error_log` — this avoids permanently skipping URLs that may have been empty due to transient rendering issues.
 
 ### 8.6 `app/crawl/fetchers/page_crawler.py` — HTTP Fetch with Retry
@@ -1123,8 +1133,8 @@ Wraps the shared `httpx.AsyncClient` with retry logic. Does not own the client l
 Purpose : Fetch the URL with exponential backoff retry.
 Params  : url — target URL
 Returns : httpx.Response on success
-Raises  : CrawlNetworkError after all retries exhausted — caller adds to result.failures
-          CrawlBlockedError immediately on HTTP 403 or 404 — caller adds to result.failures
+Raises  : CrawlBlockedException — HTTP client error (4xx except 429) or all retries exhausted
+          CrawlRateLimitedException — immediately on HTTP 429 (transient, not persisted to error log)
 ```
 
 #### Flowchart
@@ -1133,12 +1143,13 @@ Raises  : CrawlNetworkError after all retries exhausted — caller adds to resul
 flowchart TD
     A([fetch called]) --> D[attempt = 1]
     D --> E[httpx GET with timeout]
-    E -->|HTTP 403 or 404| F([raise CrawlBlockedError immediately])
-    E -->|HTTP 500 or timeout| G{attempt < MAX_RETRY?}
-    G -->|Yes| H[wait: base × 2^attempt-1\nincrement attempt]
-    H --> E
-    G -->|No| I([raise CrawlNetworkError])
-    E -->|HTTP 200| J([return response])
+    E -->|HTTP 429| F([raise CrawlRateLimitedException immediately])
+    E -->|HTTP 4xx except 429| G([raise CrawlBlockedException immediately])
+    E -->|HTTP 5xx or network error| H{attempt < MAX_RETRY?}
+    H -->|Yes| I[wait: base × 2^attempt-1\nincrement attempt]
+    I --> E
+    H -->|No| J([raise CrawlBlockedException])
+    E -->|HTTP 2xx| K([return response])
 ```
 
 Implementation notes:
@@ -1146,7 +1157,7 @@ Implementation notes:
 - Add random jitter between requests: `await asyncio.sleep(random.randint(min_ms, max_ms) / 1000)`; use `self._config.sources[source_name]` interval values in the Crawler, not inside `fetch()`
 - Backoff formula: `wait_ms = config.retry_base_wait_ms × 2^(attempt - 1)`
 
-> **Error log pre-check:** The crawl_error_log lookup (`SELECT EXISTS(SELECT 1 FROM crawl_error_log WHERE url = $1)`) is business logic and belongs in the crawl worker, not in `PageCrawler`. Each crawler's `run()` should check the error log before calling `page_crawler.fetch()`, and raise `CrawlSkippedError` (from `app/crawl/exceptions.py`) if the URL is already recorded. This keeps `PageCrawler` as a pure HTTP tool with no database dependency.
+> **Error log pre-check:** The crawl_error_log lookup (`SELECT EXISTS(SELECT 1 FROM crawl_error_log WHERE url = $1)`) is business logic and belongs in the crawl worker, not in `PageCrawler`. Each crawler's `run()` should check the error log before calling `page_crawler.fetch()`, and skip the URL if it is already recorded. This keeps `PageCrawler` as a pure HTTP tool with no database dependency.
 
 ### 8.7 `app/crawl/parsers/html_parser.py` — HTML Body Extraction
 
@@ -1171,7 +1182,7 @@ Returns : Extracted plain text from the matched element, or None if selector doe
 Implementation notes:
 - `extract_body_css` uses BeautifulSoup4: `soup.select_one(selector).get_text(separator=" ", strip=True)`
 - Always try `extract_body_auto` first where applicable; only fall back to CSS selector if needed
-- Neither function catches exceptions internally — they are pure tools. If the underlying library raises (e.g. lxml error on malformed HTML), the exception propagates to the caller. Crawl workers must catch these and convert to `CrawlFailItem` with `error_type="PARSE"` — same pattern as `PdfEncryptedError`/`PdfParseError` in `HKEXCrawler`.
+- Neither function catches exceptions internally — they are pure tools. If the underlying library raises (e.g. lxml error on malformed HTML), the exception propagates to the caller. Crawl workers must catch these and convert to `CrawlFailItem` with `error_type="PARSE"` — same pattern as `PdfEncryptedException`/`PdfParseException` in `HKEXCrawler`.
 
 ### 8.8 `app/crawl/parsers/pdf_parser.py` — PDF Text Extraction
 
@@ -1182,8 +1193,8 @@ Purpose : Extract plain text from a PDF binary. Tries pymupdf first; falls back
           to pdfminer.six if pymupdf returns empty text (complex layout PDFs).
 Params  : content — raw PDF bytes (from httpx response.content)
 Returns : Extracted plain text string
-Raises  : PdfEncryptedError if PDF is encrypted (log and discard — non-retryable)
-          PdfParseError if both parsers fail on a non-encrypted PDF (retry parsing only)
+Raises  : PdfEncryptedException if PDF is encrypted (log and discard — non-retryable)
+          PdfParseException if both parsers fail on a non-encrypted PDF (retry parsing only)
 ```
 
 #### Flowchart
@@ -1191,12 +1202,12 @@ Raises  : PdfEncryptedError if PDF is encrypted (log and discard — non-retryab
 ```mermaid
 flowchart TD
     A([parse_pdf bytes]) --> B[Open with pymupdf fitz.open]
-    B -->|metadata.encrypted = True| C([raise PdfEncryptedError])
+    B -->|metadata.encrypted = True| C([raise PdfEncryptedException])
     B -->|OK| D[Extract text from all pages with page.get_text]
     D -->|text not empty| E([return text])
     D -->|text empty| F[Try pdfminer.six: extract_text]
     F -->|text not empty| G([return text])
-    F -->|text empty or error| H([raise PdfParseError])
+    F -->|text empty or error| H([raise PdfParseException])
 ```
 
 Implementation notes:
@@ -1221,7 +1232,7 @@ The HKEX crawl has two distinct phases:
 Purpose : Phase 1 — collect all PDF links via playwright. Phase 2 — fetch and parse
           PDFs in parallel. Return results with successes and failures.
 Returns : CrawlResult with successes and failures populated
-Raises  : CrawlFatalError if playwright fails to load the search page after retries
+Raises  : CrawlFatalException if playwright fails to load the search page after retries
 ```
 
 #### Flowchart
@@ -1244,7 +1255,7 @@ flowchart TD
     CHK -->|Yes| SKIP[Release semaphore\nsilently skip]
     CHK -->|No| M[Acquire semaphore\npage_crawler.fetch PDF URL]
     M --> N[parse_pdf bytes]
-    N -->|PdfEncryptedError\nor PdfParseError after retries| O[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
+    N -->|PdfEncryptedException\nor PdfParseException| O[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
     N -->|OK| P[Build CrawlSuccessItem\nextra_metadata={stock_code: list of codes}\nAppend to result.successes\nRelease semaphore]
     O & P --> K
     K -->|Done| S[BrowserManager.stop]
@@ -1283,7 +1294,7 @@ MingPao uses a producer-consumer model: RSS feed discovery → playwright browse
 ```
 Purpose : Fetch RSS, discover article URLs, crawl bodies via playwright, return results.
 Returns : CrawlResult with successes and failures populated
-Raises  : CrawlFatalError if RSS fetch fails after all retries
+Raises  : CrawlFatalException if RSS fetch fails after all retries
 ```
 
 #### Flowchart
@@ -1292,8 +1303,8 @@ Raises  : CrawlFatalError if RSS fetch fails after all retries
 flowchart TD
     A([run]) --> START[BrowserManager.start]
     START --> B[fetch_rss RSS_URL]
-    B -->|FeedFetchError after retries| C[BrowserManager.stop]
-    C --> C2([raise CrawlFatalError])
+    B -->|FeedFetchException after retries| C[BrowserManager.stop]
+    C --> C2([raise CrawlFatalException])
     B -->|OK ~26 entries| D[Create asyncio.Queue\nEnqueue all article URLs]
     D --> E[Create asyncio.Semaphore max_concurrent=3]
     E --> F[Launch N crawl_worker coroutines]
@@ -1315,7 +1326,7 @@ flowchart TD
     S --> T([return CrawlResult])
 ```
 
-> **Crawl worker exception handling:** If the HTML body extraction raises an unexpected exception (e.g. lxml parse error), catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedError`/`PdfParseError` handling in `HKEXCrawler`.
+> **Crawl worker exception handling:** If the HTML body extraction raises an unexpected exception (e.g. lxml parse error), catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedException`/`PdfParseException` handling in `HKEXCrawler`.
 
 #### Helper: `_extract_published_at_from_page(page_html: str) -> Optional[datetime]`
 
@@ -1339,7 +1350,7 @@ Returns : UTC datetime, or None if the selector or pattern is missing.
 ```
 Purpose : Fetch list page, discover up to 9 article URLs, crawl bodies via httpx, return results.
 Returns : CrawlResult with successes and failures populated
-Raises  : CrawlFatalError if the list page fetch fails after all retries
+Raises  : CrawlFatalException if the list page fetch fails after all retries
 ```
 
 #### Flowchart
@@ -1347,7 +1358,7 @@ Raises  : CrawlFatalError if the list page fetch fails after all retries
 ```mermaid
 flowchart TD
     A([run]) --> B[page_crawler.fetch list page /tc/]
-    B -->|CrawlNetworkError after retries| C([raise CrawlFatalError])
+    B -->|CrawlBlockedException after retries| C([raise CrawlFatalException])
     B -->|OK| D[CSS selector a href aafn-con/NOW.\nExtract up to 9 URLs]
     D --> E[Create asyncio.Queue + Semaphore max_concurrent=3]
     E --> F[Launch crawl_worker coroutines]
@@ -1356,16 +1367,17 @@ flowchart TD
     H --> CHK{URL in crawl_error_log?\ndb.fetch_one check}
     CHK -->|Yes| SKIP[Release semaphore\nsilently skip]
     CHK -->|No| I[page_crawler.fetch article URL /tc/]
-    I -->|CrawlBlockedError 403/404\nor CrawlNetworkError after retries| J[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
+    I -->|CrawlRateLimitedException| J2[Log warning\nRelease semaphore]
+    I -->|CrawlBlockedException| J[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
     I -->|OK| K[CSS selector newscon\nExtract body]
     K -->|Empty| J
     K -->|OK| M[Extract published_at\nfrom div.newstime5 (skip newshead-Source sibling)\nConvert HKT → UTC]
     M --> N[Build CrawlSuccessItem\nAppend to result.successes\nRelease semaphore]
-    J & N --> G
+    J & J2 & N --> G
     G -->|Done| R([return CrawlResult])
 ```
 
-> **Crawl worker exception handling:** If `extract_body_css()` raises an unexpected exception, catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedError`/`PdfParseError` handling in `HKEXCrawler`.
+> **Crawl worker exception handling:** If `extract_body_css()` raises an unexpected exception, catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedException`/`PdfParseException` handling in `HKEXCrawler`.
 
 #### Helper: `_parse_published_at(page_html: str) -> Optional[datetime]`
 
@@ -1394,7 +1406,7 @@ Returns : UTC datetime (convert from HKT by subtracting 8 hours), or None if
 Purpose : Fetch RSS, filter ad URLs, crawl articles via httpx + trafilatura, return results.
           Includes coverage gap detection.
 Returns : CrawlResult with successes and failures populated
-Raises  : CrawlFatalError if RSS fetch fails after all retries
+Raises  : CrawlFatalException if RSS fetch fails after all retries
 ```
 
 #### Flowchart
@@ -1402,7 +1414,7 @@ Raises  : CrawlFatalError if RSS fetch fails after all retries
 ```mermaid
 flowchart TD
     A([run]) --> B[fetch_rss RSS_URL]
-    B -->|FeedFetchError after retries| C([raise CrawlFatalError])
+    B -->|FeedFetchException after retries| C([raise CrawlFatalException])
     B -->|OK| D[Filter entries: keep URL contains hk.finance.yahoo.com/news/]
     D --> E{Oldest entry published_at\n> _get_previous_crawl_time?}
     E -->|Yes| F[Log WARNING: potential coverage gap\nProceed anyway]
@@ -1411,16 +1423,17 @@ flowchart TD
     H --> CHK{URL in crawl_error_log?\ndb.fetch_one check}
     CHK -->|Yes| SKIP[Release semaphore\nsilently skip]
     CHK -->|No| I[crawl_worker: page_crawler.fetch article]
-    I -->|CrawlNetworkError after retries| J[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
+    I -->|CrawlRateLimitedException| J2[Log warning\nRelease semaphore]
+    I -->|CrawlBlockedException| J[Build CrawlFailItem\nAppend to result.failures\nRelease semaphore]
     I -->|OK| K[extract_body_auto]
     K -->|Empty| J
     K -->|OK| L[Build CrawlSuccessItem\npublished_at from RSS UTC\nAppend to result.successes\nRelease semaphore]
-    J & L --> N{More URLs?}
+    J & J2 & L --> N{More URLs?}
     N -->|Yes| I
     N -->|No| O([return CrawlResult])
 ```
 
-> **Crawl worker exception handling:** If `extract_body_auto()` raises an unexpected exception, catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedError`/`PdfParseError` handling in `HKEXCrawler`.
+> **Crawl worker exception handling:** If `extract_body_auto()` raises an unexpected exception, catch it in the crawl worker, log the error, and build a `CrawlFailItem` with `error_type="PARSE"`. Same pattern as `PdfEncryptedException`/`PdfParseException` handling in `HKEXCrawler`.
 
 > **Coverage gap:** Yahoo RSS only returns 5 entries. If the crawl runs too infrequently, entries may drop off the feed before being captured. This is a scheduling concern handled by Admin Service — SADI only logs the warning.
 
@@ -1485,7 +1498,7 @@ await stream_client.publish(
     }
 )
 
-# On CrawlFatalError or unexpected exception:
+# On CrawlFatalException or unexpected exception:
 await stream_client.publish(
     STREAM_CRAWL_COMPLETED,
     {

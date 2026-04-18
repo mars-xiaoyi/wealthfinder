@@ -4,10 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlBlockedException, CrawlFatalException
 from app.crawl.crawlers.hkex_crawler import HKEXAnnouncement, HKEXCrawler
-from app.crawl.parsers.pdf_parser import PdfEncryptedError, PdfParseError
+from app.crawl.parsers.pdf_parser import PdfEncryptedException, PdfParseException
 
 
 def make_source_config(max_concurrent: int = 5) -> CrawlSourceConfig:
@@ -152,7 +152,7 @@ class TestFetchOnePdf:
     @pytest.mark.asyncio
     async def test_blocked_403(self):
         pc = make_page_crawler()
-        pc.fetch.side_effect = CrawlBlockedError("HTTP 403 for x")
+        pc.fetch.side_effect = CrawlBlockedException("HTTP 403 for x")
         crawler = make_crawler(page_crawler=pc)
         from app.crawl.crawlers.base_crawler import CrawlResult
 
@@ -161,20 +161,20 @@ class TestFetchOnePdf:
 
         assert len(result.failures) == 1
         f = result.failures[0]
-        assert f.error_type == NetworkErrorCode.HTTP_403.error_type
-        assert f.error_code == NetworkErrorCode.HTTP_403.error_code
+        assert f.error_type == CrawlErrorCode.URL_GET_FAILED.error_type
+        assert f.error_code == CrawlErrorCode.URL_GET_FAILED.error_code
 
     @pytest.mark.asyncio
     async def test_network_error_uses_max_retry(self):
         pc = make_page_crawler(max_retry=4)
-        pc.fetch.side_effect = CrawlNetworkError("retries exhausted")
+        pc.fetch.side_effect = CrawlBlockedException("retries exhausted")
         crawler = make_crawler(page_crawler=pc)
         from app.crawl.crawlers.base_crawler import CrawlResult
 
         result = CrawlResult()
         await crawler._fetch_one_pdf(_announcement(), result)
 
-        assert result.failures[0].error_code == NetworkErrorCode.NETWORK_ERROR.error_code
+        assert result.failures[0].error_code == CrawlErrorCode.URL_GET_FAILED.error_code
         assert result.failures[0].attempt_count == 4
 
     @pytest.mark.asyncio
@@ -189,7 +189,7 @@ class TestFetchOnePdf:
         result = CrawlResult()
         with patch(
             "app.crawl.crawlers.hkex_crawler.parse_pdf",
-            new=AsyncMock(side_effect=PdfEncryptedError("encrypted")),
+            new=AsyncMock(side_effect=PdfEncryptedException("encrypted")),
         ):
             await crawler._fetch_one_pdf(_announcement(), result)
 
@@ -206,7 +206,7 @@ class TestFetchOnePdf:
         result = CrawlResult()
         with patch(
             "app.crawl.crawlers.hkex_crawler.parse_pdf",
-            new=AsyncMock(side_effect=PdfParseError("bad")),
+            new=AsyncMock(side_effect=PdfParseException("bad")),
         ):
             await crawler._fetch_one_pdf(_announcement(), result)
 
@@ -491,7 +491,7 @@ class TestRun:
         bm.acquire_context = AsyncMock(side_effect=RuntimeError("playwright kaboom"))
 
         with patch("app.crawl.crawlers.hkex_crawler.BrowserManager", return_value=bm):
-            with pytest.raises(CrawlFatalError, match="Phase 1"):
+            with pytest.raises(CrawlFatalException, match="Phase 1"):
                 await crawler.run()
 
         bm.stop.assert_called_once()

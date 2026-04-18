@@ -4,7 +4,7 @@ import logging
 import httpx
 
 from app.config import CrawlConfig
-from app.crawl.exceptions import CrawlBlockedError, CrawlNetworkError
+from app.crawl.exceptions import CrawlBlockedException, CrawlRateLimitedException
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,8 @@ class PageCrawler:
         Fetch the URL with exponential backoff retry.
 
         Raises:
-            CrawlNetworkError: after all retries exhausted
-            CrawlBlockedError: immediately on HTTP 403 or 404
+            CrawlBlockedException: HTTP error or all retries exhausted
+            CrawlRateLimitedException: immediately on HTTP 429
         """
         logger.debug("[page_crawler] Fetching URL: %s", url)
         last_exc: Exception | None = None
@@ -39,9 +39,13 @@ class PageCrawler:
                     url, timeout=self._config.request_timeout_s
                 )
 
-                if response.status_code in (403, 404):
-                    logger.warning("[page_crawler] Blocked HTTP %d for %s", response.status_code, url)
-                    raise CrawlBlockedError(
+                if response.status_code == 429:
+                    logger.warning("[page_crawler] Rate limited (HTTP 429) for %s", url)
+                    raise CrawlRateLimitedException(f"HTTP 429 for {url}")
+
+                if 400 <= response.status_code < 500:
+                    logger.warning("[page_crawler] Client error HTTP %d for %s", response.status_code, url)
+                    raise CrawlBlockedException(
                         f"HTTP {response.status_code} for {url}"
                     )
 
@@ -49,7 +53,7 @@ class PageCrawler:
                 logger.debug("[page_crawler] Fetched OK: %s", url)
                 return response
 
-            except CrawlBlockedError:
+            except (CrawlBlockedException, CrawlRateLimitedException):
                 raise
 
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
@@ -69,6 +73,6 @@ class PageCrawler:
                     await asyncio.sleep(wait_s)
 
         logger.error("[page_crawler] All %d retries exhausted for %s: %s", self._config.max_retry, url, last_exc)
-        raise CrawlNetworkError(
+        raise CrawlBlockedException(
             f"All {self._config.max_retry} retries exhausted for {url}: {last_exc}"
         )

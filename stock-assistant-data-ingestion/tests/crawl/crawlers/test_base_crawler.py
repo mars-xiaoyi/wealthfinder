@@ -9,7 +9,7 @@ from app.crawl.crawlers.base_crawler import (
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawl.exceptions import CrawlFatalError
+from app.crawl.exceptions import CrawlFatalException
 
 
 # ---------------------------------------------------------------------------
@@ -65,13 +65,13 @@ class TestCrawlResult:
 
 
 # ---------------------------------------------------------------------------
-# CrawlFatalError
+# CrawlFatalException
 # ---------------------------------------------------------------------------
 
-class TestCrawlFatalError:
+class TestCrawlFatalException:
     def test_is_exception(self):
-        with pytest.raises(CrawlFatalError, match="boom"):
-            raise CrawlFatalError("boom")
+        with pytest.raises(CrawlFatalException, match="boom"):
+            raise CrawlFatalException("boom")
 
 
 # ---------------------------------------------------------------------------

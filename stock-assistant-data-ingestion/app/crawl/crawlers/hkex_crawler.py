@@ -14,10 +14,10 @@ from app.crawl.crawlers.base_crawler import (
     CrawlSuccessItem,
 )
 from app.crawl.fetchers.browser_manager import BrowserManager
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlBlockedException, CrawlFatalException, CrawlRateLimitedException
 from app.crawl.fetchers.page_crawler import PageCrawler
-from app.crawl.parsers.pdf_parser import PdfEncryptedError, PdfParseError, parse_pdf
+from app.crawl.parsers.pdf_parser import PdfEncryptedException, PdfParseException, parse_pdf
 from app.db.connection import DatabaseClient
 
 logger = logging.getLogger(__name__)
@@ -79,11 +79,11 @@ class HKEXCrawler(BaseCrawler):
         try:
             try:
                 announcements = await self._collect_announcements(browser_manager, target_date)
-            except CrawlFatalError:
+            except CrawlFatalException:
                 raise
             except Exception as exc:
                 logger.exception("[hkex_crawler] Phase 1 failed")
-                raise CrawlFatalError(
+                raise CrawlFatalException(
                     f"HKEX Phase 1 (playwright pagination) failed: {exc}"
                 ) from exc
         finally:
@@ -260,25 +260,16 @@ class HKEXCrawler(BaseCrawler):
         max_retry = self.page_crawler._config.max_retry
         try:
             response = await self.page_crawler.fetch(pdf_url)
-        except CrawlBlockedError as exc:
-            code = NetworkErrorCode.HTTP_403 if "403" in str(exc) else NetworkErrorCode.HTTP_404
-            logger.warning("[hkex_crawler] Blocked %s: %s", pdf_url, exc)
-            result.failures.append(
-                CrawlFailItem(
-                    source_url=pdf_url,
-                    error_type=code.error_type,
-                    error_code=code.error_code,
-                    attempt_count=1,
-                )
-            )
+        except CrawlRateLimitedException as exc:
+            logger.warning("[hkex_crawler] Rate limited %s: %s", pdf_url, exc)
             return
-        except CrawlNetworkError as exc:
-            logger.warning("[hkex_crawler] Network error %s: %s", pdf_url, exc)
+        except CrawlBlockedException as exc:
+            logger.warning("[hkex_crawler] Fetch failed %s: %s", pdf_url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
-                    error_type=NetworkErrorCode.NETWORK_ERROR.error_type,
-                    error_code=NetworkErrorCode.NETWORK_ERROR.error_code,
+                    error_type=CrawlErrorCode.URL_GET_FAILED.error_type,
+                    error_code=CrawlErrorCode.URL_GET_FAILED.error_code,
                     attempt_count=max_retry,
                 )
             )
@@ -286,7 +277,7 @@ class HKEXCrawler(BaseCrawler):
 
         try:
             body = await parse_pdf(response.content)
-        except PdfEncryptedError as exc:
+        except PdfEncryptedException as exc:
             logger.warning("[hkex_crawler] Encrypted PDF %s: %s", pdf_url, exc)
             result.failures.append(
                 CrawlFailItem(
@@ -297,7 +288,7 @@ class HKEXCrawler(BaseCrawler):
                 )
             )
             return
-        except PdfParseError as exc:
+        except PdfParseException as exc:
             logger.warning("[hkex_crawler] PDF parse error %s: %s", pdf_url, exc)
             result.failures.append(
                 CrawlFailItem(

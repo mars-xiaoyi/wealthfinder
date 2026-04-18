@@ -13,8 +13,8 @@ from app.crawl.crawlers.base_crawler import (
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlBlockedException, CrawlFatalException, CrawlRateLimitedException
 from app.crawl.parsers.html_parser import extract_body_css
 from app.crawl.fetchers.page_crawler import PageCrawler
 from app.db.connection import DatabaseClient
@@ -55,9 +55,9 @@ class AAStocksCrawler(BaseCrawler):
         logger.info("[aastocks_crawler] Starting crawl")
         try:
             list_response = await self.page_crawler.fetch(AASTOCKS_LIST_URL)
-        except (CrawlBlockedError, CrawlNetworkError) as exc:
+        except CrawlBlockedException as exc:
             logger.exception("[aastocks_crawler] List page fetch failed")
-            raise CrawlFatalError(f"AAStocks list page fetch failed: {exc}") from exc
+            raise CrawlFatalException(f"AAStocks list page fetch failed: {exc}") from exc
 
         urls = self._extract_article_urls(list_response.text)
         logger.info("[aastocks_crawler] Discovered %d article URLs", len(urls))
@@ -110,25 +110,16 @@ class AAStocksCrawler(BaseCrawler):
         max_retry = self.page_crawler._config.max_retry
         try:
             response = await self.page_crawler.fetch(url)
-        except CrawlBlockedError as exc:
-            code = NetworkErrorCode.HTTP_403 if "403" in str(exc) else NetworkErrorCode.HTTP_404
-            logger.warning("[aastocks_crawler] Blocked %s: %s", url, exc)
-            result.failures.append(
-                CrawlFailItem(
-                    source_url=url,
-                    error_type=code.error_type,
-                    error_code=code.error_code,
-                    attempt_count=1,
-                )
-            )
+        except CrawlRateLimitedException as exc:
+            logger.warning("[aastocks_crawler] Rate limited %s: %s", url, exc)
             return
-        except CrawlNetworkError as exc:
-            logger.warning("[aastocks_crawler] Network error %s: %s", url, exc)
+        except CrawlBlockedException as exc:
+            logger.warning("[aastocks_crawler] Fetch failed %s: %s", url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type=NetworkErrorCode.NETWORK_ERROR.error_type,
-                    error_code=NetworkErrorCode.NETWORK_ERROR.error_code,
+                    error_type=CrawlErrorCode.URL_GET_FAILED.error_type,
+                    error_code=CrawlErrorCode.URL_GET_FAILED.error_code,
                     attempt_count=max_retry,
                 )
             )

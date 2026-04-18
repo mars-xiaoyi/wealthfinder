@@ -8,11 +8,11 @@ from pdfminer.high_level import extract_text as pdfminer_extract_text
 logger = logging.getLogger(__name__)
 
 
-class PdfEncryptedError(Exception):
+class PdfEncryptedException(Exception):
     """Raised when the PDF is encrypted. Non-retryable — log and discard."""
 
 
-class PdfParseError(Exception):
+class PdfParseException(Exception):
     """Raised when both parsers fail on a non-encrypted PDF."""
 
 
@@ -21,7 +21,7 @@ def _parse_primary(content: bytes) -> str:
     doc = fitz.open(stream=content, filetype="pdf")
     try:
         if doc.is_encrypted:
-            raise PdfEncryptedError("PDF is encrypted")
+            raise PdfEncryptedException("PDF is encrypted")
         text_parts: list[str] = []
         for page in doc:
             text_parts.append(page.get_text())
@@ -41,8 +41,8 @@ async def parse_pdf(content: bytes) -> str:
     to secondary parser if primary returns empty text (complex layout PDFs).
 
     Raises:
-        PdfEncryptedError: if PDF is encrypted (non-retryable)
-        PdfParseError: if both parsers fail on a non-encrypted PDF
+        PdfEncryptedException: if PDF is encrypted (non-retryable)
+        PdfParseException: if both parsers fail on a non-encrypted PDF
     """
     logger.debug("[pdf_parser] Parsing PDF (%d bytes) with primary parser", len(content))
     text = await asyncio.to_thread(_parse_primary, content)
@@ -54,10 +54,10 @@ async def parse_pdf(content: bytes) -> str:
     try:
         text = await asyncio.to_thread(_parse_fallback, content)
     except Exception as exc:
-        raise PdfParseError(f"Fallback parser failed: {exc}") from exc
+        raise PdfParseException(f"Fallback parser failed: {exc}") from exc
 
     if not text:
-        raise PdfParseError("Both primary and fallback parsers returned empty text")
+        raise PdfParseException("Both primary and fallback parsers returned empty text")
 
     logger.debug("[pdf_parser] Fallback parser extracted %d chars", len(text))
     return text

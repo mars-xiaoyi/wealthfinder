@@ -1,12 +1,12 @@
 """
-Crawler error code catalog — single source of truth for SADI internal
-crawl errors recorded in crawl_error_log and stream:crawl_completed.
+Error code catalog — single source of truth for all SADI error codes.
 
 Codes follow the unified MWP error format defined in docs/api.md §1.2:
     {SERVICE_PREFIX}-{CODE}
 
-The 6xxx range is reserved for internal classification codes (not exposed
-via HTTP). Convention: SADI-61xx = NETWORK, SADI-62xx = PARSE.
+COMMON-4xxx / COMMON-5xxx = shared HTTP error responses (all services).
+SADI-61xx = NETWORK (crawler fetch failures).
+SADI-62xx = PARSE (crawler content extraction failures).
 """
 from dataclasses import dataclass
 
@@ -21,29 +21,70 @@ class ErrorCode:
     message: str       # Short human-readable summary (dashboards, ops alerts)
 
 
-class NetworkErrorCode:
-    """SADI-61xx — crawler NETWORK errors (fetch itself failed)."""
+class CommonErrorCode:
+    """COMMON-4xxx / COMMON-5xxx — shared HTTP error responses."""
 
-    HTTP_403 = ErrorCode(
-        error_type="NETWORK",
+    MALFORMED_REQUEST = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-4000",
+        dev_message="Malformed request — unparseable JSON or missing Content-Type",
+        message="Malformed request",
+    )
+    VALIDATION_FAILED = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-4001",
+        dev_message="Request validation failed — one or more fields failed validation",
+        message="Request validation failed",
+    )
+    NOT_FOUND = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-4004",
+        dev_message="Requested resource does not exist",
+        message="Resource not found",
+    )
+    METHOD_NOT_ALLOWED = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-4005",
+        dev_message="HTTP method not allowed for this endpoint",
+        message="Method not allowed",
+    )
+    INTERNAL_ERROR = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-5000",
+        dev_message="Unexpected internal server error",
+        message="Internal server error",
+    )
+    SERVICE_UNAVAILABLE = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-5001",
+        dev_message="Dependency unreachable — database or Redis",
+        message="Service unavailable",
+    )
+    RATE_LIMITED = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-4029",
+        dev_message="Rate limited — too many requests to upstream source",
+        message="Rate limited",
+    )
+    UPSTREAM_UNAVAILABLE = ErrorCode(
+        error_type="COMMON",
+        error_code="COMMON-5002",
+        dev_message="Upstream service unreachable",
+        message="Service unavailable",
+    )
+
+
+class CrawlErrorCode:
+    """SADI-61xx — crawler errors (fetch itself failed)."""
+
+    URL_GET_FAILED = ErrorCode(
+        error_type="CRAWL",
         error_code="SADI-6101",
-        dev_message="Source returned HTTP 403 Forbidden during article fetch",
-        message="Source blocked the request (HTTP 403)",
-    )
-    HTTP_404 = ErrorCode(
-        error_type="NETWORK",
-        error_code="SADI-6102",
-        dev_message="Source returned HTTP 404 Not Found during article fetch",
-        message="Article URL not found (HTTP 404)",
-    )
-    NETWORK_ERROR = ErrorCode(
-        error_type="NETWORK",
-        error_code="SADI-6103",
-        dev_message="Network-level failure: timeout, DNS, connection reset, or TLS error",
-        message="Network failure fetching article",
+        dev_message="Failed to access the page — HTTP error, timeout, DNS, connection reset, or TLS error",
+        message="Failed to fetch article",
     )
     BROWSER_FETCH_FAILED = ErrorCode(
-        error_type="NETWORK",
+        error_type="CRAWL",
         error_code="SADI-6104",
         dev_message="Playwright browser fetch failed (navigation timeout or context crash)",
         message="Browser fetch failed",

@@ -1,7 +1,7 @@
 import fitz
 import pytest
 
-from app.crawl.parsers.pdf_parser import PdfEncryptedError, PdfParseError, parse_pdf
+from app.crawl.parsers.pdf_parser import PdfEncryptedException, PdfParseException, parse_pdf
 
 
 def _make_pdf(text: str = "Hello PDF world") -> bytes:
@@ -51,7 +51,7 @@ async def test_parse_pdf_primary_success():
 @pytest.mark.asyncio
 async def test_parse_pdf_encrypted_raises():
     content = _make_encrypted_pdf()
-    with pytest.raises(PdfEncryptedError):
+    with pytest.raises(PdfEncryptedException):
         await parse_pdf(content)
 
 
@@ -62,7 +62,7 @@ async def test_parse_pdf_encrypted_raises():
 @pytest.mark.asyncio
 async def test_parse_pdf_empty_raises():
     content = _make_empty_pdf()
-    with pytest.raises(PdfParseError, match="Both primary and fallback"):
+    with pytest.raises(PdfParseException, match="Both primary and fallback"):
         await parse_pdf(content)
 
 

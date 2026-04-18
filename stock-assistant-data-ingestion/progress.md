@@ -1,6 +1,6 @@
 # SADI — Implementation Progress
 
-Last updated: 2026-04-16
+Last updated: 2026-04-17
 
 ---
 
@@ -56,10 +56,10 @@ Last updated: 2026-04-16
 
 - [x] `app/common/text_utils.py` — `normalise()`, `compute_hash()` _(pure text tools pulled forward — shared by crawl & clean layers)_
 - [x] `app/cleaner/dedup_service.py` — `is_duplicate()` _(pulled forward — query helper used by Phase 7)_
-- [ ] `app/cleaner/stream_handler.py` — `StreamHandler` (`ensure_consumer_group`, `read_messages`, `reclaim_pending`, `ack`, `publish_cleaned`)
-- [ ] `app/cleaner/cleaning_service.py` — `CleaningService` (`start`, `process_record`, 7-step pipeline, `_mark_deleted`, `_fetch_raw_news`, `_insert_cleaned_news`)
-- [ ] `app/api/routes/cleaned_news.py` — `GET /v1/cleaned_news/{id}`, `POST /v1/cleaned_news/batch`
-- [ ] `app/api/main.py` — `create_app()` with routers + exception handlers
+- [x] `app/cleaner/stream_handler.py` — `StreamHandler` (`ensure_consumer_group`, `read_messages`, `reclaim_pending`, `ack`, `publish_cleaned`)
+- [x] `app/cleaner/cleaning_service.py` — `CleaningService` (`start`, `process_record`, 7-step pipeline, `_mark_deleted`, `_fetch_raw_news`, `_insert_cleaned_news`)
+- [x] `app/api/routes/cleaned_news.py` — `GET /v1/cleaned_news/{id}`, `POST /v1/cleaned_news/batch`
+- [x] `app/api/main.py` — `create_app()` with routers + exception handlers
 
 ## Phase 8 — Database Schema
 
@@ -91,4 +91,5 @@ Last updated: 2026-04-16
 | # | Question | Status |
 |---|---|---|
 | Q-2 | Validate `CLEAN_BODY_MIN_LENGTH = 50` against real crawl data | Unresolved — do not implement workarounds |
+| Q-4 | `CleaningService` processes records one-by-one (3–4 DB round-trips per record). For high-volume crawls (e.g. HKEX 500+ filings), consider batching DB operations in the worker — batch idempotency checks, fetches, dedup lookups, and inserts to reduce round-trips from ~4N to ~4 per batch. Tradeoff: added complexity in per-item error handling and ACK tracking within a batch. | Unresolved — evaluate after observing real throughput |
 | Q-3 | Audit `_parse_published_at` in all crawlers — current `re.search` over full page HTML is fragile (can match sidebar dates, footer copyright, embedded scripts). Scope regex to a CSS-selected DOM element instead. Needs sample article HTML from each source to identify the correct timestamp selector. | Resolved 2026-04-16. Sampled live HTML from both affected sources. **AAStocks**: timestamp sits in `div.newstime5` (skip the `newshead-Source` sibling), inside a `document.write(ConvertToLocalTime({dt:'YYYY/MM/DD HH:MM'}))` JS call — `_parse_published_at` now scopes the existing regex to that div's inner HTML. **Ming Pao**: timestamp sits in `div.date.color2nd` (e.g. `2026年4月15日 星期三　6:04AM`); the `div.date[itemprop="datePublished"]` sibling only carries the date with no time and is avoided — `_extract_published_at_from_page` now reads `get_text()` off the scoped node. HKEX (`td.release-time`) and Yahoo HK (RSS `pubDate` only) were already CSS-scoped / not affected. Unit tests added for noise-rejection (sidebar/footer dates, date-only sibling); live re-run: AAStocks 19/0, MingPao 88/0, both with populated timestamps. |

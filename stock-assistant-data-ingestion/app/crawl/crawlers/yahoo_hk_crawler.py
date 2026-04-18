@@ -10,9 +10,9 @@ from app.crawl.crawlers.base_crawler import (
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
-from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchError, fetch_rss
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlBlockedException, CrawlFatalException, CrawlRateLimitedException
+from app.crawl.fetchers.feed_fetcher import FeedEntry, FeedFetchException, fetch_rss
 from app.crawl.parsers.html_parser import extract_body_auto
 from app.crawl.fetchers.page_crawler import PageCrawler
 from app.db.connection import DatabaseClient
@@ -46,9 +46,9 @@ class YahooHKCrawler(BaseCrawler):
         logger.info("[yahoo_hk_crawler] Starting crawl")
         try:
             entries = await fetch_rss(YAHOO_HK_RSS_URL)
-        except FeedFetchError as exc:
+        except FeedFetchException as exc:
             logger.exception("[yahoo_hk_crawler] RSS fetch failed")
-            raise CrawlFatalError(f"Yahoo HK RSS fetch failed: {exc}") from exc
+            raise CrawlFatalException(f"Yahoo HK RSS fetch failed: {exc}") from exc
 
         filtered = [e for e in entries if YAHOO_HK_URL_PREFIX_FILTER in e.url]
         logger.info(
@@ -130,25 +130,16 @@ class YahooHKCrawler(BaseCrawler):
         max_retry = self.page_crawler._config.max_retry
         try:
             response = await self.page_crawler.fetch(url)
-        except CrawlBlockedError as exc:
-            code = NetworkErrorCode.HTTP_403 if "403" in str(exc) else NetworkErrorCode.HTTP_404
-            logger.warning("[yahoo_hk_crawler] Blocked %s: %s", url, exc)
-            result.failures.append(
-                CrawlFailItem(
-                    source_url=url,
-                    error_type=code.error_type,
-                    error_code=code.error_code,
-                    attempt_count=1,
-                )
-            )
+        except CrawlRateLimitedException as exc:
+            logger.warning("[yahoo_hk_crawler] Rate limited %s: %s", url, exc)
             return
-        except CrawlNetworkError as exc:
-            logger.warning("[yahoo_hk_crawler] Network error %s: %s", url, exc)
+        except CrawlBlockedException as exc:
+            logger.warning("[yahoo_hk_crawler] Fetch failed %s: %s", url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
-                    error_type=NetworkErrorCode.NETWORK_ERROR.error_type,
-                    error_code=NetworkErrorCode.NETWORK_ERROR.error_code,
+                    error_type=CrawlErrorCode.URL_GET_FAILED.error_type,
+                    error_code=CrawlErrorCode.URL_GET_FAILED.error_code,
                     attempt_count=max_retry,
                 )
             )

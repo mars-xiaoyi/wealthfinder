@@ -1,16 +1,12 @@
-class CrawlSkippedError(Exception):
-    """URL is already in crawl_error_log — caller raises this after its own pre-check."""
+class CrawlBlockedException(Exception):
+    """Page fetch failed — HTTP error, network failure, or all retries exhausted."""
 
 
-class CrawlNetworkError(Exception):
-    """All retries exhausted — caller adds to result.failures."""
+class CrawlRateLimitedException(Exception):
+    """HTTP 429 — transient, do not persist to crawl_error_log."""
 
 
-class CrawlBlockedError(Exception):
-    """HTTP 403 or 404 — immediate failure, caller adds to result.failures."""
-
-
-class CrawlFatalError(Exception):
+class CrawlFatalException(Exception):
     """
     Unrecoverable source-level failure (e.g. RSS unreachable after all retries,
     HKEX search page playwright load failure).

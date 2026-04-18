@@ -6,8 +6,8 @@ import pytest
 from app.config import CrawlConfig, CrawlSourceConfig
 from app.crawl.crawlers.aastocks_crawler import AAStocksCrawler
 from app.crawl.crawlers.base_crawler import CrawlResult
-from app.common.error_codes import DocumentParseErrorCode, NetworkErrorCode
-from app.crawl.exceptions import CrawlBlockedError, CrawlFatalError, CrawlNetworkError
+from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
+from app.crawl.exceptions import CrawlBlockedException, CrawlFatalException
 
 
 def make_source_config() -> CrawlSourceConfig:
@@ -162,24 +162,24 @@ class TestFetchOneArticle:
     @pytest.mark.asyncio
     async def test_blocked_404(self):
         pc = make_page_crawler()
-        pc.fetch.side_effect = CrawlBlockedError("HTTP 404 for x")
+        pc.fetch.side_effect = CrawlBlockedException("HTTP 404 for x")
         crawler = make_crawler(page_crawler=pc)
         result = CrawlResult()
 
         await crawler._fetch_one_article("https://x", result)
 
-        assert result.failures[0].error_code == NetworkErrorCode.HTTP_404.error_code
+        assert result.failures[0].error_code == CrawlErrorCode.URL_GET_FAILED.error_code
 
     @pytest.mark.asyncio
     async def test_network_error(self):
         pc = make_page_crawler(max_retry=2)
-        pc.fetch.side_effect = CrawlNetworkError("dead")
+        pc.fetch.side_effect = CrawlBlockedException("dead")
         crawler = make_crawler(page_crawler=pc)
         result = CrawlResult()
 
         await crawler._fetch_one_article("https://x", result)
 
-        assert result.failures[0].error_code == NetworkErrorCode.NETWORK_ERROR.error_code
+        assert result.failures[0].error_code == CrawlErrorCode.URL_GET_FAILED.error_code
         assert result.failures[0].attempt_count == 2
 
     @pytest.mark.asyncio
@@ -237,18 +237,18 @@ class TestRun:
     @pytest.mark.asyncio
     async def test_list_page_failure_raises_fatal(self):
         pc = make_page_crawler()
-        pc.fetch.side_effect = CrawlNetworkError("dead")
+        pc.fetch.side_effect = CrawlBlockedException("dead")
         crawler = make_crawler(page_crawler=pc)
 
-        with pytest.raises(CrawlFatalError, match="AAStocks list page"):
+        with pytest.raises(CrawlFatalException, match="AAStocks list page"):
             await crawler.run()
 
     @pytest.mark.asyncio
     async def test_blocked_list_page_raises_fatal(self):
         pc = make_page_crawler()
-        pc.fetch.side_effect = CrawlBlockedError("HTTP 403")
+        pc.fetch.side_effect = CrawlBlockedException("HTTP 403")
         crawler = make_crawler(page_crawler=pc)
-        with pytest.raises(CrawlFatalError):
+        with pytest.raises(CrawlFatalException):
             await crawler.run()
 
     @pytest.mark.asyncio

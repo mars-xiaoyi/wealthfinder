@@ -12,8 +12,8 @@ from app.crawl.crawlers.base_crawler import (
     CrawlSuccessItem,
 )
 from app.crawl.crawl_service import CrawlService
-from app.common.error_codes import NetworkErrorCode
-from app.crawl.exceptions import CrawlFatalError
+from app.common.error_codes import CrawlErrorCode
+from app.crawl.exceptions import CrawlFatalException
 from app.crawl.crawlers.hkex_crawler import HKEXCrawler
 from app.crawl.crawlers.mingpao_crawler import MingPaoCrawler
 from app.crawl.source_name import CrawlSourceName
@@ -71,8 +71,8 @@ def make_success(url="https://x/1") -> CrawlSuccessItem:
 def make_failure(url="https://x/bad") -> CrawlFailItem:
     return CrawlFailItem(
         source_url=url,
-        error_type=NetworkErrorCode.HTTP_403.error_type,
-        error_code=NetworkErrorCode.HTTP_403.error_code,
+        error_type=CrawlErrorCode.URL_GET_FAILED.error_type,
+        error_code=CrawlErrorCode.URL_GET_FAILED.error_code,
         attempt_count=1,
     )
 
@@ -286,7 +286,7 @@ class TestExecute:
     async def test_fatal_error_publishes_failed(self):
         service, db, stream, _ = make_service()
         _patch_crawler(
-            service, AsyncMock(side_effect=CrawlFatalError("RSS dead"))
+            service, AsyncMock(side_effect=CrawlFatalException("RSS dead"))
         )
 
         await service.execute("exec-1", CrawlSourceName.MINGPAO, None)

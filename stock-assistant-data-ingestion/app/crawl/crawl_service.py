@@ -15,7 +15,7 @@ from app.crawl.crawlers.base_crawler import (
     CrawlResult,
     CrawlSuccessItem,
 )
-from app.crawl.exceptions import CrawlFatalError
+from app.crawl.exceptions import CrawlFatalException
 from app.crawl.crawlers.hkex_crawler import HKEXCrawler
 from app.crawl.crawlers.mingpao_crawler import MingPaoCrawler
 from app.crawl.fetchers.page_crawler import PageCrawler
@@ -98,9 +98,9 @@ class CrawlService:
             crawler = self._create_crawler(source_name, crawl_date)
             try:
                 result = await crawler.run()
-            except CrawlFatalError as exc:
+            except CrawlFatalException as exc:
                 logger.error(
-                    "[crawl_service] CrawlFatalError for %s: %s",
+                    "[crawl_service] CrawlFatalException for %s: %s",
                     source_name.value,
                     exc,
                 )
