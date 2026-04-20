@@ -3,6 +3,7 @@ pyyaml==6.0.3
 
 # Database
 asyncpg==0.30.0
+alembic==1.15.2
 
 # Web framework
 fastapi==0.115.12

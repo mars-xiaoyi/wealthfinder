@@ -63,7 +63,10 @@ Last updated: 2026-04-17
 
 ## Phase 8 — Database Schema
 
-- [ ] `alembic/versions/001_create_tables.py` — `raw_news`, `cleaned_news`, `crawl_error_log` tables + indexes
+- [x] `alembic.ini` — Alembic configuration
+- [x] `alembic/env.py` — Migration runner (reads `DATABASE_URL` from env)
+- [x] `alembic/script.py.mako` — Migration file template
+- [x] `alembic/versions/001_create_tables.py` — `raw_news`, `cleaned_news`, `crawl_error_log` tables + indexes
 
 ## Phase 9 — Service Wiring
 

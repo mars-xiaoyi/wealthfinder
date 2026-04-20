@@ -62,5 +62,5 @@ def create_app() -> FastAPI:
                 "detail": {},
             },
         )
-
+        
     return app
