@@ -26,7 +26,7 @@ class TestValidationErrorHandler:
         assert resp.status_code == 400
         body = resp.json()
         assert body["error_code"] == "COMMON-4001"
-        assert "errors" in body["detail"]
+        assert "detail" not in body
 
 
 class TestJsonDecodeErrorHandler:

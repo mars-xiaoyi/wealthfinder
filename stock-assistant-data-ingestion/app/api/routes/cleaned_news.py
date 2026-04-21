@@ -2,7 +2,6 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from fastapi.responses import JSONResponse
 
 from app.api.dependencies import get_db
 from app.api.schemas import (
@@ -10,7 +9,7 @@ from app.api.schemas import (
     CleanedNewsBatchResponse,
     CleanedNewsRecord,
 )
-from app.common.error_codes import CommonErrorCode
+from app.common.exceptions import NotFoundException
 from app.db.connection import DatabaseClient
 
 logger = logging.getLogger(__name__)
@@ -51,18 +50,11 @@ def _row_to_record(row) -> CleanedNewsRecord:
 async def get_cleaned_news(
     cleaned_id: UUID,
     db: DatabaseClient = Depends(get_db),
-) -> CleanedNewsRecord | JSONResponse:
+) -> CleanedNewsRecord:
     logger.info("[cleaned_news] GET /v1/cleaned_news/%s", cleaned_id)
     row = await db.fetch_one(_SINGLE_QUERY, cleaned_id)
     if row is None:
-        return JSONResponse(
-            status_code=404,
-            content={
-                "error_code": CommonErrorCode.NOT_FOUND.error_code,
-                "message": CommonErrorCode.NOT_FOUND.message,
-                "detail": f"cleaned_id {cleaned_id} not found",
-            },
-        )
+        raise NotFoundException(f"cleaned_id {cleaned_id} not found")
     return _row_to_record(row)
 
 

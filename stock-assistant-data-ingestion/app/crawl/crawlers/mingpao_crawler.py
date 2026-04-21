@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -109,13 +110,18 @@ class MingPaoCrawler(BaseCrawler):
         self, context, entry: FeedEntry, result: CrawlResult
     ) -> None:
         url = entry.url
+        jitter_s = random.uniform(
+            self.source_config.request_interval_min_ms / 1000,
+            self.source_config.request_interval_max_ms / 1000,
+        )
+        await asyncio.sleep(jitter_s)
         try:
             page = await context.new_page()
             try:
                 await page.goto(
                     url,
                     wait_until="domcontentloaded",
-                    timeout=self.page_crawler._config.browser_navigation_timeout_ms,
+                    timeout=self.page_crawler.config.browser_navigation_timeout_ms,
                 )
                 html = await page.content()
             finally:

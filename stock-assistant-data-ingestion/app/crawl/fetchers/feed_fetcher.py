@@ -10,8 +10,13 @@ import feedparser
 logger = logging.getLogger(__name__)
 
 
-class FeedFetchException(Exception):
+from app.common.error_codes import CrawlErrorCode
+from app.common.exceptions import SADIException
+
+
+class FeedFetchException(SADIException):
     """Raised when feedparser fails or returns an empty/invalid feed."""
+    error_code = CrawlErrorCode.URL_GET_FAILED
 
 
 @dataclass

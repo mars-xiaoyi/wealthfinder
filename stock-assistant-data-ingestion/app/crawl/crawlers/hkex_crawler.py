@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -109,7 +110,7 @@ class HKEXCrawler(BaseCrawler):
         target_date: date,
     ) -> list[HKEXAnnouncement]:
         url = HKEX_SEARCH_URL_TEMPLATE.format(date=target_date.strftime("%Y%m%d"))
-        nav_timeout_ms = self.page_crawler._config.browser_navigation_timeout_ms
+        nav_timeout_ms = self.page_crawler.config.browser_navigation_timeout_ms
         context = await browser_manager.acquire_context()
         try:
             page = await context.new_page()
@@ -257,7 +258,12 @@ class HKEXCrawler(BaseCrawler):
         self, announcement: HKEXAnnouncement, result: CrawlResult
     ) -> None:
         pdf_url = announcement.pdf_url
-        max_retry = self.page_crawler._config.max_retry
+        max_retry = self.page_crawler.config.max_retry
+        jitter_s = random.uniform(
+            self.source_config.request_interval_min_ms / 1000,
+            self.source_config.request_interval_max_ms / 1000,
+        )
+        await asyncio.sleep(jitter_s)
         try:
             response = await self.page_crawler.fetch(pdf_url)
         except CrawlRateLimitedException as exc:

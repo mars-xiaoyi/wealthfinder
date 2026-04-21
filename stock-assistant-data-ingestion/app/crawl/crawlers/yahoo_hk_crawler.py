@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from datetime import date, datetime
 from typing import Optional
 
@@ -127,7 +128,12 @@ class YahooHKCrawler(BaseCrawler):
         self, entry: FeedEntry, result: CrawlResult
     ) -> None:
         url = entry.url
-        max_retry = self.page_crawler._config.max_retry
+        max_retry = self.page_crawler.config.max_retry
+        jitter_s = random.uniform(
+            self.source_config.request_interval_min_ms / 1000,
+            self.source_config.request_interval_max_ms / 1000,
+        )
+        await asyncio.sleep(jitter_s)
         try:
             response = await self.page_crawler.fetch(url)
         except CrawlRateLimitedException as exc:

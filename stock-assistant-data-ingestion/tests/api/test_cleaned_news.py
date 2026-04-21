@@ -3,10 +3,9 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
-from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from app.api.routes.cleaned_news import router
+from app.api.main import create_app
 from app.db.connection import DatabaseClient
 
 
@@ -15,10 +14,9 @@ from app.db.connection import DatabaseClient
 # ---------------------------------------------------------------------------
 
 
-def _create_test_app(db: DatabaseClient) -> FastAPI:
-    app = FastAPI()
+def _create_test_app(db: DatabaseClient):
+    app = create_app()
     app.state.db = db
-    app.include_router(router, prefix="/v1")
     return app
 
 
@@ -78,11 +76,12 @@ class TestGetCleanedNews:
         assert body["error_code"] == "COMMON-4004"
 
     @pytest.mark.asyncio
-    async def test_invalid_uuid_returns_422(self, mock_db):
+    async def test_invalid_uuid_returns_400(self, mock_db):
         app = _create_test_app(mock_db)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             resp = await ac.get("/v1/cleaned_news/not-a-uuid")
-        assert resp.status_code == 422
+        assert resp.status_code == 400
+        assert resp.json()["error_code"] == "COMMON-4001"
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +128,8 @@ class TestPostCleanedNewsBatch:
         app = _create_test_app(mock_db)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             resp = await ac.post("/v1/cleaned_news/batch", json={"cleaned_ids": []})
-        assert resp.status_code == 422
+        assert resp.status_code == 400
+        assert resp.json()["error_code"] == "COMMON-4001"
 
     @pytest.mark.asyncio
     async def test_over_50_rejected(self, mock_db):
@@ -137,4 +137,5 @@ class TestPostCleanedNewsBatch:
         ids = [str(uuid4()) for _ in range(51)]
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             resp = await ac.post("/v1/cleaned_news/batch", json={"cleaned_ids": ids})
-        assert resp.status_code == 422
+        assert resp.status_code == 400
+        assert resp.json()["error_code"] == "COMMON-4001"

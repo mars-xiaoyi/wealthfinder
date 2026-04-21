@@ -5,15 +5,20 @@ from io import BytesIO
 import fitz  # pymupdf
 from pdfminer.high_level import extract_text as pdfminer_extract_text
 
+from app.common.error_codes import DocumentParseErrorCode
+from app.common.exceptions import SADIException
+
 logger = logging.getLogger(__name__)
 
 
-class PdfEncryptedException(Exception):
+class PdfEncryptedException(SADIException):
     """Raised when the PDF is encrypted. Non-retryable — log and discard."""
+    error_code = DocumentParseErrorCode.PDF_ENCRYPTED
 
 
-class PdfParseException(Exception):
+class PdfParseException(SADIException):
     """Raised when both parsers fail on a non-encrypted PDF."""
+    error_code = DocumentParseErrorCode.PDF_PARSE_ERROR
 
 
 def _parse_primary(content: bytes) -> str:

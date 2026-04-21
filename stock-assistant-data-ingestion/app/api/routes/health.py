@@ -23,7 +23,7 @@ async def _ping_db(db: DatabaseClient) -> ComponentStatus:
 
 async def _ping_redis(stream_client: StreamClient) -> ComponentStatus:
     try:
-        await stream_client._client.ping()
+        await stream_client.ping()
         return ComponentStatus.OK
     except Exception:
         logger.warning("Health check: redis ping failed", exc_info=True)

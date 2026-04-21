@@ -104,6 +104,9 @@ class StreamClient:
             else:
                 raise
 
+    async def ping(self) -> bool:
+        return await self._client.ping()
+
     async def close(self) -> None:
         """Close the Redis connection."""
         await self._client.aclose()

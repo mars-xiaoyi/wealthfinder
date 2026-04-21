@@ -27,8 +27,7 @@ def mock_db():
 @pytest.fixture
 def mock_stream_client():
     client = AsyncMock(spec=StreamClient)
-    client._client = AsyncMock()
-    client._client.ping = AsyncMock(return_value=True)
+    client.ping = AsyncMock(return_value=True)
     return client
 
 
@@ -61,7 +60,7 @@ async def test_health_db_down(mock_db, mock_stream_client):
 
 @pytest.mark.asyncio
 async def test_health_redis_down(mock_db, mock_stream_client):
-    mock_stream_client._client.ping.side_effect = ConnectionError("redis unreachable")
+    mock_stream_client.ping.side_effect = ConnectionError("redis unreachable")
     app = _create_test_app(mock_db, mock_stream_client)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         resp = await ac.get("/v1/health")
@@ -76,7 +75,7 @@ async def test_health_redis_down(mock_db, mock_stream_client):
 @pytest.mark.asyncio
 async def test_health_both_down(mock_db, mock_stream_client):
     mock_db.fetch_one.side_effect = ConnectionError("db unreachable")
-    mock_stream_client._client.ping.side_effect = ConnectionError("redis unreachable")
+    mock_stream_client.ping.side_effect = ConnectionError("redis unreachable")
     app = _create_test_app(mock_db, mock_stream_client)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         resp = await ac.get("/v1/health")

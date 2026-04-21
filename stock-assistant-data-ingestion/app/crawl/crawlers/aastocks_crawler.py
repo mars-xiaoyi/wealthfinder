@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -107,7 +108,12 @@ class AAStocksCrawler(BaseCrawler):
         await asyncio.gather(*(worker(u) for u in urls))
 
     async def _fetch_one_article(self, url: str, result: CrawlResult) -> None:
-        max_retry = self.page_crawler._config.max_retry
+        max_retry = self.page_crawler.config.max_retry
+        jitter_s = random.uniform(
+            self.source_config.request_interval_min_ms / 1000,
+            self.source_config.request_interval_max_ms / 1000,
+        )
+        await asyncio.sleep(jitter_s)
         try:
             response = await self.page_crawler.fetch(url)
         except CrawlRateLimitedException as exc:

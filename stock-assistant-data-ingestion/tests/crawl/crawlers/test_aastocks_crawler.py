@@ -20,7 +20,7 @@ def make_source_config() -> CrawlSourceConfig:
 
 def make_page_crawler(max_retry: int = 3) -> MagicMock:
     pc = MagicMock()
-    pc._config = CrawlConfig(
+    pc.config = CrawlConfig(
         max_retry=max_retry,
         retry_base_wait_ms=10,
         request_timeout_s=10,

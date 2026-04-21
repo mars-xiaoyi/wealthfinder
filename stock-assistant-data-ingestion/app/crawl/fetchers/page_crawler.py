@@ -21,7 +21,7 @@ class PageCrawler:
         config: CrawlConfig,
     ) -> None:
         self._client = client
-        self._config = config
+        self.config = config
 
     async def fetch(self, url: str) -> httpx.Response:
         """
@@ -33,10 +33,10 @@ class PageCrawler:
         """
         logger.debug("[page_crawler] Fetching URL: %s", url)
         last_exc: Exception | None = None
-        for attempt in range(1, self._config.max_retry + 1):
+        for attempt in range(1, self.config.max_retry + 1):
             try:
                 response = await self._client.get(
-                    url, timeout=self._config.request_timeout_s
+                    url, timeout=self.config.request_timeout_s
                 )
 
                 if response.status_code == 429:
@@ -58,21 +58,21 @@ class PageCrawler:
 
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
                 last_exc = exc
-                if attempt < self._config.max_retry:
+                if attempt < self.config.max_retry:
                     wait_s = (
-                        self._config.retry_base_wait_ms * (2 ** (attempt - 1))
+                        self.config.retry_base_wait_ms * (2 ** (attempt - 1))
                     ) / 1000
                     logger.warning(
                         "[page_crawler] Attempt %d/%d failed for %s, retrying in %.3fs: %s",
                         attempt,
-                        self._config.max_retry,
+                        self.config.max_retry,
                         url,
                         wait_s,
                         exc,
                     )
                     await asyncio.sleep(wait_s)
 
-        logger.error("[page_crawler] All %d retries exhausted for %s: %s", self._config.max_retry, url, last_exc)
+        logger.error("[page_crawler] All %d retries exhausted for %s: %s", self.config.max_retry, url, last_exc)
         raise CrawlBlockedException(
-            f"All {self._config.max_retry} retries exhausted for {url}: {last_exc}"
+            f"All {self.config.max_retry} retries exhausted for {url}: {last_exc}"
         )

@@ -70,13 +70,14 @@ Last updated: 2026-04-17
 
 ## Phase 9 — Service Wiring
 
-- [ ] `app/main.py` — lifespan handler (startup + shutdown), `app` instance
+- [x] `app/main.py` — lifespan handler (startup + shutdown), `app` instance
 
 ## Phase 10 — Packaging
 
-- [ ] `requirements.txt`
-- [ ] `Dockerfile`
-- [ ] `docker-compose.yml`
+- [x] `requirements.txt` — added `uvicorn`, `psycopg2-binary`; moved `httpx` to runtime; split test deps to `requirements-test.txt`
+- [x] `requirements-test.txt` — extends `requirements.txt` with `pytest`, `pytest-asyncio`
+- [x] `Dockerfile` — `python:3.12-slim`, playwright chromium system deps, `uvicorn` entry point
+- [x] `docker-compose.yml` — `sadi`, `postgres:16-alpine`, `redis:7-alpine` with healthchecks and persistent volume
 
 ---
 
