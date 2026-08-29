@@ -16,4 +16,6 @@ class RawNews:
     raw_hash: str                       # SHA-256 of normalised title (unique index in DB)
     extra_metadata: Optional[dict]      # e.g. {"stock_code": ["00700", "00388"]} for HKEX (always a list, even for single-issuer rows); null for others
     is_deleted: bool = False            # Soft delete flag set by cleaning layer
-    deleted_reason: Optional[str] = None  # "EMPTY_FIELD" / "DUPLICATE_TITLE" / "BODY_TOO_SHORT"
+    deleted_reason: Optional[str] = None  # "EMPTY_FIELD" / "BODY_TOO_SHORT" — cross-source
+    # title dedup is handled by the crawl layer's raw_hash UNIQUE constraint (never a
+    # cleaning-layer rejection reason here), see docs/spikes.md §1.1

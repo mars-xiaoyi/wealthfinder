@@ -53,7 +53,7 @@ class TestRawNews:
             raw_hash="ghi789",
             extra_metadata=None,
             is_deleted=True,
-            deleted_reason="DUPLICATE_TITLE",
+            deleted_reason="BODY_TOO_SHORT",
         )
         assert raw.is_deleted is True
-        assert raw.deleted_reason == "DUPLICATE_TITLE"
+        assert raw.deleted_reason == "BODY_TOO_SHORT"

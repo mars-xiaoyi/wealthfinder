@@ -109,9 +109,10 @@ sadi/
 │   │       ├── html_parser.py       # Auto-extraction + BS4 CSS selector fallback
 │   │       └── pdf_parser.py        # pymupdf primary + pdfminer.six fallback
 │   ├── cleaner/
-│   │   ├── cleaning_service.py      # Cleaning layer: queue management + 7-step pipeline
-│   │   ├── stream_handler.py        # Redis Streams consumer + producer
-│   │   └── dedup_service.py         # is_duplicate() — cross-source raw_hash lookup
+│   │   ├── cleaning_service.py      # Cleaning layer: queue management + 6-step pipeline
+│   │   └── stream_handler.py        # Redis Streams consumer + producer
+│   │   # No dedup_service.py — cross-source dedup is the crawl layer's raw_hash
+│   │   # UNIQUE constraint alone; see docs/spikes.md §1.1
 │   ├── common/
 │   │   ├── text_utils.py            # normalise() + compute_hash() — pure text tools shared by crawl & clean layers
 │   │   └── error_codes.py           # ErrorCode base + CommonErrorCode / CrawlErrorCode / DocumentParseErrorCode catalogs
@@ -171,7 +172,9 @@ class RawNews:
     raw_hash: str                       # SHA-256 of normalised title (unique index in DB)
     extra_metadata: Optional[dict]      # e.g. {"stock_code": ["00700"]} for HKEX (list — one row may list multiple short codes); null for others
     is_deleted: bool = False            # Soft delete flag set by cleaning layer
-    deleted_reason: Optional[str] = None  # "EMPTY_FIELD" / "DUPLICATE_TITLE" / "BODY_TOO_SHORT"
+    deleted_reason: Optional[str] = None  # "EMPTY_FIELD" / "BODY_TOO_SHORT" — cross-source
+    # title dedup is handled by the crawl layer's raw_hash UNIQUE constraint (never a
+    # cleaning-layer rejection reason here), see docs/spikes.md §1.1
 ```
 
 ### 3.2 `app/models/cleaned_news.py`
@@ -428,12 +431,26 @@ Purpose : Execute a write query (INSERT / UPDATE) with transient-failure retry
           and exponential backoff. Use this for all writes.
 Params  : query — SQL string with positional placeholders ($1, $2, ...)
           *args — query parameter values in positional order
-Raises  : asyncpg.PostgresError on permanent failure, or after all retries
-          exhausted on transient failure.
+Raises  : UniqueConstraintError (app.db.exceptions) on a unique-constraint
+          violation, DatabaseError (app.db.exceptions) on other data-integrity
+          failures, or ServiceUnavailableException (app.common.exceptions) on
+          a connection failure / after all retries exhausted.
 
-Retry behaviour:
-  Transient (retry):  TooManyConnectionsError, ConnectionDoesNotExistError
-  Permanent (no retry): UniqueViolationError, DataError, NotNullViolationError
+asyncpg is an implementation detail of this module. Every asyncpg exception is
+translated into one of the above at this boundary before returning to the
+caller — no other module may import asyncpg or catch its exception types
+directly (see app/crawl/crawl_service.py and app/api/main.py for the callers
+this replaced asyncpg-specific handling in).
+
+Retry behaviour (internal asyncpg classification, not visible to callers):
+  Transient (retry):    TooManyConnectionsError, ConnectionDoesNotExistError
+                         → ServiceUnavailableException once retries exhausted
+  Permanent (no retry):  UniqueViolationError       → UniqueConstraintError
+                          DataError,
+                          NotNullViolationError      → DatabaseError
+                          PostgresConnectionError,
+                          InterfaceError             → ServiceUnavailableException
+                          any other PostgresError    → DatabaseError (safety net)
 ```
 
 Backoff formula: `wait_ms = config.retry_base_wait_ms × 2^(attempt - 1)`
@@ -444,7 +461,27 @@ Attempt 2 → wait 200ms
 Attempt 3 → wait 400ms → raise if still failing
 ```
 
-> **Unique constraint violations:** `UniqueViolationError` is raised immediately (no retry) and should be caught at the call site and treated as a no-op — it means the record already exists, which is expected behaviour in the crawler layer (`ON CONFLICT DO NOTHING` handles most cases at SQL level, but double-check).
+> **Unique constraint violations:** surfaced to callers as `UniqueConstraintError` (`app/db/exceptions.py`; carries `constraint_name`), raised immediately with no retry. Catch this driver-agnostic type at the call site — never `asyncpg.UniqueViolationError` directly. In the crawler layer, a `raw_hash` collision (cross-source title duplicate) is expected behaviour and treated as a no-op; a `source_url` collision is instead absorbed silently by `ON CONFLICT (source_url) DO NOTHING` at the SQL level and never raises at all (`execute_returning()` returns `None` in that case — see below and §6 `CrawlService._persist_successes`).
+
+---
+
+#### Method: `execute_returning(query: str, *args) -> Optional[asyncpg.Record]`
+
+```
+Purpose : Execute a write query with a RETURNING clause (e.g. an
+          INSERT ... ON CONFLICT DO NOTHING RETURNING <col>), with the same
+          retry-on-transient-failure and exception-translation semantics as
+          execute().
+Params  : query — SQL string with positional placeholders ($1, $2, ...) and a
+          RETURNING clause
+          *args — query parameter values in positional order
+Returns : The first returned row, or None if the statement affected no rows
+          (e.g. an ON CONFLICT DO NOTHING no-op silently swallowed the write —
+          this is how CrawlService._persist_successes detects a source_url
+          retry/redelivery and skips publishing a raw_id that was never
+          actually written to raw_news).
+Raises  : Same as execute() above.
+```
 
 ---
 
@@ -456,6 +493,9 @@ Purpose : Execute a SELECT query and return the first matching row, or None if n
 Params  : query — SQL string
           *args — query parameter values
 Returns : asyncpg.Record (access fields as record["field_name"]), or None
+Raises  : DatabaseError or ServiceUnavailableException (same translation as
+          execute(), minus the retry loop — a connection failure here raises
+          immediately rather than retrying).
 ```
 
 ---
@@ -468,6 +508,7 @@ Purpose : Execute a SELECT query and return all matching rows.
 Params  : query — SQL string
           *args — query parameter values
 Returns : List of asyncpg.Record; empty list if no rows found
+Raises  : Same as fetch_one() above.
 ```
 
 ---
@@ -1564,22 +1605,9 @@ def compute_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 ```
 
-> Both functions are pure — no DB, no I/O, no domain coupling. They are imported by `CrawlService._persist_successes` (crawl layer) and will be imported by `CleaningService` (clean layer) when Phase 7 lands. Do not re-implement these anywhere else.
+> Both functions are pure — no DB, no I/O, no domain coupling. They are imported by `CrawlService._persist_successes` (crawl layer) to compute `raw_hash` at insert time, and by `CleaningService` (clean layer) to produce cleaned titles/bodies. Do not re-implement these anywhere else.
 
-### 9.1 `app/cleaner/dedup_service.py`
-
-Cleaning-layer query helper. Pure hash/normalisation functions live in `app/common/text_utils.py` (see §9.0) — this module only holds the DB lookup.
-
-#### Function: `is_duplicate(raw_hash: str, db: DatabaseClient) -> bool`
-
-```
-Purpose : Check if a raw_hash already exists in raw_news.
-          Used by the cleaning layer to detect cross-source title duplicates.
-Params  : raw_hash — SHA-256 hex string (produced by compute_hash from app.common.text_utils)
-          db       — DatabaseClient instance
-Returns : True if a record with this hash already exists (and has is_deleted=False)
-Query   : SELECT EXISTS(SELECT 1 FROM raw_news WHERE raw_hash = $1 AND is_deleted = FALSE)
-```
+> **`app/cleaner/dedup_service.py` — superseded, not implemented.** An earlier revision of this doc specified a cleaning-layer `is_duplicate(raw_hash, db) -> bool` helper here, checking for a `raw_hash` collision in `raw_news` and rejecting the row with `deleted_reason=DUPLICATE_TITLE`. This turned out to be structurally unreachable: `raw_news.raw_hash` carries a DB-level `UNIQUE` constraint, and the crawl layer already relies on it — `CrawlService._persist_successes` catches the resulting `UniqueConstraintError` and no-ops before the duplicate row is ever inserted, so it never reaches `stream:raw_news_inserted` or the cleaning layer at all. Cross-source title dedup is fully owned by the crawl-insert layer; no `dedup_service.py` file exists or is planned. See `stock-assistant-data-ingestion/docs/spikes.md` §1.1 for the full analysis and decision record.
 
 ### 9.2 `app/cleaner/stream_handler.py`
 
@@ -1640,7 +1668,7 @@ Purpose : Publish to stream:raw_news_cleaned after a record is successfully clea
 
 #### Class: `CleaningService`
 
-The heart of the cleaning layer. Runs the consumer loop and orchestrates the 7-step pipeline.
+The heart of the cleaning layer. Runs the consumer loop and orchestrates the 6-step pipeline.
 
 ```python
 class CleaningService:
@@ -1695,7 +1723,10 @@ flowchart TD
 
 #### Method: `process_record(raw_id: UUID) -> None`
 
-The 7-step cleaning pipeline. This is the most important method in the cleaning layer.
+The 6-step cleaning pipeline. This is the most important method in the cleaning layer.
+(Cross-source title dedup is not one of these steps — it's a crawl-insert-time
+rejection via the `raw_hash` UNIQUE constraint; see the §9.1 note above and
+`docs/spikes.md` §1.1.)
 
 ```
 Purpose : Run the full cleaning pipeline for one raw_news record.
@@ -1704,7 +1735,7 @@ Purpose : Run the full cleaning pipeline for one raw_news record.
           On storage failure: raise exception (message remains unACKed for redelivery).
 ```
 
-#### Flowchart — 7-Step Pipeline
+#### Flowchart — 6-Step Pipeline
 
 ```mermaid
 flowchart TD
@@ -1716,14 +1747,11 @@ flowchart TD
     F --> C
     E -->|Pass| G[Step 2: published_at check\nalways passes - nullable OK]
     G --> H[Step 3: normalise title\nunicodedata NFKC + whitespace]
-    H --> I[Step 4: compute SHA-256 of normalised_title\ncheck raw_hash collision in raw_news]
-    I -->|Duplicate found| J[mark_deleted DUPLICATE_TITLE\nlog rejection]
-    J --> C
-    I -->|No duplicate| K[Step 5: normalise body\nNFKC + whitespace]
-    K --> L{Step 6: len body_cleaned >= CLEAN_BODY_MIN_LENGTH?}
+    H --> K[Step 4: normalise body\nNFKC + whitespace]
+    K --> L{Step 5: len body_cleaned >= CLEAN_BODY_MIN_LENGTH?}
     L -->|Fail| M[mark_deleted BODY_TOO_SHORT\nlog rejection]
     M --> C
-    L -->|Pass| N[Step 7: INSERT cleaned_news]
+    L -->|Pass| N[Step 6: INSERT cleaned_news]
     N -->|DB error| O([raise exception\nmessage stays unACKed])
     N -->|OK| P[StreamHandler.publish_cleaned cleaned_id]
     P --> Q([return success])
@@ -1734,7 +1762,7 @@ flowchart TD
 ```
 Purpose : Set is_deleted=True and deleted_reason on a raw_news record.
           Uses self.db — no pool parameter needed.
-Params  : reason — "EMPTY_FIELD" / "DUPLICATE_TITLE" / "BODY_TOO_SHORT"
+Params  : reason — "EMPTY_FIELD" / "BODY_TOO_SHORT"
 SQL     : UPDATE raw_news SET is_deleted=TRUE, deleted_reason=$1 WHERE raw_id=$2
 ```
 

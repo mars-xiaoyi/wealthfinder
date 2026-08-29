@@ -55,9 +55,9 @@ Last updated: 2026-04-17
 ## Phase 7 — Cleaning Layer
 
 - [x] `app/common/text_utils.py` — `normalise()`, `compute_hash()` _(pure text tools pulled forward — shared by crawl & clean layers)_
-- [x] `app/cleaner/dedup_service.py` — `is_duplicate()` _(pulled forward — query helper used by Phase 7)_
+- [~] ~~`app/cleaner/dedup_service.py` — `is_duplicate()`~~ — **superseded, not implemented.** `raw_news.raw_hash` already carries a DB-level UNIQUE constraint; the crawl layer's insert already no-ops on a collision before the row ever reaches the cleaning stream, making a cleaning-layer `is_duplicate()` check unreachable dead code. Cross-source dedup is fully owned by the crawl-insert layer. See `docs/spikes.md` §1.1.
 - [x] `app/cleaner/stream_handler.py` — `StreamHandler` (`ensure_consumer_group`, `read_messages`, `reclaim_pending`, `ack`, `publish_cleaned`)
-- [x] `app/cleaner/cleaning_service.py` — `CleaningService` (`start`, `process_record`, 7-step pipeline, `_mark_deleted`, `_fetch_raw_news`, `_insert_cleaned_news`)
+- [x] `app/cleaner/cleaning_service.py` — `CleaningService` (`start`, `process_record`, 6-step pipeline, `_mark_deleted`, `_fetch_raw_news`, `_insert_cleaned_news`)
 - [x] `app/api/routes/cleaned_news.py` — `GET /v1/cleaned_news/{id}`, `POST /v1/cleaned_news/batch`
 - [x] `app/api/main.py` — `create_app()` with routers + exception handlers
 

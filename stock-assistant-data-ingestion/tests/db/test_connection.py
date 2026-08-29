@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 import asyncpg
 import pytest
 
+from app.common.exceptions import ServiceUnavailableException
 from app.config import DatabaseConfig
 from app.db.connection import DatabaseClient, create_db_client
+from app.db.exceptions import DatabaseError, UniqueConstraintError
 
 
 def make_config(**overrides) -> DatabaseConfig:
@@ -35,25 +37,55 @@ async def test_execute_success():
 
 
 # ---------------------------------------------------------------------------
-# execute — permanent errors raise immediately without retry
+# execute — asyncpg errors are translated to driver-agnostic exceptions,
+# never leaked to the caller. Permanent ones raise immediately without retry.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc_class", [
-    asyncpg.UniqueViolationError,
-    asyncpg.DataError,
-    asyncpg.NotNullViolationError,
-])
-async def test_execute_permanent_error_no_retry(exc_class):
+async def test_execute_unique_violation_translated_with_constraint_name():
+    client, conn = make_client()
+    exc = asyncpg.UniqueViolationError("msg")
+    exc.constraint_name = "uq_raw_news_raw_hash"
+    conn.execute = AsyncMock(side_effect=exc)
+    with pytest.raises(UniqueConstraintError) as excinfo:
+        await client.execute("INSERT INTO foo VALUES ($1)", 1)
+    assert excinfo.value.constraint_name == "uq_raw_news_raw_hash"
+    conn.execute.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc_class", [asyncpg.DataError, asyncpg.NotNullViolationError])
+async def test_execute_data_integrity_error_translated_no_retry(exc_class):
     client, conn = make_client()
     conn.execute = AsyncMock(side_effect=exc_class("msg"))
-    with pytest.raises(exc_class):
+    with pytest.raises(DatabaseError):
         await client.execute("INSERT INTO foo VALUES ($1)", 1)
     conn.execute.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc_class", [asyncpg.PostgresConnectionError, asyncpg.InterfaceError])
+async def test_execute_connection_error_translated_to_service_unavailable(exc_class):
+    client, conn = make_client()
+    conn.execute = AsyncMock(side_effect=exc_class("msg"))
+    with pytest.raises(ServiceUnavailableException):
+        await client.execute("INSERT INTO foo VALUES ($1)", 1)
+    conn.execute.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_unclassified_postgres_error_translated_to_database_error():
+    """Safety net: any Postgres-side error not explicitly classified above
+    must still never leak a raw asyncpg type out of DatabaseClient."""
+    client, conn = make_client()
+    conn.execute = AsyncMock(side_effect=asyncpg.InternalServerError("weird"))
+    with pytest.raises(DatabaseError):
+        await client.execute("INSERT INTO foo VALUES ($1)", 1)
+
+
 # ---------------------------------------------------------------------------
-# execute — transient error retries then raises after exhausting attempts
+# execute — transient error retries then raises ServiceUnavailableException
+# after exhausting attempts
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -63,7 +95,7 @@ async def test_execute_transient_error_retries_then_raises():
     conn.execute = AsyncMock(side_effect=asyncpg.TooManyConnectionsError("busy"))
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-        with pytest.raises(asyncpg.TooManyConnectionsError):
+        with pytest.raises(ServiceUnavailableException):
             await client.execute("INSERT INTO foo VALUES ($1)", 1)
 
     assert conn.execute.call_count == 3
@@ -92,6 +124,103 @@ async def test_execute_transient_error_succeeds_on_retry():
 
 
 # ---------------------------------------------------------------------------
+# execute_returning — happy path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_returning_returns_row():
+    client, conn = make_client()
+    fake_row = MagicMock()
+    conn.fetchrow = AsyncMock(return_value=fake_row)
+    result = await client.execute_returning(
+        "INSERT INTO foo VALUES ($1) RETURNING id", "bar"
+    )
+    assert result is fake_row
+    conn.fetchrow.assert_called_once_with(
+        "INSERT INTO foo VALUES ($1) RETURNING id", "bar"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_returning_returns_none_on_conflict_no_op():
+    client, conn = make_client()
+    conn.fetchrow = AsyncMock(return_value=None)
+    result = await client.execute_returning(
+        "INSERT INTO foo VALUES ($1) ON CONFLICT DO NOTHING RETURNING id", "bar"
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# execute_returning — same translation contract as execute()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_returning_unique_violation_translated():
+    client, conn = make_client()
+    exc = asyncpg.UniqueViolationError("msg")
+    exc.constraint_name = "uq_raw_news_raw_hash"
+    conn.fetchrow = AsyncMock(side_effect=exc)
+    with pytest.raises(UniqueConstraintError) as excinfo:
+        await client.execute_returning("INSERT INTO foo VALUES ($1) RETURNING id", 1)
+    assert excinfo.value.constraint_name == "uq_raw_news_raw_hash"
+    conn.fetchrow.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc_class", [asyncpg.DataError, asyncpg.NotNullViolationError])
+async def test_execute_returning_data_integrity_error_translated(exc_class):
+    client, conn = make_client()
+    conn.fetchrow = AsyncMock(side_effect=exc_class("msg"))
+    with pytest.raises(DatabaseError):
+        await client.execute_returning("INSERT INTO foo VALUES ($1) RETURNING id", 1)
+    conn.fetchrow.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# execute_returning — transient error retries then raises ServiceUnavailableException
+# after exhausting attempts
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_returning_transient_error_retries_then_raises():
+    config = make_config(max_retry=3, retry_base_wait_ms=10)
+    client, conn = make_client(config)
+    conn.fetchrow = AsyncMock(side_effect=asyncpg.TooManyConnectionsError("busy"))
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with pytest.raises(ServiceUnavailableException):
+            await client.execute_returning("INSERT INTO foo VALUES ($1) RETURNING id", 1)
+
+    assert conn.fetchrow.call_count == 3
+    assert mock_sleep.call_count == 2
+    assert mock_sleep.call_args_list == [call(0.01), call(0.02)]
+
+
+# ---------------------------------------------------------------------------
+# execute_returning — transient error succeeds on retry
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_returning_transient_error_succeeds_on_retry():
+    config = make_config(max_retry=3, retry_base_wait_ms=10)
+    client, conn = make_client(config)
+    fake_row = MagicMock()
+    conn.fetchrow = AsyncMock(
+        side_effect=[asyncpg.TooManyConnectionsError("busy"), fake_row]
+    )
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        result = await client.execute_returning(
+            "INSERT INTO foo VALUES ($1) RETURNING id", 1
+        )
+
+    assert result is fake_row
+    assert conn.fetchrow.call_count == 2
+    assert mock_sleep.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # fetch_one
 # ---------------------------------------------------------------------------
 
@@ -113,6 +242,24 @@ async def test_fetch_one_returns_none_when_not_found():
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_fetch_one_connection_error_translated_no_retry():
+    client, conn = make_client()
+    conn.fetchrow = AsyncMock(side_effect=asyncpg.InterfaceError("conn closed"))
+    with pytest.raises(ServiceUnavailableException):
+        await client.fetch_one("SELECT * FROM foo WHERE id = $1", 1)
+    # No retry on reads — must fail on the first attempt.
+    conn.fetchrow.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_one_unclassified_postgres_error_translated():
+    client, conn = make_client()
+    conn.fetchrow = AsyncMock(side_effect=asyncpg.InternalServerError("weird"))
+    with pytest.raises(DatabaseError):
+        await client.fetch_one("SELECT * FROM foo WHERE id = $1", 1)
+
+
 # ---------------------------------------------------------------------------
 # fetch_all
 # ---------------------------------------------------------------------------
@@ -132,6 +279,15 @@ async def test_fetch_all_returns_empty_list():
     conn.fetch = AsyncMock(return_value=[])
     result = await client.fetch_all("SELECT * FROM foo WHERE 1=0")
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_connection_error_translated_no_retry():
+    client, conn = make_client()
+    conn.fetch = AsyncMock(side_effect=asyncpg.TooManyConnectionsError("busy"))
+    with pytest.raises(ServiceUnavailableException):
+        await client.fetch_all("SELECT * FROM foo")
+    conn.fetch.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

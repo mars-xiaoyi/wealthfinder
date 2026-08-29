@@ -337,7 +337,7 @@ Retries are scoped to the stage of failure. Successful stages are not repeated.
 | raw_hash | VARCHAR(64) | SHA-256(normalised_title); unique index for cross-source deduplication |
 | extra_metadata | JSONB | Source-specific structured metadata; e.g. `{"stock_code": ["00700", "00388"]}` for HKEX (always a list, even for single-issuer rows). Nullable |
 | is_deleted | BOOLEAN | Soft delete flag set by cleaning layer for rejected records; default false |
-| deleted_reason | VARCHAR(50) | EMPTY_FIELD / DUPLICATE_TITLE / BODY_TOO_SHORT; required when `is_deleted = true` |
+| deleted_reason | VARCHAR(50) | EMPTY_FIELD / BODY_TOO_SHORT; required when `is_deleted = true`. Cross-source title dedup is a crawl-insert-time rejection (`raw_hash` UNIQUE constraint), not a cleaning-layer `deleted_reason` — see §4.3 note and `stock-assistant-data-ingestion/docs/spikes.md` §1.1 |
 
 **`crawl_error_log` table** — Pure audit log. Does not drive any business decisions.
 
@@ -424,12 +424,13 @@ The cleaning layer consumes from `stream:raw_news_inserted` via Redis Streams Co
 | 1. Null check | Validate `title` and `body` are not empty | Either null → log rejection (`EMPTY_FIELD`); mark `is_deleted = true` in `raw_news`; stop processing |
 | 2. `published_at` check | `published_at` is nullable; no substitution is applied by the cleaning layer. Downstream consuming layers are responsible for falling back to `created_at` when null | Does not block processing |
 | 3. Title normalisation | Fullwidth-to-halfwidth (NFKC), strip excess whitespace | Normalisation failure logged as warning; does not block |
-| 4. Title hash deduplication | Compute `SHA-256(normalised_title)`; if collision found, retain record with earliest `created_at` | Duplicate → log rejection (`DUPLICATE_TITLE`); mark `is_deleted = true` in `raw_news`; stop processing |
-| 5. Body normalisation | Strip excess whitespace and line breaks, fullwidth-to-halfwidth | Normalisation failure logged as warning; does not block |
-| 6. Body length check | After normalisation, if `len(body_cleaned) < CLEAN_BODY_MIN_LENGTH` | Too short → log rejection (`BODY_TOO_SHORT`); mark `is_deleted = true` in `raw_news`; stop processing |
-| 7. Write to `cleaned_news` | Insert record with `title_cleaned`, `body_cleaned`, `created_at = now()` | On success: write to `stream:raw_news_cleaned`. On failure: do not write to stream — message remains unACKed for redelivery |
+| 4. Body normalisation | Strip excess whitespace and line breaks, fullwidth-to-halfwidth | Normalisation failure logged as warning; does not block |
+| 5. Body length check | After normalisation, if `len(body_cleaned) < CLEAN_BODY_MIN_LENGTH` | Too short → log rejection (`BODY_TOO_SHORT`); mark `is_deleted = true` in `raw_news`; stop processing |
+| 6. Write to `cleaned_news` | Insert record with `title_cleaned`, `body_cleaned`, `created_at = now()` | On success: write to `stream:raw_news_cleaned`. On failure: do not write to stream — message remains unACKed for redelivery |
 
 > **Rejection logging:** Rejected records are marked `is_deleted = true` with `deleted_reason` in `raw_news`. No entry is written to `cleaned_news`. Rejection details are recorded in application logs only.
+>
+> **Cross-source title dedup is not a cleaning-layer step.** It is owned entirely by the crawl-insert layer via the `raw_hash` UNIQUE constraint on `raw_news` (§4.4) — a duplicate-titled row from a different source is rejected at `INSERT` time and never reaches this pipeline. An earlier revision of this TAD specified a cleaning-layer title-hash-collision step here; it was found to be structurally unreachable given the constraint above and was dropped. See `stock-assistant-data-ingestion/docs/spikes.md` §1.1 for the analysis and decision record.
 
 ### 4.4 Data Model
 
@@ -597,8 +598,9 @@ sadi/
 │   │       └── pdf_parser.py        # pymupdf primary + pdfminer.six fallback
 │   ├── cleaner/
 │   │   ├── cleaning_service.py      # Cleaning layer main service, queue management
-│   │   ├── stream_handler.py        # Redis Streams consumer/producer
-│   │   └── dedup_service.py         # is_duplicate() — cross-source raw_hash lookup
+│   │   └── stream_handler.py        # Redis Streams consumer/producer
+│   │   # No dedup_service.py — cross-source dedup is the crawl layer's raw_hash
+│   │   # UNIQUE constraint alone; see docs/spikes.md §1.1
 │   ├── common/
 │   │   └── text_utils.py            # normalise() + compute_hash() — pure text tools shared by crawl & clean layers
 │   ├── api/

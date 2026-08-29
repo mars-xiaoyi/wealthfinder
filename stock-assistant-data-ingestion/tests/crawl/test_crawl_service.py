@@ -1,10 +1,10 @@
 from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import asyncpg
 import pytest
 
 from app.config import CrawlConfig, CrawlSourceConfig
+from app.db.exceptions import UniqueConstraintError
 from app.crawl.crawlers.aastocks_crawler import AAStocksCrawler
 from app.crawl.crawlers.base_crawler import (
     CrawlFailItem,
@@ -45,6 +45,7 @@ def make_config() -> CrawlConfig:
 def make_service() -> tuple[CrawlService, MagicMock, MagicMock, MagicMock]:
     db = MagicMock()
     db.execute = AsyncMock()
+    db.execute_returning = AsyncMock(return_value=MagicMock())
     db.fetch_one = AsyncMock()
     stream = MagicMock()
     stream.publish = AsyncMock()
@@ -125,7 +126,7 @@ class TestPersistSuccesses:
 
         await service._persist_successes(CrawlSourceName.HKEX, items)
 
-        assert db.execute.call_count == 2
+        assert db.execute_returning.call_count == 2
         assert stream.publish.call_count == 2
         for call in stream.publish.call_args_list:
             args, _ = call
@@ -135,7 +136,20 @@ class TestPersistSuccesses:
     @pytest.mark.asyncio
     async def test_unique_violation_skips_publish(self):
         service, db, stream, _ = make_service()
-        db.execute.side_effect = asyncpg.UniqueViolationError("dup")
+        db.execute_returning.side_effect = UniqueConstraintError("dup")
+
+        await service._persist_successes(
+            CrawlSourceName.HKEX, [make_success()]
+        )
+
+        stream.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_source_url_conflict_no_op_skips_publish(self):
+        """ON CONFLICT (source_url) DO NOTHING returns no row — nothing was
+        actually written, so we must not publish a raw_id that isn't in raw_news."""
+        service, db, stream, _ = make_service()
+        db.execute_returning.return_value = None
 
         await service._persist_successes(
             CrawlSourceName.HKEX, [make_success()]
@@ -146,7 +160,7 @@ class TestPersistSuccesses:
     @pytest.mark.asyncio
     async def test_db_failure_swallowed_other_records_still_processed(self):
         service, db, stream, _ = make_service()
-        db.execute.side_effect = [Exception("boom"), None]
+        db.execute_returning.side_effect = [Exception("boom"), MagicMock()]
 
         await service._persist_successes(
             CrawlSourceName.HKEX,
@@ -163,8 +177,8 @@ class TestPersistSuccesses:
 
         await service._persist_successes(CrawlSourceName.HKEX, [item])
 
-        # Last positional arg of execute should be the JSON string
-        args, _ = db.execute.call_args
+        # Last positional arg of execute_returning should be the JSON string
+        args, _ = db.execute_returning.call_args
         assert args[-1] == '{"stock_code": ["00700"]}'
 
     @pytest.mark.asyncio
@@ -180,7 +194,7 @@ class TestPersistSuccesses:
 
         await service._persist_successes(CrawlSourceName.MINGPAO, [item])
 
-        args, _ = db.execute.call_args
+        args, _ = db.execute_returning.call_args
         assert args[-1] is None
 
 
@@ -270,8 +284,9 @@ class TestExecute:
 
         await service.execute("exec-1", CrawlSourceName.HKEX, None)
 
-        # 1 raw_news insert + 1 crawl_error_log insert
-        assert db.execute.call_count == 2
+        # 1 raw_news insert (execute_returning) + 1 crawl_error_log insert (execute)
+        assert db.execute_returning.call_count == 1
+        assert db.execute.call_count == 1
         # 1 raw_news_inserted + 1 crawl_completed SUCCESS
         publish_calls = stream.publish.call_args_list
         streams_published = [call.args[0] for call in publish_calls]
@@ -298,7 +313,7 @@ class TestExecute:
         assert args[1]["status"] == "FAILED"
         assert args[1]["error_detail"] == "RSS dead"
         # No raw_news inserts
-        db.execute.assert_not_called()
+        db.execute_returning.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_zero_records_still_publishes_success(self):

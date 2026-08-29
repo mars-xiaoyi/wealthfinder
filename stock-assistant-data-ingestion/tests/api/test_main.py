@@ -2,6 +2,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.api.main import create_app
+from app.common.exceptions import ServiceUnavailableException
 
 
 @pytest.fixture
@@ -13,6 +14,29 @@ class TestCreateApp:
     def test_title_and_version(self, app):
         assert app.title == "SADI"
         assert app.version == "1.0.0"
+
+
+class TestServiceUnavailableViaGenericHandler:
+    """
+    A DB- or Redis-unreachable condition surfaces as ServiceUnavailableException
+    (e.g. raised inside DatabaseClient — see app/db/connection.py) and is routed
+    through the generic sadi_exception_handler via _HTTP_STATUS_MAP. There is no
+    dedicated asyncpg-specific handler: app/api/main.py must never import asyncpg.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_503(self, app):
+        @app.get("/__raises_service_unavailable")
+        async def _raise():
+            raise ServiceUnavailableException("db down")
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.get("/__raises_service_unavailable")
+
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["error_code"] == "COMMON-5001"
+        assert "detail" not in body
 
 
 class TestValidationErrorHandler:

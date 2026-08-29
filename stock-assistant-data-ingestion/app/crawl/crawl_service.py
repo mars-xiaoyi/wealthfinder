@@ -4,8 +4,6 @@ from datetime import date, datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-import asyncpg
-
 from app.common.text_utils import compute_hash, normalise
 from app.config import CrawlConfig
 from app.crawl.crawlers.aastocks_crawler import AAStocksCrawler
@@ -22,6 +20,7 @@ from app.crawl.fetchers.page_crawler import PageCrawler
 from app.crawl.source_name import CrawlSourceName
 from app.crawl.crawlers.yahoo_hk_crawler import YahooHKCrawler
 from app.db.connection import DatabaseClient
+from app.db.exceptions import UniqueConstraintError
 from app.redis.stream_client import (
     STREAM_CRAWL_COMPLETED,
     STREAM_RAW_NEWS_INSERTED,
@@ -38,6 +37,7 @@ INSERT INTO raw_news (
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (source_url) DO NOTHING
+RETURNING raw_id
 """
 
 
@@ -161,7 +161,7 @@ class CrawlService:
             )
 
             try:
-                await self._db.execute(
+                row = await self._db.execute_returning(
                     _INSERT_RAW_NEWS_SQL,
                     raw_id,
                     source_name.value,
@@ -173,7 +173,7 @@ class CrawlService:
                     raw_hash,
                     extra_metadata_json,
                 )
-            except asyncpg.UniqueViolationError:
+            except UniqueConstraintError:
                 logger.info(
                     "[crawl_service] Duplicate raw_news (hash collision) for %s — no-op",
                     item.source_url,
@@ -182,6 +182,18 @@ class CrawlService:
             except Exception:
                 logger.exception(
                     "[crawl_service] Failed to insert raw_news for %s",
+                    item.source_url,
+                )
+                continue
+
+            if row is None:
+                # ON CONFLICT (source_url) DO NOTHING silently absorbed this —
+                # the article was already ingested (retry/redelivery). Expected,
+                # not an error, but nothing was actually written: skip the
+                # publish so we don't signal a raw_id that isn't in raw_news.
+                logger.info(
+                    "[crawl_service] Duplicate raw_news (source_url already exists) "
+                    "for %s — no-op, skipping publish",
                     item.source_url,
                 )
                 continue
