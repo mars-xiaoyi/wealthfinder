@@ -4,7 +4,7 @@
 
 **Mars Wealthfinder (MWP)** is a Hong Kong equity news intelligence system. It ingests news from multiple sources, enriches it through an NLP and scoring pipeline, and produces a ranked "Morning Brief" of stock-relevant events for investment research.
 
-The system is in the **architecture/design phase** — all three services are fully documented but not yet implemented. The only runnable code is a SADI proof-of-concept (POC) for validating data sources.
+All three services are fully documented. **SADI implementation is substantially complete** (all 10 planned phases done — crawlers, cleaning pipeline, API, DB migrations, Docker packaging — see [stock-assistant-data-ingestion/progress.md](stock-assistant-data-ingestion/progress.md) for status and open questions). **SAPI and Admin are still design-only**, with no implementation code yet.
 
 ---
 
@@ -77,12 +77,11 @@ Always read the relevant documents before implementing any feature. All design d
 | File | Description |
 |------|-------------|
 | `docs/api.md` | API Spec — all endpoints, schemas, error codes |
-| `admin/docs/system-design.md` | Admin TAD |
-| `admin/docs/implementation.md` | Admin implementation doc |
+| `docs/admin-tad.md` | Admin TAD (no implementation doc or `admin/` code yet) |
 | `stock-assistant-data-ingestion/docs/architecture/system-design.md` | SADI TAD |
 | `stock-assistant-data-ingestion/docs/implementation.md` | SADI implementation doc |
-| `stock-assistant-pipeline-intelligence/docs/system-design.md` | SAPI TAD |
-| `stock-assistant-pipeline-intelligence/docs/implementation.md` | SAPI implementation doc |
+| `stock-assistant-data-ingestion/progress.md` | SADI implementation progress & open questions |
+| `stock-assistant-pipeline-intelligence/docs/architecture/system-design.md` | SAPI TAD (no implementation doc yet) |
 
 ---
 
@@ -91,7 +90,7 @@ Always read the relevant documents before implementing any feature. All design d
 - [x] System design documentation complete (SADI, SAPI, Admin)
 - [x] API specification complete
 - [x] SADI data source probe validated (all 4 sources pass)
-- [ ] SADI service implementation
-- [ ] SAPI service implementation
-- [ ] Admin service implementation
-- [ ] Docker Compose setup
+- [x] SADI service implementation — all 10 phases done: config, DB/Redis clients, models, 4 crawlers (HKEX, Ming Pao, AAStocks, Yahoo HK), cleaning pipeline, API routes, Alembic migrations, Dockerfile. 2 open questions remain unresolved in `progress.md` (Q-2: unvalidated `CLEAN_BODY_MIN_LENGTH`; Q-4: per-record DB round-trips, batching not designed) — do not implement around them.
+- [ ] SAPI service implementation — not started, design-only
+- [ ] Admin service implementation — not started, design-only, `admin/` directory does not exist yet
+- [x] Docker Compose setup — done for SADI (`sadi` + `postgres:16-alpine` + `redis:7-alpine`); not yet extended to SAPI/Admin
