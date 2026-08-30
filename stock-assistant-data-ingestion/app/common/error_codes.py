@@ -34,9 +34,8 @@ class ErrorCode:
                         # an individual failure (one URL, one PDF) at fleet scale isn't
                         # ops-actionable on its own. Override to logging.ERROR only for
                         # codes that are: genuinely unexpected (INTERNAL_ERROR) or
-                        # represent a dependency being down (SERVICE_UNAVAILABLE,
-                        # UPSTREAM_UNAVAILABLE). Callers log with
-                        # `logger.log(error_code.log_level, ...)`.
+                        # represent a dependency being down (SERVICE_UNAVAILABLE).
+                        # Callers log with `logger.log(error_code.log_level, ...)`.
 
 
 class CommonErrorCode:
@@ -79,13 +78,6 @@ class CommonErrorCode:
         error_code="COMMON-4029",
         dev_message="Rate limited — too many requests to upstream source",
         message="Rate limited",
-    )
-    UPSTREAM_UNAVAILABLE = ErrorCode(
-        error_type="COMMON",
-        error_code="COMMON-5002",
-        dev_message="Upstream service unreachable",
-        message="Service unavailable",
-        log_level=logging.ERROR,
     )
 
 

@@ -516,6 +516,13 @@ HTTP response codes:
 - Any component degraded → `200 degraded`
 - Database or Redis unreachable → `503 unhealthy`
 
+> **`degraded` is not implemented by SADI's MVP** (`docs/implementation.md` §7.4) —
+> `database`/`redis` are currently binary connectivity pings (`ok`/`error`), which
+> can't express "reachable but impaired." Planned future enhancement: derive
+> `degraded` from consumer-group lag on `stream:raw_news_inserted` (the pipeline
+> falling behind is a real signal; an arbitrary DB-pool/Redis-connection
+> saturation threshold would not be, with no load data yet to calibrate one).
+
 ---
 
 ## 7. Database Retry Strategy

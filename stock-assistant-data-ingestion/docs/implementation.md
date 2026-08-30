@@ -874,6 +874,13 @@ Health status rules:
 - `database=error` OR `redis=error` → `status=unhealthy`, HTTP 503
 
 > There is no `degraded` state for SADI in MVP (unlike SAPI which has layer-level health).
+> `_ping_db`/`_ping_redis` are binary connectivity probes — succeed or raise — with no
+> notion of "reachable but impaired," so there's nothing today's checks could report
+> `degraded` from. Planned future enhancement, not a gap to fill blindly: the leading
+> candidate signal is consumer-group lag on `stream:raw_news_inserted` (Redis up, but
+> `CleaningService` falling behind is a real, actionable condition), not a DB-pool or
+> Redis-connection saturation threshold picked without load data to calibrate it
+> against. See `docs/spikes.md` §4 for the full writeup.
 
 ---
 
@@ -1198,7 +1205,6 @@ class CommonErrorCode:
     RATE_LIMITED          = ErrorCode("COMMON", "COMMON-4029", ...)
     INTERNAL_ERROR       = ErrorCode("COMMON", "COMMON-5000", ..., log_level=logging.ERROR)
     SERVICE_UNAVAILABLE  = ErrorCode("COMMON", "COMMON-5001", ..., log_level=logging.ERROR)
-    UPSTREAM_UNAVAILABLE = ErrorCode("COMMON", "COMMON-5002", ..., log_level=logging.ERROR)
 
 
 class CrawlErrorCode:

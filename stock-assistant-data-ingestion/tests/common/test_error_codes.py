@@ -30,7 +30,6 @@ class TestErrorCodeBase:
         # failure — ops-actionable, so they override the WARNING default.
         assert CommonErrorCode.INTERNAL_ERROR.log_level == logging.ERROR
         assert CommonErrorCode.SERVICE_UNAVAILABLE.log_level == logging.ERROR
-        assert CommonErrorCode.UPSTREAM_UNAVAILABLE.log_level == logging.ERROR
 
 
 class TestCrawlErrorCode:
@@ -81,7 +80,6 @@ class TestCommonErrorCode:
             CommonErrorCode.RATE_LIMITED,
             CommonErrorCode.INTERNAL_ERROR,
             CommonErrorCode.SERVICE_UNAVAILABLE,
-            CommonErrorCode.UPSTREAM_UNAVAILABLE,
         ):
             assert code.error_type == "COMMON"
 
@@ -92,7 +90,6 @@ class TestCommonErrorCode:
         assert CommonErrorCode.RATE_LIMITED.error_code == "COMMON-4029"
         assert CommonErrorCode.INTERNAL_ERROR.error_code == "COMMON-5000"
         assert CommonErrorCode.SERVICE_UNAVAILABLE.error_code == "COMMON-5001"
-        assert CommonErrorCode.UPSTREAM_UNAVAILABLE.error_code == "COMMON-5002"
 
     def test_all_have_messages(self):
         for code in (
@@ -102,7 +99,6 @@ class TestCommonErrorCode:
             CommonErrorCode.RATE_LIMITED,
             CommonErrorCode.INTERNAL_ERROR,
             CommonErrorCode.SERVICE_UNAVAILABLE,
-            CommonErrorCode.UPSTREAM_UNAVAILABLE,
         ):
             assert code.dev_message
             assert code.message
@@ -117,7 +113,6 @@ class TestNoCodeCollisions:
             CommonErrorCode.RATE_LIMITED,
             CommonErrorCode.INTERNAL_ERROR,
             CommonErrorCode.SERVICE_UNAVAILABLE,
-            CommonErrorCode.UPSTREAM_UNAVAILABLE,
             CrawlErrorCode.URL_GET_FAILED,
             CrawlErrorCode.BROWSER_FETCH_FAILED,
             DocumentParseErrorCode.PARSE_ERROR,

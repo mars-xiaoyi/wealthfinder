@@ -135,6 +135,15 @@ Returns service health status.
 - Any component degraded → `200` with `status: degraded`
 - Database or Redis unreachable → `503` with `status: unhealthy`
 
+> **`degraded` is not implemented by SADI's MVP.** `database`/`redis` are currently
+> binary (`ok`/`error` only — there is no component-level `degraded` value yet
+> either), so today's health check only ever reports `healthy` or `unhealthy`. A
+> meaningful `degraded` signal needs something a binary connectivity ping can't
+> provide — the leading candidate is consumer-group lag on
+> `stream:raw_news_inserted` (Redis reachable, but the cleaning pipeline is falling
+> behind), not an arbitrary resource-saturation threshold with no load data to
+> calibrate it against. Planned future enhancement, not a bug.
+
 ---
 
 ### 2.3 `POST /v1/crawl`

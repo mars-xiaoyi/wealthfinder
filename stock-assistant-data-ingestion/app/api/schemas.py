@@ -16,6 +16,12 @@ class CrawlStatus(str, Enum):
 
 class HealthStatus(str, Enum):
     HEALTHY = "healthy"
+    # Not produced by app/api/routes/health.py yet — _ping_db/_ping_redis are
+    # binary connectivity probes with no "reachable but impaired" signal to
+    # derive this from. Planned future enhancement (consumer-group lag on
+    # stream:raw_news_inserted is the leading candidate), see docs/spikes.md §4.
+    # Kept here so this stays a 1:1 match with the documented API contract
+    # (docs/api.md §2.2) rather than silently dropping a value the spec defines.
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
 
