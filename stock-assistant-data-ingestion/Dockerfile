@@ -10,8 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 libasound2 libwayland-client0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# requirements.lock pins every transitive dependency with hashes (generated via
+# `uv pip compile requirements.txt -o requirements.lock --generate-hashes`) —
+# pip verifies the hashes automatically since the file declares them, giving
+# a reproducible, tamper-evident build instead of resolving floating
+# transitive versions at build time.
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Install full chromium build (not headless shell — required for anti-fingerprint)
 RUN playwright install chromium

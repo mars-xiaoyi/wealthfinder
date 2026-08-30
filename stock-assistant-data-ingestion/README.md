@@ -16,31 +16,33 @@ News ingestion and cleaning service for the HK Stock AI Research Assistant.
 uv venv --python 3.12
 source .venv/bin/activate
 
-# Install dependencies
-uv pip install -r requirements.txt
+# Install dependencies — from the lockfile for a reproducible install
+# (exact transitive versions + hashes; use requirements-test.lock instead to
+# also get pytest/pytest-asyncio). requirements.txt/-test.txt stay the source
+# of direct dependencies — add new ones there first, per CLAUDE.md.
+uv pip sync requirements.lock
 
 # Install playwright browsers (required for HKEX + MingPao crawlers)
 playwright install chromium
 ```
 
-Create a `.env` file in the project root (do not commit this file):
+After adding or changing a dependency in `requirements.txt`/`requirements-test.txt`,
+regenerate the corresponding lockfile:
 
-```env
-DATABASE_URL=postgresql://postgres:password@localhost:5432/sadi
-DB_POOL_SIZE=10
-DB_MAX_RETRY=3
-DB_RETRY_BASE_WAIT_MS=100
-REDIS_URL=redis://localhost:6379
-
-CRAWL_MAX_RETRY=3
-CRAWL_RETRY_BASE_WAIT_MS=500
-CRAWL_REQUEST_TIMEOUT_S=10
-CRAWL_BROWSER_NAV_TIMEOUT_MS=15000
-
-CLEAN_WORKER_CONCURRENCY=5
-CLEAN_BODY_MIN_LENGTH=50
-STREAM_CLAIM_TIMEOUT_MS=30000
+```bash
+uv pip compile requirements.txt -o requirements.lock --generate-hashes
+uv pip compile requirements-test.txt -o requirements-test.lock --generate-hashes
 ```
+
+Copy `.env.example` to `.env` (the latter is gitignored — never commit it) and
+adjust as needed:
+
+```bash
+cp .env.example .env
+```
+
+See `.env.example` for the full list of variables and their defaults — it's the
+single source of truth; this file doesn't duplicate it so the two can't drift.
 
 ## Running the service
 

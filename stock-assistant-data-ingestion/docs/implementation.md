@@ -63,27 +63,16 @@ uvicorn app.main:app --reload --port 8000
 
 ### Environment Variables for Local Development
 
-Create a `.env` file in the project root (do NOT commit this file):
+Copy `.env.example` to `.env` (gitignored — do NOT commit it) and adjust as needed:
 
-```env
-# Shared infrastructure
-DATABASE_URL=postgresql://postgres:password@localhost:5432/sadi
-DB_POOL_SIZE=10
-DB_MAX_RETRY=3
-DB_RETRY_BASE_WAIT_MS=100
-REDIS_URL=redis://localhost:6379
-
-# Crawler
-CRAWL_MAX_RETRY=3
-CRAWL_RETRY_BASE_WAIT_MS=500
-CRAWL_REQUEST_TIMEOUT_S=10
-CRAWL_BROWSER_NAV_TIMEOUT_MS=15000
-
-# Cleaner
-CLEAN_WORKER_CONCURRENCY=5
-CLEAN_BODY_MIN_LENGTH=50
-STREAM_CLAIM_TIMEOUT_MS=30000
+```bash
+cp .env.example .env
 ```
+
+`.env.example` is the single source of truth for the full variable list and their
+defaults — kept here as one file rather than duplicated across this doc, `README.md`,
+and the TAD, which is exactly how `CRAWL_BROWSER_NAV_TIMEOUT_MS` went undocumented in
+three of those four places for a while (see `docs/spikes.md` §3.5).
 
 ---
 

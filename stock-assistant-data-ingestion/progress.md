@@ -37,14 +37,14 @@ Last updated: 2026-04-17
 
 - [x] `app/crawl/fetchers/feed_fetcher.py` — `fetch_rss()`, `FeedEntry`
 - [x] `app/crawl/parsers/html_parser.py` — `extract_body_auto()`, `extract_body_css()`
-- [x] `app/crawl/parsers/pdf_parser.py` — `parse_pdf()`, `PdfEncryptedError`, `PdfParseError`
+- [x] `app/crawl/parsers/pdf_parser.py` — `parse_pdf()`, `PdfEncryptedException`, `PdfParseException`
 - [x] `app/crawl/fetchers/browser_manager.py` — `BrowserManager` (`start`, `stop`, `acquire_context`, `release_context`)
-- [x] `app/crawl/fetchers/page_crawler.py` — `PageCrawler.fetch()` with error log pre-check + retry, `CrawlSkippedError`, `CrawlNetworkError`, `CrawlBlockedError`
-- [x] `app/common/error_codes.py` — `ErrorCode` base, `NetworkErrorCode` (SADI-61xx), `DocumentParseErrorCode` (SADI-62xx)
+- [x] `app/crawl/fetchers/page_crawler.py` — `PageCrawler.fetch()` with retry, raises `CrawlBlockedException`, `CrawlRateLimitedException` (the error-log pre-check itself lives in `base_crawler.py`, not here — see Phase 6)
+- [x] `app/common/error_codes.py` — `ErrorCode` base, `CrawlErrorCode` (SADI-61xx), `DocumentParseErrorCode` (SADI-62xx)
 
 ## Phase 6 — Crawler Core
 
-- [x] `app/crawl/crawlers/base_crawler.py` — `BaseCrawler` ABC, `CrawlResult`, `CrawlSuccessItem`, `CrawlFailItem`, `CrawlFatalError`
+- [x] `app/crawl/crawlers/base_crawler.py` — `BaseCrawler` ABC, `CrawlResult`, `CrawlSuccessItem`, `CrawlFailItem`, `CrawlFatalException`; `_is_url_in_error_log()` pre-check used by every crawler's worker loop
 - [x] `app/crawl/crawlers/hkex_crawler.py` — `HKEXCrawler` (Phase 1 playwright pagination + Phase 2 parallel PDF fetch)
 - [x] `app/crawl/crawlers/mingpao_crawler.py` — `MingPaoCrawler` (RSS + playwright browser)
 - [x] `app/crawl/crawlers/aastocks_crawler.py` — `AAStocksCrawler` (list page + httpx)
@@ -92,8 +92,15 @@ Last updated: 2026-04-17
 
 ## Open Questions
 
+Q-1–Q-7 are the TAD's own design-phase questions (`docs/architecture/system-design.md`
+§9) — only Q-2 remains open there; the rest are resolved (see the TAD and
+`docs/implementation.md` §12). Q-8+ below are implementation-phase questions that came
+up after the TAD was approved, numbered to continue that sequence rather than collide
+with it (an earlier revision of this table mislabeled these Q-3/Q-4, which happen to
+be different, already-resolved questions in the TAD itself).
+
 | # | Question | Status |
 |---|---|---|
 | Q-2 | Validate `CLEAN_BODY_MIN_LENGTH = 50` against real crawl data | Unresolved — do not implement workarounds |
-| Q-4 | `CleaningService` processes records one-by-one (3–4 DB round-trips per record). For high-volume crawls (e.g. HKEX 500+ filings), consider batching DB operations in the worker — batch idempotency checks, fetches, dedup lookups, and inserts to reduce round-trips from ~4N to ~4 per batch. Tradeoff: added complexity in per-item error handling and ACK tracking within a batch. | Unresolved — evaluate after observing real throughput |
-| Q-3 | Audit `_parse_published_at` in all crawlers — current `re.search` over full page HTML is fragile (can match sidebar dates, footer copyright, embedded scripts). Scope regex to a CSS-selected DOM element instead. Needs sample article HTML from each source to identify the correct timestamp selector. | Resolved 2026-04-16. Sampled live HTML from both affected sources. **AAStocks**: timestamp sits in `div.newstime5` (skip the `newshead-Source` sibling), inside a `document.write(ConvertToLocalTime({dt:'YYYY/MM/DD HH:MM'}))` JS call — `_parse_published_at` now scopes the existing regex to that div's inner HTML. **Ming Pao**: timestamp sits in `div.date.color2nd` (e.g. `2026年4月15日 星期三　6:04AM`); the `div.date[itemprop="datePublished"]` sibling only carries the date with no time and is avoided — `_extract_published_at_from_page` now reads `get_text()` off the scoped node. HKEX (`td.release-time`) and Yahoo HK (RSS `pubDate` only) were already CSS-scoped / not affected. Unit tests added for noise-rejection (sidebar/footer dates, date-only sibling); live re-run: AAStocks 19/0, MingPao 88/0, both with populated timestamps. |
+| Q-8 | Audit `_parse_published_at` in all crawlers — current `re.search` over full page HTML is fragile (can match sidebar dates, footer copyright, embedded scripts). Scope regex to a CSS-selected DOM element instead. Needs sample article HTML from each source to identify the correct timestamp selector. | Resolved 2026-04-16. Sampled live HTML from both affected sources. **AAStocks**: timestamp sits in `div.newstime5` (skip the `newshead-Source` sibling), inside a `document.write(ConvertToLocalTime({dt:'YYYY/MM/DD HH:MM'}))` JS call — `_parse_published_at` now scopes the existing regex to that div's inner HTML. **Ming Pao**: timestamp sits in `div.date.color2nd` (e.g. `2026年4月15日 星期三　6:04AM`); the `div.date[itemprop="datePublished"]` sibling only carries the date with no time and is avoided — `_extract_published_at_from_page` now reads `get_text()` off the scoped node. HKEX (`td.release-time`) and Yahoo HK (RSS `pubDate` only) were already CSS-scoped / not affected. Unit tests added for noise-rejection (sidebar/footer dates, date-only sibling); live re-run: AAStocks 19/0, MingPao 88/0, both with populated timestamps. |
+| Q-9 | `CleaningService` processes records one-by-one (3–4 DB round-trips per record). For high-volume crawls (e.g. HKEX 500+ filings), consider batching DB operations in the worker — batch idempotency checks, fetches, dedup lookups, and inserts to reduce round-trips from ~4N to ~4 per batch. Tradeoff: added complexity in per-item error handling and ACK tracking within a batch. | Unresolved — evaluate after observing real throughput |
