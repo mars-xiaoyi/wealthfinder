@@ -83,7 +83,10 @@ class HKEXCrawler(BaseCrawler):
             except CrawlFatalException:
                 raise
             except Exception as exc:
-                logger.exception("[hkex_crawler] Phase 1 failed")
+                # Not logged here — crawl_service.py logs the escalated
+                # CrawlFatalException with exc_info=exc, which surfaces this
+                # exception's own traceback via chaining. Logging both here
+                # and there would double-log the same failure.
                 raise CrawlFatalException(
                     f"HKEX Phase 1 (playwright pagination) failed: {exc}"
                 ) from exc
@@ -267,10 +270,10 @@ class HKEXCrawler(BaseCrawler):
         try:
             response = await self.page_crawler.fetch(pdf_url)
         except CrawlRateLimitedException as exc:
-            logger.warning("[hkex_crawler] Rate limited %s: %s", pdf_url, exc)
+            logger.log(exc.error_code.log_level, "[hkex_crawler] Rate limited %s: %s", pdf_url, exc)
             return
         except CrawlBlockedException as exc:
-            logger.warning("[hkex_crawler] Fetch failed %s: %s", pdf_url, exc)
+            logger.log(exc.error_code.log_level, "[hkex_crawler] Fetch failed %s: %s", pdf_url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
@@ -284,7 +287,7 @@ class HKEXCrawler(BaseCrawler):
         try:
             body = await parse_pdf(response.content)
         except PdfEncryptedException as exc:
-            logger.warning("[hkex_crawler] Encrypted PDF %s: %s", pdf_url, exc)
+            logger.log(exc.error_code.log_level, "[hkex_crawler] Encrypted PDF %s: %s", pdf_url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
@@ -295,7 +298,7 @@ class HKEXCrawler(BaseCrawler):
             )
             return
         except PdfParseException as exc:
-            logger.warning("[hkex_crawler] PDF parse error %s: %s", pdf_url, exc)
+            logger.log(exc.error_code.log_level, "[hkex_crawler] PDF parse error %s: %s", pdf_url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,
@@ -306,7 +309,12 @@ class HKEXCrawler(BaseCrawler):
             )
             return
         except Exception as exc:
-            logger.exception("[hkex_crawler] Unexpected PDF parse failure %s", pdf_url)
+            logger.log(
+                DocumentParseErrorCode.PARSE_ERROR.log_level,
+                "[hkex_crawler] Unexpected PDF parse failure %s",
+                pdf_url,
+                exc_info=True,
+            )
             result.failures.append(
                 CrawlFailItem(
                     source_url=pdf_url,

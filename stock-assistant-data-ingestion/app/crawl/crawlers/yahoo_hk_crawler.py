@@ -48,7 +48,10 @@ class YahooHKCrawler(BaseCrawler):
         try:
             entries = await fetch_rss(YAHOO_HK_RSS_URL)
         except FeedFetchException as exc:
-            logger.exception("[yahoo_hk_crawler] RSS fetch failed")
+            # Not logged here — crawl_service.py logs the escalated
+            # CrawlFatalException with exc_info=exc, which surfaces this
+            # exception's own traceback via chaining. Logging both here and
+            # there would double-log the same failure.
             raise CrawlFatalException(f"Yahoo HK RSS fetch failed: {exc}") from exc
 
         filtered = [e for e in entries if YAHOO_HK_URL_PREFIX_FILTER in e.url]
@@ -137,10 +140,10 @@ class YahooHKCrawler(BaseCrawler):
         try:
             response = await self.page_crawler.fetch(url)
         except CrawlRateLimitedException as exc:
-            logger.warning("[yahoo_hk_crawler] Rate limited %s: %s", url, exc)
+            logger.log(exc.error_code.log_level, "[yahoo_hk_crawler] Rate limited %s: %s", url, exc)
             return
         except CrawlBlockedException as exc:
-            logger.warning("[yahoo_hk_crawler] Fetch failed %s: %s", url, exc)
+            logger.log(exc.error_code.log_level, "[yahoo_hk_crawler] Fetch failed %s: %s", url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
@@ -154,7 +157,13 @@ class YahooHKCrawler(BaseCrawler):
         try:
             body = extract_body_auto(response.text)
         except Exception as exc:
-            logger.exception("[yahoo_hk_crawler] body extraction failed for %s: %s", url, exc)
+            logger.log(
+                DocumentParseErrorCode.PARSE_ERROR.log_level,
+                "[yahoo_hk_crawler] body extraction failed for %s: %s",
+                url,
+                exc,
+                exc_info=True,
+            )
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,

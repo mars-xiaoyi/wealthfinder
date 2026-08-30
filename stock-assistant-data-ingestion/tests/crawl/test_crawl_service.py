@@ -1,3 +1,4 @@
+import logging
 from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -298,13 +299,14 @@ class TestExecute:
         assert completed_call.args[1]["status"] == "SUCCESS"
 
     @pytest.mark.asyncio
-    async def test_fatal_error_publishes_failed(self):
+    async def test_fatal_error_publishes_failed(self, caplog):
         service, db, stream, _ = make_service()
         _patch_crawler(
             service, AsyncMock(side_effect=CrawlFatalException("RSS dead"))
         )
 
-        await service.execute("exec-1", CrawlSourceName.MINGPAO, None)
+        with caplog.at_level(logging.WARNING):
+            await service.execute("exec-1", CrawlSourceName.MINGPAO, None)
 
         # Only the crawl_completed FAILED publish should fire
         stream.publish.assert_called_once()
@@ -314,6 +316,10 @@ class TestExecute:
         assert args[1]["error_detail"] == "RSS dead"
         # No raw_news inserts
         db.execute_returning.assert_not_called()
+        # CrawlFatalException.error_code is CommonErrorCode.INTERNAL_ERROR,
+        # whose log_level is ERROR — severity comes from the ErrorCode, not a
+        # hardcoded logger.error() call.
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_zero_records_still_publishes_success(self):

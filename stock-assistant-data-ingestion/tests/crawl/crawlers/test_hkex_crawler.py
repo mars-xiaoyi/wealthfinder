@@ -213,6 +213,32 @@ class TestFetchOnePdf:
         assert result.failures[0].error_code == DocumentParseErrorCode.PDF_PARSE_ERROR.error_code
 
     @pytest.mark.asyncio
+    async def test_unexpected_parse_exception(self, caplog):
+        # An exception not caught by the two typed handlers above (neither
+        # PdfEncryptedException nor PdfParseException) falls through to the
+        # generic Exception catch, tagged DocumentParseErrorCode.PARSE_ERROR.
+        pc = make_page_crawler()
+        pc.fetch.return_value = MagicMock(content=b"%PDF")
+        crawler = make_crawler(page_crawler=pc)
+        from app.crawl.crawlers.base_crawler import CrawlResult
+
+        result = CrawlResult()
+        with patch(
+            "app.crawl.crawlers.hkex_crawler.parse_pdf",
+            new=AsyncMock(side_effect=RuntimeError("unexpected")),
+        ):
+            await crawler._fetch_one_pdf(_announcement(), result)
+
+        assert result.failures[0].error_code == DocumentParseErrorCode.PARSE_ERROR.error_code
+        # Severity comes from DocumentParseErrorCode.PARSE_ERROR.log_level
+        # (WARNING by default), not a hardcoded logger.exception() (ERROR) —
+        # but exc_info is still attached so the traceback isn't lost.
+        records = [r for r in caplog.records if "Unexpected PDF parse failure" in r.message]
+        assert len(records) == 1
+        assert records[0].levelno == DocumentParseErrorCode.PARSE_ERROR.log_level
+        assert records[0].exc_info is not None
+
+    @pytest.mark.asyncio
     async def test_empty_body_skips_without_failure(self):
         pc = make_page_crawler()
         pc.fetch.return_value = MagicMock(content=b"%PDF")

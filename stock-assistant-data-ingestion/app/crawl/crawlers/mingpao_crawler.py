@@ -63,7 +63,10 @@ class MingPaoCrawler(BaseCrawler):
         try:
             entries = await fetch_rss(MINGPAO_RSS_URL)
         except FeedFetchException as exc:
-            logger.exception("[mingpao_crawler] RSS fetch failed")
+            # Not logged here — crawl_service.py logs the escalated
+            # CrawlFatalException with exc_info=exc, which surfaces this
+            # exception's own traceback via chaining. Logging both here and
+            # there would double-log the same failure.
             raise CrawlFatalException(f"MingPao RSS fetch failed: {exc}") from exc
 
         logger.info("[mingpao_crawler] RSS returned %d entries", len(entries))
@@ -127,7 +130,12 @@ class MingPaoCrawler(BaseCrawler):
             finally:
                 await page.close()
         except Exception as exc:
-            logger.warning("[mingpao_crawler] playwright fetch failed for %s: %s", url, exc)
+            logger.log(
+                CrawlErrorCode.BROWSER_FETCH_FAILED.log_level,
+                "[mingpao_crawler] playwright fetch failed for %s: %s",
+                url,
+                exc,
+            )
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
@@ -141,7 +149,13 @@ class MingPaoCrawler(BaseCrawler):
         try:
             body = extract_body_css(html, ARTICLE_BODY_SELECTOR)
         except Exception as exc:
-            logger.exception("[mingpao_crawler] body extraction failed for %s: %s", url, exc)
+            logger.log(
+                DocumentParseErrorCode.PARSE_ERROR.log_level,
+                "[mingpao_crawler] body extraction failed for %s: %s",
+                url,
+                exc,
+                exc_info=True,
+            )
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,

@@ -2,9 +2,11 @@ import pytest
 import redis.exceptions
 from httpx import ASGITransport, AsyncClient
 
+import logging
+
 from app.api.main import create_app
 from app.common.error_codes import CommonErrorCode
-from app.common.exceptions import ServiceUnavailableException
+from app.common.exceptions import NotFoundException, ServiceUnavailableException
 
 
 @pytest.fixture
@@ -41,6 +43,73 @@ class TestServiceUnavailableViaGenericHandler:
         # exc.detail is a safe, fixed message set at the raise site (never the
         # raw exception string — see app/db/connection.py) — safe to surface.
         assert body["detail"] == "Database is unavailable"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_dev_message_when_no_detail(self, app):
+        @app.get("/__raises_service_unavailable_no_detail")
+        async def _raise():
+            raise ServiceUnavailableException()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.get("/__raises_service_unavailable_no_detail")
+
+        body = resp.json()
+        # No per-occurrence detail was set — fall back to the ErrorCode's
+        # static dev_message rather than showing nothing.
+        assert body["detail"] == CommonErrorCode.SERVICE_UNAVAILABLE.dev_message
+
+    @pytest.mark.asyncio
+    async def test_logs_full_chain_including_original_cause(self, app, caplog):
+        # This is the only log point for a SADIException raised directly in a
+        # route (no wrapping try/except) — see app/db/connection.py, which
+        # deliberately does not log its own ServiceUnavailableException raises.
+        # exc_info=exc must surface the original chained exception too.
+        @app.get("/__raises_chained_service_unavailable")
+        async def _raise():
+            try:
+                raise RuntimeError("original driver failure")
+            except RuntimeError as exc:
+                raise ServiceUnavailableException("Database is unavailable") from exc
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.get("/__raises_chained_service_unavailable")
+
+        assert resp.status_code == 503
+        assert "original driver failure" in caplog.text
+        assert "RuntimeError" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_logs_at_error_level_per_error_code(self, app, caplog):
+        # ServiceUnavailableException's ErrorCode (SERVICE_UNAVAILABLE) declares
+        # log_level=ERROR — a dependency being down is ops-actionable.
+        @app.get("/__raises_service_unavailable_2")
+        async def _raise():
+            raise ServiceUnavailableException("Database is unavailable")
+
+        with caplog.at_level(logging.WARNING):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                await ac.get("/__raises_service_unavailable_2")
+
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+class TestNotFoundLogLevel:
+    @pytest.mark.asyncio
+    async def test_logs_at_warning_level_not_error(self, app, caplog):
+        # NotFoundException's ErrorCode (NOT_FOUND) has no log_level override,
+        # so it uses the WARNING default — a 404 isn't ops-actionable, unlike
+        # a status->=500 heuristic would have to assume without this field.
+        @app.get("/__raises_not_found")
+        async def _raise():
+            raise NotFoundException("cleaned_id X not found")
+
+        with caplog.at_level(logging.WARNING):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.get("/__raises_not_found")
+
+        assert resp.status_code == 404
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 class TestValidationErrorHandler:
@@ -99,9 +168,10 @@ class TestRedisConnectionErrorHandler:
         assert resp.status_code == 503
         body = resp.json()
         assert body["error_code"] == "COMMON-5001"
-        # A fixed, safe reason — never the raw redis exception string (which
-        # could carry hostnames/ports).
-        assert body["detail"] == "Redis is unavailable"
+        # Not a SADIException, so no per-occurrence .detail exists — falls
+        # back to the catalog's dev_message, never the raw redis exception
+        # string (which could carry hostnames/ports).
+        assert body["detail"] == CommonErrorCode.SERVICE_UNAVAILABLE.dev_message
 
 
 class TestGeneralExceptionHandler:
@@ -122,10 +192,9 @@ class TestGeneralExceptionHandler:
         assert resp.status_code == 500
         body = resp.json()
         assert body["error_code"] == "COMMON-5000"
-        # Generic on purpose — we don't know what failed here, so we don't
-        # echo str(exc) (unlike the two handlers above, which know exactly
-        # which dependency is unavailable and can say so safely).
-        assert body["detail"] == "An unexpected internal error occurred"
+        # No SADIException, no per-occurrence detail — falls back to the
+        # catalog's dev_message rather than echoing str(exc).
+        assert body["detail"] == CommonErrorCode.INTERNAL_ERROR.dev_message
 
 
 class TestRouterRegistration:

@@ -717,22 +717,56 @@ def create_app() -> FastAPI:
 > `COMMON-4000`, since docs/api.md §1.3 treats malformed JSON as a distinct error
 > from field validation failure (`COMMON-4001`). See `docs/spikes.md` §3.3.
 
-> **`detail` field (docs/api.md §1.1):** every response body includes `error_code`,
-> `message`, and `detail` — `{}` only when there's genuinely nothing to add. SADI has
-> no authentication (single-user MVP) and is only ever called by other internal MWP
-> services, not untrusted external clients, so `detail` favours giving the caller
-> something to debug with over defaulting to empty. Concretely: `SADIException.detail`
-> is always fixed at the raise site (e.g. `NotFoundException("cleaned_id X not
-> found")`, or `ServiceUnavailableException("Database is unavailable")` in
-> `app/db/connection.py` — never `str(exc)`, which could leak infra details like
-> hostnames/ports) and `sadi_exception_handler` always surfaces it as-is;
-> `redis_connection_error_handler` and `general_exception_handler` hardcode `"Redis is
-> unavailable"` / `"An unexpected internal error occurred"` respectively, since
-> neither has a safe per-exception message to draw from; the malformed-JSON branch of
-> `validation_error_handler` uses `CommonErrorCode.MALFORMED_REQUEST.dev_message` — a
-> static but genuinely descriptive string, safe here because it describes the
-> *client's own* malformed input, not anything about SADI's internals. The raw
-> exception is always still logged server-side (`exc_info=True`) for full debugging.
+> **`message` vs `dev_message` vs `detail` (docs/api.md §1.1, `ErrorCode` in
+> `app/common/error_codes.py` §8.5b):** `ErrorCode.message` is the short,
+> generic, public-facing summary — safe for any caller to relay further (e.g. an
+> internal UI showing it to an end user). `ErrorCode.dev_message` is the static,
+> per-error-code technical description meant for debugging; `SADIException.detail`
+> is the dynamic, per-occurrence version of the same idea, set at the raise site
+> (e.g. `NotFoundException("cleaned_id X not found")`,
+> `ServiceUnavailableException("DB connection error")` in
+> `app/db/connection.py`). SADI has no authentication (single-user MVP) and is only
+> ever called by other internal MWP services, not untrusted external clients, so
+> both are safe to return in `detail` — but **never a raw exception string**
+> (`str(exc)`), which could leak infra details like hostnames/ports.
+>
+> The rule every handler follows: **use `exc.detail` if the exception set one
+> (it's more specific); otherwise fall back to `exc.error_code.dev_message`
+> (still better than nothing).** `sadi_exception_handler` implements this
+> directly. `redis_connection_error_handler` and `general_exception_handler`
+> aren't `SADIException`s (no `.detail` to check), so they always use the
+> relevant `CommonErrorCode.*.dev_message`. The malformed-JSON branch of
+> `validation_error_handler` does the same for `MALFORMED_REQUEST`. `detail`
+> is `{}` only for the (currently nonexistent) case of an `ErrorCode` with no
+> `dev_message` at all.
+>
+> **Logging — exactly once per exception, at whichever point actually handles
+> it.** `sadi_exception_handler` logs with `exc_info=exc` at
+> `exc.error_code.log_level` (see `ErrorCode` in §8.5b) — severity is a
+> declared property of the error code itself, not derived from the HTTP status
+> (a 4xx isn't always low-severity, and plenty of `ErrorCode`s never cross an
+> HTTP response at all, e.g. `CrawlErrorCode`/`DocumentParseErrorCode`).
+> `redis_connection_error_handler` and `general_exception_handler` likewise use
+> `CommonErrorCode.SERVICE_UNAVAILABLE.log_level` /
+> `CommonErrorCode.INTERNAL_ERROR.log_level` instead of a hardcoded `.error()`.
+> Python's traceback formatter walks `exc.__cause__` automatically, so a
+> translated exception raised as `raise X(...) from
+> original_exc` (e.g. `ServiceUnavailableException(...) from exc` in
+> `app/db/connection.py`) still surfaces `original_exc`'s own traceback in this
+> one log line. This is the *only* log point for a `SADIException` raised
+> directly in a route with no wrapping `try/except` (e.g. `NotFoundException`
+> in `cleaned_news.py`) — so `app/db/connection.py` deliberately does **not**
+> log its own `ServiceUnavailableException` raises, to avoid double-logging the
+> same failure. That's safe because every other caller of `DatabaseClient`
+> already has its own full-chain catch-all further up the stack
+> (`logger.exception(...)` / `exc_info=True` in `CrawlService` and
+> `CleaningService`'s background-task loops) — a `DatabaseClient` method is
+> never called from a spot with no logging anywhere in its call chain.
+> `ServiceUnavailableException`'s `.detail` text also distinguishes *why*:
+> `"DB connection retries exhausted"` for the retry-loop-gave-up case,
+> `"DB connection error"` for an immediate connection failure
+> (`PostgresConnectionError`/`InterfaceError`) on a write, and
+> `"DB connection error during read"` for the same on a read (no retry).
 
 ### 7.2 `app/api/routes/crawl.py` — `POST /v1/crawl`
 
@@ -1077,21 +1111,32 @@ Implementation notes:
 All crawler-layer exceptions are defined here and imported by `page_crawler.py`, crawl workers, and `CrawlService`.
 
 ```python
-class CrawlBlockedException(Exception):
+from app.common.error_codes import CommonErrorCode, CrawlErrorCode
+from app.common.exceptions import SADIException
+
+class CrawlBlockedException(SADIException):
     """Page fetch failed — HTTP error, network failure, or all retries exhausted."""
+    error_code = CrawlErrorCode.URL_GET_FAILED
 
-class CrawlRateLimitedException(Exception):
+class CrawlRateLimitedException(SADIException):
     """HTTP 429 — transient, do not persist to crawl_error_log."""
+    error_code = CommonErrorCode.RATE_LIMITED
 
-class CrawlFatalException(Exception):
+class CrawlFatalException(SADIException):
     """
     Unrecoverable source-level failure (e.g. RSS unreachable after all retries,
     HKEX search page playwright load failure). CrawlService catches this and
     publishes crawl_completed FAILED.
     """
+    error_code = CommonErrorCode.INTERNAL_ERROR
 ```
 
 > `CrawlFatalException` lives here (not in `base_crawler.py`) so the full set of crawler exceptions stays in a single module. All crawler subclasses and `CrawlService` import it from `app.crawl.exceptions`.
+>
+> Each subclass carries an `error_code` (from `app/common/error_codes.py` §8.5b),
+> which is where these exceptions' log severity (`error_code.log_level`) and
+> `dev_message` come from — see §7.1's logging note and §§8.9-8.12's per-crawler
+> "Crawl worker exception handling" notes for how call sites use it.
 
 ### 8.5a `app/crawl/source_name.py` — CrawlSourceName Enum
 
@@ -1123,6 +1168,7 @@ Single source of truth for all SADI error codes. Codes follow the unified MWP er
 - `SADI-61xx` = crawler fetch errors. `SADI-62xx` = crawler parse errors.
 
 ```python
+import logging
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
@@ -1130,8 +1176,17 @@ class ErrorCode:
     """Base error code record. One frozen instance per distinct code."""
     error_type: str    # Category: "COMMON" | "CRAWL" | "PARSE"
     error_code: str    # Unique identifier, e.g. "SADI-6101"
-    dev_message: str   # Technical description for devs/ops (logs, debugging)
-    message: str       # Short human-readable summary (dashboards, ops alerts)
+    dev_message: str   # Static technical description, for debugging — see §7.1's
+                        # detail-field note for the full message/dev_message/detail rule
+    message: str       # Short, generic, public-facing summary — safe for a caller to
+                        # relay further (e.g. to its own end-user-facing UI)
+    log_level: int = logging.WARNING
+                        # Declared severity — single source of truth for how loggers
+                        # treat this code (`logger.log(error_code.log_level, ...)`),
+                        # instead of every call site re-deciding ad hoc. WARNING by
+                        # default (an individual failure at fleet scale usually isn't
+                        # ops-actionable); override to logging.ERROR only for codes
+                        # that are genuinely unexpected or mean a dependency is down.
 
 
 class CommonErrorCode:
@@ -1140,9 +1195,9 @@ class CommonErrorCode:
     VALIDATION_FAILED    = ErrorCode("COMMON", "COMMON-4001", ...)
     NOT_FOUND            = ErrorCode("COMMON", "COMMON-4004", ...)
     RATE_LIMITED          = ErrorCode("COMMON", "COMMON-4029", ...)
-    INTERNAL_ERROR       = ErrorCode("COMMON", "COMMON-5000", ...)
-    SERVICE_UNAVAILABLE  = ErrorCode("COMMON", "COMMON-5001", ...)
-    UPSTREAM_UNAVAILABLE = ErrorCode("COMMON", "COMMON-5002", ...)
+    INTERNAL_ERROR       = ErrorCode("COMMON", "COMMON-5000", ..., log_level=logging.ERROR)
+    SERVICE_UNAVAILABLE  = ErrorCode("COMMON", "COMMON-5001", ..., log_level=logging.ERROR)
+    UPSTREAM_UNAVAILABLE = ErrorCode("COMMON", "COMMON-5002", ..., log_level=logging.ERROR)
 
 
 class CrawlErrorCode:

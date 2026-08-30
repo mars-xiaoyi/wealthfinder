@@ -57,7 +57,10 @@ class AAStocksCrawler(BaseCrawler):
         try:
             list_response = await self.page_crawler.fetch(AASTOCKS_LIST_URL)
         except CrawlBlockedException as exc:
-            logger.exception("[aastocks_crawler] List page fetch failed")
+            # Not logged here — crawl_service.py logs the escalated
+            # CrawlFatalException with exc_info=exc, which surfaces this
+            # exception's own traceback via chaining. Logging both here and
+            # there would double-log the same failure.
             raise CrawlFatalException(f"AAStocks list page fetch failed: {exc}") from exc
 
         urls = self._extract_article_urls(list_response.text)
@@ -117,10 +120,10 @@ class AAStocksCrawler(BaseCrawler):
         try:
             response = await self.page_crawler.fetch(url)
         except CrawlRateLimitedException as exc:
-            logger.warning("[aastocks_crawler] Rate limited %s: %s", url, exc)
+            logger.log(exc.error_code.log_level, "[aastocks_crawler] Rate limited %s: %s", url, exc)
             return
         except CrawlBlockedException as exc:
-            logger.warning("[aastocks_crawler] Fetch failed %s: %s", url, exc)
+            logger.log(exc.error_code.log_level, "[aastocks_crawler] Fetch failed %s: %s", url, exc)
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,
@@ -134,7 +137,13 @@ class AAStocksCrawler(BaseCrawler):
         try:
             body = extract_body_css(response.text, ARTICLE_BODY_SELECTOR)
         except Exception as exc:
-            logger.exception("[aastocks_crawler] body extraction failed for %s: %s", url, exc)
+            logger.log(
+                DocumentParseErrorCode.PARSE_ERROR.log_level,
+                "[aastocks_crawler] body extraction failed for %s: %s",
+                url,
+                exc,
+                exc_info=True,
+            )
             result.failures.append(
                 CrawlFailItem(
                     source_url=url,

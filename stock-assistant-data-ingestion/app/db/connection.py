@@ -38,6 +38,14 @@ class DatabaseClient:
 
         Raises UniqueConstraintError / DatabaseError / ServiceUnavailableException
         — never a raw asyncpg exception.
+
+        Deliberately does not log the connection-error paths itself (beyond the
+        per-attempt retry warning below): every raise here is chained via
+        `from exc`, and every caller already logs the full chain on its own
+        catch-all (sadi_exception_handler's exc_info=exc for direct API-route
+        calls; logger.exception(...)/exc_info=True in CrawlService/
+        CleaningService for background-task calls) — logging here too would
+        just duplicate the same traceback a second time.
         """
         for attempt in range(1, self._config.max_retry + 1):
             try:
@@ -49,10 +57,7 @@ class DatabaseClient:
                 raise DatabaseError(str(exc)) from exc
             except self._TRANSIENT as exc:
                 if attempt == self._config.max_retry:
-                    logger.error(
-                        "DB connection retries exhausted: %s", exc, exc_info=True
-                    )
-                    raise ServiceUnavailableException("Database is unavailable") from exc
+                    raise ServiceUnavailableException("DB connection retries exhausted") from exc
                 wait_s = (self._config.retry_base_wait_ms * (2 ** (attempt - 1))) / 1000
                 logger.warning(
                     "Transient DB error on attempt %d/%d, retrying in %.3fs: %s",
@@ -63,8 +68,7 @@ class DatabaseClient:
                 )
                 await asyncio.sleep(wait_s)
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError) as exc:
-                logger.error("DB connection error: %s", exc, exc_info=True)
-                raise ServiceUnavailableException("Database is unavailable") from exc
+                raise ServiceUnavailableException("DB connection error") from exc
             except asyncpg.PostgresError as exc:
                 # Safety net for any Postgres-side error not classified above.
                 raise DatabaseError(str(exc)) from exc
@@ -92,8 +96,7 @@ class DatabaseClient:
             async with self._pool.acquire() as conn:
                 return await op(conn)
         except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, *self._TRANSIENT) as exc:
-            logger.error("DB connection error during read: %s", exc, exc_info=True)
-            raise ServiceUnavailableException("Database is unavailable") from exc
+            raise ServiceUnavailableException("DB connection error during read") from exc
         except asyncpg.PostgresError as exc:
             raise DatabaseError(str(exc)) from exc
 

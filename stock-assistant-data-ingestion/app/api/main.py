@@ -52,19 +52,34 @@ def create_app() -> FastAPI:
         request: Request, exc: SADIException
     ) -> JSONResponse:
         status = _HTTP_STATUS_MAP.get(type(exc), 500)
-        logger.warning("[api] SADIException: %s %s", exc.error_code.error_code, exc.detail)
-        # exc.detail is always a safe, human-readable message set at the raise
-        # site (e.g. "cleaned_id X not found", "Database is unavailable") —
-        # SADIException subclasses must never pass a raw exception string or
-        # anything else that could leak internal details (hostnames, ports,
-        # stack fragments). See app/db/connection.py's ServiceUnavailableException
-        # raises for the pattern to follow.
+        # exc.detail is the per-occurrence context (e.g. "cleaned_id X not
+        # found", "DB connection error") set at the raise site — never a
+        # raw exception string, which could leak internal details (hostnames,
+        # ports, stack fragments). When an exception has nothing specific to
+        # add, fall back to its ErrorCode's dev_message (a static, generic
+        # technical description) rather than showing nothing.
+        detail = exc.detail if exc.detail else exc.error_code.dev_message
+        # exc_info=exc logs the full chain (Python walks __cause__ automatically),
+        # so a translated exception raised as `raise X(...) from original_exc`
+        # (see e.g. app/db/connection.py) still surfaces original_exc's own
+        # traceback here — this is the only log point for a SADIException
+        # raised directly in a route with no wrapping try/except, so callers
+        # further down the stack must not log the same exception again.
+        # Severity comes from the ErrorCode itself (single source of truth),
+        # not from the HTTP status — see ErrorCode.log_level.
+        logger.log(
+            exc.error_code.log_level,
+            "[api] SADIException: %s %s",
+            exc.error_code.error_code,
+            detail,
+            exc_info=exc,
+        )
         return JSONResponse(
             status_code=status,
             content={
                 "error_code": exc.error_code.error_code,
                 "message": exc.error_code.message,
-                "detail": exc.detail if exc.detail else {},
+                "detail": detail,
             },
         )
 
@@ -111,13 +126,21 @@ def create_app() -> FastAPI:
     async def redis_connection_error_handler(
         request: Request, exc: Exception
     ) -> JSONResponse:
-        logger.error("[api] redis connection error: %s", exc, exc_info=True)
+        logger.log(
+            CommonErrorCode.SERVICE_UNAVAILABLE.log_level,
+            "[api] redis connection error: %s",
+            exc,
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=503,
             content={
                 "error_code": CommonErrorCode.SERVICE_UNAVAILABLE.error_code,
                 "message": CommonErrorCode.SERVICE_UNAVAILABLE.message,
-                "detail": "Redis is unavailable",
+                # Not a SADIException instance, so there's no per-occurrence
+                # .detail to draw from — fall back to the catalog's dev_message,
+                # same rule as sadi_exception_handler.
+                "detail": CommonErrorCode.SERVICE_UNAVAILABLE.dev_message,
             },
         )
 
@@ -125,16 +148,21 @@ def create_app() -> FastAPI:
     async def general_exception_handler(
         request: Request, exc: Exception
     ) -> JSONResponse:
-        logger.error("[api] unhandled exception: %s", exc, exc_info=True)
+        logger.log(
+            CommonErrorCode.INTERNAL_ERROR.log_level,
+            "[api] unhandled exception: %s",
+            exc,
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=500,
             content={
                 "error_code": CommonErrorCode.INTERNAL_ERROR.error_code,
                 "message": CommonErrorCode.INTERNAL_ERROR.message,
-                # Generic on purpose — unlike ServiceUnavailableException/Redis's
-                # handler, we don't know what actually failed here, and echoing
-                # str(exc) risks leaking internal details. See server logs (above).
-                "detail": "An unexpected internal error occurred",
+                # No SADIException instance and genuinely nothing specific to
+                # add — echoing str(exc) risks leaking internal details. Same
+                # dev_message fallback as the other handlers.
+                "detail": CommonErrorCode.INTERNAL_ERROR.dev_message,
             },
         )
         

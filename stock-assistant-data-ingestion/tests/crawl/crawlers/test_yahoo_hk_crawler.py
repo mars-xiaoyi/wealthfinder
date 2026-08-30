@@ -177,7 +177,7 @@ class TestFetchOneArticle:
         assert result.failures == []
 
     @pytest.mark.asyncio
-    async def test_parse_exception(self):
+    async def test_parse_exception(self, caplog):
         pc = make_page_crawler()
         pc.fetch.return_value = make_response("html")
         crawler = make_crawler(page_crawler=pc)
@@ -188,6 +188,13 @@ class TestFetchOneArticle:
         ):
             await crawler._fetch_one_article(make_entry(), result)
         assert result.failures[0].error_code == DocumentParseErrorCode.PARSE_ERROR.error_code
+        # Severity comes from DocumentParseErrorCode.PARSE_ERROR.log_level
+        # (WARNING by default), not a hardcoded logger.exception() (ERROR) —
+        # but exc_info is still attached so the traceback isn't lost.
+        records = [r for r in caplog.records if "body extraction failed" in r.message]
+        assert len(records) == 1
+        assert records[0].levelno == DocumentParseErrorCode.PARSE_ERROR.log_level
+        assert records[0].exc_info is not None
 
 
 # ---------------------------------------------------------------------------

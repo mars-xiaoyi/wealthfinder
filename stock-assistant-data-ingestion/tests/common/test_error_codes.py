@@ -1,3 +1,5 @@
+import logging
+
 from app.common.error_codes import (
     CommonErrorCode,
     CrawlErrorCode,
@@ -16,6 +18,19 @@ class TestErrorCodeBase:
             assert False, "Should have raised"
         except AttributeError:
             pass
+
+    def test_log_level_defaults_to_warning(self):
+        # An individual failure (one URL, one PDF) at fleet scale isn't
+        # ops-actionable on its own — WARNING is the sensible default.
+        assert CrawlErrorCode.URL_GET_FAILED.log_level == logging.WARNING
+        assert DocumentParseErrorCode.PARSE_ERROR.log_level == logging.WARNING
+
+    def test_dependency_and_internal_errors_escalate_to_error(self):
+        # These represent a dependency being down or a genuinely unexpected
+        # failure — ops-actionable, so they override the WARNING default.
+        assert CommonErrorCode.INTERNAL_ERROR.log_level == logging.ERROR
+        assert CommonErrorCode.SERVICE_UNAVAILABLE.log_level == logging.ERROR
+        assert CommonErrorCode.UPSTREAM_UNAVAILABLE.log_level == logging.ERROR
 
 
 class TestCrawlErrorCode:

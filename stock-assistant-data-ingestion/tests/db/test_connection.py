@@ -72,7 +72,7 @@ async def test_execute_connection_error_translated_to_service_unavailable(exc_cl
     conn.execute = AsyncMock(side_effect=exc_class("host=db.internal port=5432"))
     with pytest.raises(ServiceUnavailableException) as excinfo:
         await client.execute("INSERT INTO foo VALUES ($1)", 1)
-    assert excinfo.value.detail == "Database is unavailable"
+    assert excinfo.value.detail == "DB connection error"
     conn.execute.assert_called_once()
 
 
@@ -101,7 +101,7 @@ async def test_execute_transient_error_retries_then_raises():
         with pytest.raises(ServiceUnavailableException) as excinfo:
             await client.execute("INSERT INTO foo VALUES ($1)", 1)
 
-    assert excinfo.value.detail == "Database is unavailable"
+    assert excinfo.value.detail == "DB connection retries exhausted"
     assert conn.execute.call_count == 3
     # Backoff: 10ms, 20ms (attempt 3 raises without sleeping)
     assert mock_sleep.call_count == 2
@@ -193,9 +193,10 @@ async def test_execute_returning_transient_error_retries_then_raises():
     conn.fetchrow = AsyncMock(side_effect=asyncpg.TooManyConnectionsError("busy"))
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-        with pytest.raises(ServiceUnavailableException):
+        with pytest.raises(ServiceUnavailableException) as excinfo:
             await client.execute_returning("INSERT INTO foo VALUES ($1) RETURNING id", 1)
 
+    assert excinfo.value.detail == "DB connection retries exhausted"
     assert conn.fetchrow.call_count == 3
     assert mock_sleep.call_count == 2
     assert mock_sleep.call_args_list == [call(0.01), call(0.02)]
@@ -252,7 +253,7 @@ async def test_fetch_one_connection_error_translated_no_retry():
     conn.fetchrow = AsyncMock(side_effect=asyncpg.InterfaceError("conn closed"))
     with pytest.raises(ServiceUnavailableException) as excinfo:
         await client.fetch_one("SELECT * FROM foo WHERE id = $1", 1)
-    assert excinfo.value.detail == "Database is unavailable"
+    assert excinfo.value.detail == "DB connection error during read"
     # No retry on reads — must fail on the first attempt.
     conn.fetchrow.assert_called_once()
 

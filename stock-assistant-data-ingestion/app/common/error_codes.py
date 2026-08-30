@@ -8,6 +8,7 @@ COMMON-4xxx / COMMON-5xxx = shared HTTP error responses (all services).
 SADI-61xx = NETWORK (crawler fetch failures).
 SADI-62xx = PARSE (crawler content extraction failures).
 """
+import logging
 from dataclasses import dataclass
 
 
@@ -17,8 +18,25 @@ class ErrorCode:
 
     error_type: str    # Category: "NETWORK" | "PARSE"
     error_code: str    # Unique identifier, e.g. "SADI-6101"
-    dev_message: str   # Technical description for devs/ops (logs, debugging)
-    message: str       # Short human-readable summary (dashboards, ops alerts)
+    dev_message: str   # Static technical description, for debugging. Used server-side
+                        # in logs, and as the API response's `detail` fallback when the
+                        # raised exception has no more specific per-occurrence detail
+                        # (see app.common.exceptions.SADIException.detail) — safe to
+                        # return because SADI has no untrusted external callers.
+    message: str       # Short, generic, public-facing summary — safe for a caller to
+                        # relay further (e.g. to its own end-user-facing UI)
+    log_level: int = logging.WARNING
+                        # Declared severity for this error code — the single source of
+                        # truth for how loggers should treat it, instead of every call
+                        # site re-deciding ad hoc (which drifts: the same exception type
+                        # was logged at different severities in different crawlers
+                        # before this field existed). Default WARNING fits most codes —
+                        # an individual failure (one URL, one PDF) at fleet scale isn't
+                        # ops-actionable on its own. Override to logging.ERROR only for
+                        # codes that are: genuinely unexpected (INTERNAL_ERROR) or
+                        # represent a dependency being down (SERVICE_UNAVAILABLE,
+                        # UPSTREAM_UNAVAILABLE). Callers log with
+                        # `logger.log(error_code.log_level, ...)`.
 
 
 class CommonErrorCode:
@@ -47,12 +65,14 @@ class CommonErrorCode:
         error_code="COMMON-5000",
         dev_message="Unexpected internal server error",
         message="Internal server error",
+        log_level=logging.ERROR,
     )
     SERVICE_UNAVAILABLE = ErrorCode(
         error_type="COMMON",
         error_code="COMMON-5001",
         dev_message="Dependency unreachable — database or Redis",
         message="Service unavailable",
+        log_level=logging.ERROR,
     )
     RATE_LIMITED = ErrorCode(
         error_type="COMMON",
@@ -65,6 +85,7 @@ class CommonErrorCode:
         error_code="COMMON-5002",
         dev_message="Upstream service unreachable",
         message="Service unavailable",
+        log_level=logging.ERROR,
     )
 
 

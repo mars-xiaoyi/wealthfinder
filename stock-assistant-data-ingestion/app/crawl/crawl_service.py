@@ -99,10 +99,16 @@ class CrawlService:
             try:
                 result = await crawler.run()
             except CrawlFatalException as exc:
-                logger.error(
+                # exc_info=exc walks __cause__ automatically, surfacing the
+                # original exception's traceback even though the crawler layer
+                # deliberately doesn't log it before escalating to
+                # CrawlFatalException (this is the one log point instead).
+                logger.log(
+                    exc.error_code.log_level,
                     "[crawl_service] CrawlFatalException for %s: %s",
                     source_name.value,
                     exc,
+                    exc_info=exc,
                 )
                 await self._publish_completed(execution_id, "FAILED", str(exc))
                 return
