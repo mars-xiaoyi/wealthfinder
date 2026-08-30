@@ -706,9 +706,33 @@ def create_app() -> FastAPI:
 
 | Exception | Response |
 |---|---|
-| `RequestValidationError` (Pydantic) | HTTP 400, `error_code: "COMMON-4001"`, populate `detail.errors` from Pydantic's error list |
-| `JSONDecodeError` | HTTP 400, `error_code: "COMMON-4000"` |
-| General `Exception` | HTTP 500, `error_code: "COMMON-5000"` |
+| `RequestValidationError` (Pydantic) | HTTP 400. Field validation failure → `error_code: "COMMON-4001"`, populate `detail.errors` from Pydantic's error list. Malformed-JSON body (Pydantic error `type == "json_invalid"`, see note below) → `error_code: "COMMON-4000"`, `detail: CommonErrorCode.MALFORMED_REQUEST.dev_message` |
+| General `Exception` | HTTP 500, `error_code: "COMMON-5000"`, `detail: {}` |
+
+> **No dedicated `JSONDecodeError` handler.** FastAPI catches it internally while
+> parsing the request body and re-raises it as `RequestValidationError` (tagged
+> `type: "json_invalid"`) before it ever reaches the ASGI exception-handling layer —
+> a handler registered on `json.JSONDecodeError` here would be unreachable dead
+> code. `validation_error_handler` detects that tag itself and returns
+> `COMMON-4000`, since docs/api.md §1.3 treats malformed JSON as a distinct error
+> from field validation failure (`COMMON-4001`). See `docs/spikes.md` §3.3.
+
+> **`detail` field (docs/api.md §1.1):** every response body includes `error_code`,
+> `message`, and `detail` — `{}` only when there's genuinely nothing to add. SADI has
+> no authentication (single-user MVP) and is only ever called by other internal MWP
+> services, not untrusted external clients, so `detail` favours giving the caller
+> something to debug with over defaulting to empty. Concretely: `SADIException.detail`
+> is always fixed at the raise site (e.g. `NotFoundException("cleaned_id X not
+> found")`, or `ServiceUnavailableException("Database is unavailable")` in
+> `app/db/connection.py` — never `str(exc)`, which could leak infra details like
+> hostnames/ports) and `sadi_exception_handler` always surfaces it as-is;
+> `redis_connection_error_handler` and `general_exception_handler` hardcode `"Redis is
+> unavailable"` / `"An unexpected internal error occurred"` respectively, since
+> neither has a safe per-exception message to draw from; the malformed-JSON branch of
+> `validation_error_handler` uses `CommonErrorCode.MALFORMED_REQUEST.dev_message` — a
+> static but genuinely descriptive string, safe here because it describes the
+> *client's own* malformed input, not anything about SADI's internals. The raw
+> exception is always still logged server-side (`exc_info=True`) for full debugging.
 
 ### 7.2 `app/api/routes/crawl.py` — `POST /v1/crawl`
 
@@ -1115,7 +1139,6 @@ class CommonErrorCode:
     MALFORMED_REQUEST    = ErrorCode("COMMON", "COMMON-4000", ...)
     VALIDATION_FAILED    = ErrorCode("COMMON", "COMMON-4001", ...)
     NOT_FOUND            = ErrorCode("COMMON", "COMMON-4004", ...)
-    METHOD_NOT_ALLOWED   = ErrorCode("COMMON", "COMMON-4005", ...)
     RATE_LIMITED          = ErrorCode("COMMON", "COMMON-4029", ...)
     INTERNAL_ERROR       = ErrorCode("COMMON", "COMMON-5000", ...)
     SERVICE_UNAVAILABLE  = ErrorCode("COMMON", "COMMON-5001", ...)

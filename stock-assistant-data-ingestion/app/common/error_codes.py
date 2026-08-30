@@ -42,12 +42,6 @@ class CommonErrorCode:
         dev_message="Requested resource does not exist",
         message="Resource not found",
     )
-    METHOD_NOT_ALLOWED = ErrorCode(
-        error_type="COMMON",
-        error_code="COMMON-4005",
-        dev_message="HTTP method not allowed for this endpoint",
-        message="Method not allowed",
-    )
     INTERNAL_ERROR = ErrorCode(
         error_type="COMMON",
         error_code="COMMON-5000",

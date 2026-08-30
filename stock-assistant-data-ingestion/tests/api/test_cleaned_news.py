@@ -74,6 +74,8 @@ class TestGetCleanedNews:
         assert resp.status_code == 404
         body = resp.json()
         assert body["error_code"] == "COMMON-4004"
+        # 4xx SADIException.detail is business context, safe to surface (docs/api.md §1.1)
+        assert body["detail"] == f"cleaned_id {cid} not found"
 
     @pytest.mark.asyncio
     async def test_invalid_uuid_returns_400(self, mock_db):

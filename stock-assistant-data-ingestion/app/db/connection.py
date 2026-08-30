@@ -49,7 +49,10 @@ class DatabaseClient:
                 raise DatabaseError(str(exc)) from exc
             except self._TRANSIENT as exc:
                 if attempt == self._config.max_retry:
-                    raise ServiceUnavailableException(str(exc)) from exc
+                    logger.error(
+                        "DB connection retries exhausted: %s", exc, exc_info=True
+                    )
+                    raise ServiceUnavailableException("Database is unavailable") from exc
                 wait_s = (self._config.retry_base_wait_ms * (2 ** (attempt - 1))) / 1000
                 logger.warning(
                     "Transient DB error on attempt %d/%d, retrying in %.3fs: %s",
@@ -60,7 +63,8 @@ class DatabaseClient:
                 )
                 await asyncio.sleep(wait_s)
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError) as exc:
-                raise ServiceUnavailableException(str(exc)) from exc
+                logger.error("DB connection error: %s", exc, exc_info=True)
+                raise ServiceUnavailableException("Database is unavailable") from exc
             except asyncpg.PostgresError as exc:
                 # Safety net for any Postgres-side error not classified above.
                 raise DatabaseError(str(exc)) from exc
@@ -88,7 +92,8 @@ class DatabaseClient:
             async with self._pool.acquire() as conn:
                 return await op(conn)
         except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, *self._TRANSIENT) as exc:
-            raise ServiceUnavailableException(str(exc)) from exc
+            logger.error("DB connection error during read: %s", exc, exc_info=True)
+            raise ServiceUnavailableException("Database is unavailable") from exc
         except asyncpg.PostgresError as exc:
             raise DatabaseError(str(exc)) from exc
 

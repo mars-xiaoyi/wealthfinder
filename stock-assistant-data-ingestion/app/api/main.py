@@ -1,4 +1,3 @@
-import json
 import logging
 
 import redis.exceptions
@@ -29,7 +28,7 @@ def _format_validation_errors(exc: RequestValidationError) -> list[dict]:
     for err in exc.errors():
         loc = [str(p) for p in err.get("loc", ()) if p not in _LOCATION_MARKERS]
         errors.append({
-            "field": ".".join(loc) if loc else "unknown",
+            "field": ".".join(loc),
             "issue": err.get("msg", ""),
         })
     return errors
@@ -54,17 +53,18 @@ def create_app() -> FastAPI:
     ) -> JSONResponse:
         status = _HTTP_STATUS_MAP.get(type(exc), 500)
         logger.warning("[api] SADIException: %s %s", exc.error_code.error_code, exc.detail)
-        # exc.detail carries business-level context (e.g. "cleaned_id X not
-        # found") that's safe and useful to return on a 4xx. On a 5xx it may
-        # wrap a raw internal error string (e.g. a DB connection failure) —
-        # never echo that to the client; log it and return {} instead.
-        detail = exc.detail if status < 500 and exc.detail else {}
+        # exc.detail is always a safe, human-readable message set at the raise
+        # site (e.g. "cleaned_id X not found", "Database is unavailable") —
+        # SADIException subclasses must never pass a raw exception string or
+        # anything else that could leak internal details (hostnames, ports,
+        # stack fragments). See app/db/connection.py's ServiceUnavailableException
+        # raises for the pattern to follow.
         return JSONResponse(
             status_code=status,
             content={
                 "error_code": exc.error_code.error_code,
                 "message": exc.error_code.message,
-                "detail": detail,
+                "detail": exc.detail if exc.detail else {},
             },
         )
 
@@ -73,6 +73,20 @@ def create_app() -> FastAPI:
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         logger.warning("[api] validation error: %s", exc.errors())
+        # FastAPI routes a malformed-JSON body through this same exception type,
+        # tagged with type "json_invalid" (see the note below) — docs/api.md §1.3
+        # treats that as a distinct error (COMMON-4000), not a field validation
+        # failure (COMMON-4001), so detect and split it here rather than
+        # collapsing both into one code.
+        if any(err.get("type") == "json_invalid" for err in exc.errors()):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error_code": CommonErrorCode.MALFORMED_REQUEST.error_code,
+                    "message": CommonErrorCode.MALFORMED_REQUEST.message,
+                    "detail": CommonErrorCode.MALFORMED_REQUEST.dev_message,
+                },
+            )
         return JSONResponse(
             status_code=400,
             content={
@@ -82,19 +96,12 @@ def create_app() -> FastAPI:
             },
         )
 
-    @app.exception_handler(json.JSONDecodeError)
-    async def json_decode_error_handler(
-        request: Request, exc: json.JSONDecodeError
-    ) -> JSONResponse:
-        logger.warning("[api] malformed JSON: %s", exc)
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error_code": CommonErrorCode.MALFORMED_REQUEST.error_code,
-                "message": CommonErrorCode.MALFORMED_REQUEST.message,
-                "detail": {},
-            },
-        )
+    # Note: FastAPI catches json.JSONDecodeError internally while parsing the
+    # request body and re-raises it as RequestValidationError before it ever
+    # reaches the ASGI exception-handling layer (see fastapi/routing.py) — a
+    # dedicated handler here would be unreachable dead code. Malformed JSON is
+    # handled by validation_error_handler above, same as any other Pydantic
+    # validation failure. See docs/spikes.md §3.3.
 
     # Note: a DB-unreachable condition surfaces as ServiceUnavailableException
     # (raised inside DatabaseClient) and is handled by sadi_exception_handler
@@ -110,7 +117,7 @@ def create_app() -> FastAPI:
             content={
                 "error_code": CommonErrorCode.SERVICE_UNAVAILABLE.error_code,
                 "message": CommonErrorCode.SERVICE_UNAVAILABLE.message,
-                "detail": {},
+                "detail": "Redis is unavailable",
             },
         )
 
@@ -124,7 +131,10 @@ def create_app() -> FastAPI:
             content={
                 "error_code": CommonErrorCode.INTERNAL_ERROR.error_code,
                 "message": CommonErrorCode.INTERNAL_ERROR.message,
-                "detail": {},
+                # Generic on purpose — unlike ServiceUnavailableException/Redis's
+                # handler, we don't know what actually failed here, and echoing
+                # str(exc) risks leaking internal details. See server logs (above).
+                "detail": "An unexpected internal error occurred",
             },
         )
         
