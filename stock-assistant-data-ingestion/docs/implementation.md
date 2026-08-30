@@ -77,6 +77,7 @@ REDIS_URL=redis://localhost:6379
 CRAWL_MAX_RETRY=3
 CRAWL_RETRY_BASE_WAIT_MS=500
 CRAWL_REQUEST_TIMEOUT_S=10
+CRAWL_BROWSER_NAV_TIMEOUT_MS=15000
 
 # Cleaner
 CLEAN_WORKER_CONCURRENCY=5
@@ -1847,7 +1848,12 @@ SQL     : UPDATE raw_news SET is_deleted=TRUE, deleted_reason=$1 WHERE raw_id=$2
 #### Method: `_fetch_raw_news(raw_id: UUID) -> Optional[RawNews]`
 
 ```
-Purpose : Fetch a single raw_news record by primary key.
+Purpose : Fetch a single raw_news record by primary key. extra_metadata is
+          parsed from JSON via _parse_extra_metadata() — asyncpg returns
+          JSONB as a raw string (no type codec registered on the pool, see
+          app/db/connection.py), so it must be parsed back into a dict to
+          match RawNews.extra_metadata's Optional[dict] type. Malformed JSON
+          logs a WARNING and is treated as None rather than raising.
 Returns : RawNews dataclass, or None if not found (should not happen in normal flow —
           log a WARNING if this occurs; it may mean the DB was reset)
 ```

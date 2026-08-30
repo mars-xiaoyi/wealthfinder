@@ -280,6 +280,7 @@ After fetching a page, the crawler determines the parsing path based on the HTTP
 | max_concurrent | 3 (HKEX: 1) | Max concurrent crawler coroutines per source | SADI config file (per-source) |
 | request_interval | 500–1000ms random | Random jitter between requests to mimic human behaviour | SADI config file (per-source) |
 | CRAWL_REQUEST_TIMEOUT_S | 10s | Single page fetch timeout | Environment variable |
+| CRAWL_BROWSER_NAV_TIMEOUT_MS | 15000ms | Playwright navigation/action timeout (HKEX, MingPao) | Environment variable |
 | CRAWL_MAX_RETRY | 3 | Max retry attempts with exponential backoff | Environment variable |
 
 ### 3.5 Retry and Error Handling
@@ -496,10 +497,11 @@ SADI exposes a minimal REST API via FastAPI. The API serves two purposes: extern
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| execution_id | STRING | Yes | Correlation ID from Admin Scheduler; echoed back in the `POST /crawl` response and in `stream:crawl_completed` |
 | source_name | STRING | Yes | Source identifier: `HKEX`, `MINGPAO`, `AASTOCKS`, `YAHOO_HK`. Must match a known Crawler class in SADI |
-| date | STRING | No | Target date for HKEX batch pull, format `YYYYMMDD`. Defaults to current date if omitted. Ignored for non-HKEX sources |
+| date | STRING | No | Target date for HKEX batch pull, ISO 8601 format `YYYY-MM-DD`. Defaults to current date if omitted. Ignored for non-HKEX sources |
 
-> **Note:** `source_name` is mandatory. Requests without `source_name` or with an unknown `source_name` are rejected with HTTP 400. Each scheduled trigger in Admin Service maps to one `POST /crawl` call with a specific `source_name`; scheduling frequency is configured per-source in Admin Service `scheduled_triggers`.
+> **Note:** `execution_id` and `source_name` are both mandatory. Requests missing either, or with an unknown `source_name`, are rejected with HTTP 400. Each scheduled trigger in Admin Service maps to one `POST /crawl` call with a specific `source_name`; scheduling frequency is configured per-source in Admin Service `scheduled_triggers`.
 
 ### 6.2 `GET /health` Response
 
@@ -570,6 +572,7 @@ Backoff formula: `wait = DB_RETRY_BASE_WAIT_MS × 2^(attempt - 1)`
 | CRAWL_MAX_RETRY | 3 | Max crawler retry attempts |
 | CRAWL_RETRY_BASE_WAIT_MS | 500 | Crawler retry base wait time (ms) |
 | CRAWL_REQUEST_TIMEOUT_S | 10 | Single page fetch timeout (seconds) |
+| CRAWL_BROWSER_NAV_TIMEOUT_MS | 15000 | Playwright page navigation/action timeout for browser-based crawlers (HKEX, MingPao) (ms) |
 | CLEAN_WORKER_CONCURRENCY | 5 | Number of concurrent cleaning workers |
 | CLEAN_BODY_MIN_LENGTH | 50 | Minimum body length after cleaning (characters) |
 | STREAM_CLAIM_TIMEOUT_MS | 30000 | Message pending time before XAUTOCLAIM redelivery (ms) |

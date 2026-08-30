@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -208,10 +209,35 @@ class CleaningService:
             published_at=row["published_at"],
             created_at=row["created_at"],
             raw_hash=row["raw_hash"],
-            extra_metadata=row["extra_metadata"],
+            extra_metadata=self._parse_extra_metadata(row["extra_metadata"]),
             is_deleted=row["is_deleted"],
             deleted_reason=row["deleted_reason"],
         )
+
+    @staticmethod
+    def _parse_extra_metadata(value: Optional[str]) -> Optional[dict]:
+        """
+        raw_news.extra_metadata is a JSONB column, but asyncpg returns it as a
+        raw string — no type codec is registered on the pool (see
+        app/db/connection.py) — so it must be parsed back into a dict here to
+        match RawNews.extra_metadata's Optional[dict] type. The write side
+        (app/crawl/crawl_service.py) does the matching json.dumps().
+
+        None passes through unchanged. Malformed JSON logs a warning and
+        returns None rather than raising — this is a read path in the middle
+        of record processing, must not crash over a metadata quirk.
+        """
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[cleaning_service] Failed to parse extra_metadata JSON (len=%d); returning None",
+                len(value) if isinstance(value, str) else -1,
+                exc_info=True,
+            )
+            return None
 
     async def _insert_cleaned_news(self, record: CleanedNews) -> None:
         """

@@ -59,8 +59,14 @@ def _make_raw_row(
     raw_hash="abc123",
     is_deleted=False,
     deleted_reason=None,
+    extra_metadata=None,
 ):
-    """Create a dict simulating an asyncpg Record for raw_news."""
+    """
+    Create a dict simulating an asyncpg Record for raw_news. extra_metadata
+    here is the raw column value — a JSON string (or None), matching what
+    asyncpg actually returns for JSONB with no type codec registered — not
+    a dict. See CleaningService._parse_extra_metadata, applied in _fetch_raw_news.
+    """
     return {
         "raw_id": raw_id or uuid4(),
         "source_name": source_name,
@@ -70,7 +76,7 @@ def _make_raw_row(
         "published_at": published_at,
         "created_at": datetime.now(timezone.utc),
         "raw_hash": raw_hash,
-        "extra_metadata": None,
+        "extra_metadata": extra_metadata,
         "is_deleted": is_deleted,
         "deleted_reason": deleted_reason,
     }
@@ -258,3 +264,42 @@ class TestFetchRawNews:
         mock_db.fetch_one = AsyncMock(return_value=None)
         result = await service._fetch_raw_news(uuid4())
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_parses_extra_metadata_json_string_into_dict(self, service, mock_db):
+        # asyncpg returns JSONB as a raw string (no type codec registered) —
+        # this was previously assigned straight through, leaving
+        # RawNews.extra_metadata holding a str instead of the dict its type
+        # annotation promises. See CleaningService._parse_extra_metadata.
+        raw_id = uuid4()
+        mock_db.fetch_one = AsyncMock(
+            return_value=_make_raw_row(
+                raw_id=raw_id,
+                extra_metadata='{"stock_code": ["00700"]}',
+            )
+        )
+
+        result = await service._fetch_raw_news(raw_id)
+        assert result.extra_metadata == {"stock_code": ["00700"]}
+
+    @pytest.mark.asyncio
+    async def test_null_extra_metadata_stays_none(self, service, mock_db):
+        raw_id = uuid4()
+        mock_db.fetch_one = AsyncMock(
+            return_value=_make_raw_row(raw_id=raw_id, extra_metadata=None)
+        )
+
+        result = await service._fetch_raw_news(raw_id)
+        assert result.extra_metadata is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_extra_metadata_json_returns_none(self, service, mock_db):
+        # Must not raise — a corrupt/unexpected metadata value should not
+        # crash record processing.
+        raw_id = uuid4()
+        mock_db.fetch_one = AsyncMock(
+            return_value=_make_raw_row(raw_id=raw_id, extra_metadata="{not json")
+        )
+
+        result = await service._fetch_raw_news(raw_id)
+        assert result.extra_metadata is None
