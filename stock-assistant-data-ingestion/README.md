@@ -112,7 +112,9 @@ Useful once connected: `\dt` in `psql` lists `raw_news`, `cleaned_news`,
 `crawl_error_log`; `KEYS stream:*` in `redis-cli` shows
 `stream:raw_news_cleaned` / `stream:crawl_completed` once a crawl has run.
 
-## Running tests
+## Testing
+
+### Unit tests
 
 ```bash
 # With venv activated
@@ -121,3 +123,36 @@ pytest
 # Or without activating the venv
 uv run pytest
 ```
+
+Live integration tests (real network, one per crawler) are opt-in and skipped
+by default:
+
+```bash
+pytest -m live -v
+```
+
+### End-to-end local testing
+
+`pytest` mocks the DB/Redis, so it doesn't exercise the real running stack —
+API → crawler → DB → cleaning pipeline → Redis stream → retrieval API. For
+that, use the phase scripts in [`scripts/local-test/`](scripts/local-test/)
+against a running stack (see `Running the service` above). Each phase is
+independent and can be re-run on its own; run them in order the first time,
+since later phases assume data from earlier ones.
+
+```bash
+./scripts/local-test/00-automated.sh     # pytest (unit) + pytest -m live
+./scripts/local-test/01-health.sh        # GET /v1/health
+./scripts/local-test/02-crawl.sh         # POST /v1/crawl for all 4 sources + validation errors
+./scripts/local-test/03-cleaning.sh      # cleaned_news populated, stream:raw_news_cleaned published
+./scripts/local-test/04-retrieval.sh     # GET/POST /v1/cleaned_news, incl. 404 + validation error
+./scripts/local-test/05-idempotency.sh   # re-crawl doesn't duplicate raw_news rows
+./scripts/local-test/06-resilience.sh    # DB/Redis down -> 503s; disruptive but self-healing
+./scripts/local-test/07-docker.sh        # docker build + docker compose up --build, the actual deploy artifact
+```
+
+`HKEX_DATE` (02-crawl.sh), a source name arg (05-idempotency.sh), and
+`SADI_BASE_URL` (default `http://localhost:8000`, all scripts) can be
+overridden — see each script's header comment. Phases 0-6 passing gives
+functional confidence; phase 7 additionally confirms the actual Docker image
+works, not just the host-run dev server.

@@ -27,7 +27,7 @@ class FeedEntry:
     description: Optional[str] = None  # RSS <description>/summary; None if not in feed.
     # Used as a teaser-body fallback by MingPaoCrawler (full-article fetch is
     # Cloudflare-blocked; the RSS description is the only reliably-accessible
-    # body content) — see docs/local-test-plan.md. Unused by YahooHKCrawler,
+    # body content) — see progress.md, 2026-08-31. Unused by YahooHKCrawler,
     # which fetches the full article page instead.
 
 

@@ -27,7 +27,7 @@ class MingPaoCrawler(BaseCrawler):
     Cloudflare hard-blocks the article pages on this network — confirmed with
     the same anti-fingerprint BrowserManager context used successfully in
     April, so it is not a stale-selector or timing bug (see
-    docs/local-test-plan.md investigation). The RSS feed's <description> is
+    progress.md, 2026-08-31 investigation). The RSS feed's <description> is
     not blocked and carries a real, if short (~150-250 char), lead-paragraph
     teaser — used directly as the body instead. This is a deliberate depth
     tradeoff versus the other three sources, which capture full article text;

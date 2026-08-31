@@ -12,7 +12,7 @@ async def test_lifespan_http_client_sends_browser_identity_headers():
     phase, Yahoo HK) must send a realistic browser User-Agent/Accept-Language.
     Without it, httpx's default `python-httpx/x.y.z` UA gets fingerprinted and
     blocked (HTTP 429) on the very first request, regardless of request
-    volume — confirmed live against Yahoo HK. See docs/local-test-plan.md.
+    volume — confirmed live against Yahoo HK. See progress.md, 2026-08-31.
     """
     fake_config = MagicMock()
     fake_config.crawl.request_timeout_s = 10

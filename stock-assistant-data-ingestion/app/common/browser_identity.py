@@ -8,7 +8,7 @@ regular HK visitor. Without this, an unrealistic default UA (Playwright's
 headless-shell tell, or httpx's `python-httpx/x.y.z`) gets fingerprinted and
 blocked by some sources — Cloudflare, or a bare HTTP 429 — on the very first
 request, regardless of request volume. Confirmed live against Yahoo HK; see
-docs/local-test-plan.md.
+progress.md, 2026-08-31.
 """
 
 DEFAULT_USER_AGENT = (
