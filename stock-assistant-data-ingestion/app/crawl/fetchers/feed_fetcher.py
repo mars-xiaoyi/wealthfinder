@@ -24,6 +24,11 @@ class FeedEntry:
     title: str
     url: str
     published_at: Optional[datetime]  # UTC; None if not in feed
+    description: Optional[str] = None  # RSS <description>/summary; None if not in feed.
+    # Used as a teaser-body fallback by MingPaoCrawler (full-article fetch is
+    # Cloudflare-blocked; the RSS description is the only reliably-accessible
+    # body content) — see docs/local-test-plan.md. Unused by YahooHKCrawler,
+    # which fetches the full article page instead.
 
 
 async def fetch_rss(url: str) -> list[FeedEntry]:
@@ -61,8 +66,17 @@ async def fetch_rss(url: str) -> list[FeedEntry]:
             timestamp = calendar.timegm(entry.published_parsed)
             published_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
+        description = entry.get("summary", "").strip() or None
+
         logger.debug("[fetch_rss] Parsed entry: title=%s, url=%s, published_at=%s", title, link, published_at)
-        entries.append(FeedEntry(title=title, url=link, published_at=published_at))
+        entries.append(
+            FeedEntry(
+                title=title,
+                url=link,
+                published_at=published_at,
+                description=description,
+            )
+        )
 
     logger.info("[fetch_rss] Completed: %d entries parsed, %d skipped from %s", len(entries), skipped, url)
     return entries

@@ -326,11 +326,24 @@ Stores configuration for all news sources. Owned and managed exclusively by Admi
 | source_name | authority_weight | is_active |
 |---|---|---|
 | `HKEX` | 9.0 | true |
-| `MINGPAO` | 9.0 | true |
+| `MINGPAO` | 6.0 | true |
 | `AASTOCKS` | 6.0 | true |
 | `YAHOO_HK` | 6.0 | true |
 
 > Initial `authority_weight` values follow P1=9.0, P2=6.0 groupings. To be validated against real data in Week 3-4 (PRD OQ-2).
+>
+> **2026-08-31 revision:** `MINGPAO` moved P1 (9.0) → P2 (6.0), ahead of the
+> Week 3-4 validation, based on SADI local testing that day (see
+> `stock-assistant-data-ingestion/progress.md`, 2026-08-31 entries). Cloudflare
+> blocks full-article fetch on the test network; `MingPaoCrawler` now sources
+> its body from the RSS `<description>` field instead — a ~150-250 char
+> lead-paragraph teaser, versus full article text for HKEX, AAStocks, and
+> Yahoo HK. HKEX's and Yahoo HK's own issues found the same day (a browser
+> navigation timeout and a fingerprinted default User-Agent, respectively)
+> were operational and are now fixed with no lasting effect on content depth,
+> so neither changed weight. This was one day of testing from a single dev
+> network, not the deployment target — revisit upward if Ming Pao's block
+> turns out to be network-specific once running from the real server.
 
 ### 3.2 `GET /sources`
 

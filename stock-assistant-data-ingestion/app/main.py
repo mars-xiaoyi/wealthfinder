@@ -9,6 +9,7 @@ from app.api.main import create_app
 from app.cleaner.cleaning_service import CleaningService
 from app.cleaner.stream_handler import StreamHandler
 from app.config import load_config
+from app.common.browser_identity import DEFAULT_ACCEPT_LANGUAGE, DEFAULT_USER_AGENT
 from app.crawl.crawl_service import CrawlService
 from app.crawl.fetchers.page_crawler import PageCrawler
 from app.db.connection import create_db_client
@@ -32,6 +33,15 @@ async def lifespan(app: FastAPI):
     http_client = httpx.AsyncClient(
         follow_redirects=True,
         timeout=config.crawl.request_timeout_s,
+        # Without a realistic identity, httpx's default `python-httpx/x.y.z`
+        # User-Agent gets fingerprinted and blocked (HTTP 429) by some sources
+        # on the very first request, regardless of request volume — confirmed
+        # live against Yahoo HK. Same identity BrowserManager uses for
+        # Playwright, kept consistent across both fetch paths.
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
+        },
     )
     page_crawler = PageCrawler(http_client, config.crawl)
     crawl_service = CrawlService(db, stream_client, page_crawler, config.crawl)

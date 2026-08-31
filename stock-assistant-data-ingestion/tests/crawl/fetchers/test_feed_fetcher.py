@@ -15,11 +15,17 @@ def _make_feed(entries=None, bozo=False, bozo_exception=None):
     return feed
 
 
-def _make_entry(title="Test Title", link="https://example.com/1", published_parsed=None):
+def _make_entry(
+    title="Test Title",
+    link="https://example.com/1",
+    published_parsed=None,
+    summary="",
+):
     data = {
         "title": title,
         "link": link,
         "published_parsed": published_parsed,
+        "summary": summary,
     }
     entry = MagicMock()
     entry.get = lambda key, default="": data.get(key, default)
@@ -81,6 +87,32 @@ async def test_fetch_rss_empty_entries_raises():
     with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
         with pytest.raises(FeedFetchException, match="returned no entries"):
             await fetch_rss("https://example.com/rss")
+
+
+# ---------------------------------------------------------------------------
+# fetch_rss — description field
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_rss_captures_description():
+    entries = [_make_entry(summary="  a teaser paragraph  ")]
+    feed = _make_feed(entries=entries)
+
+    with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
+        result = await fetch_rss("https://example.com/rss")
+
+    assert result[0].description == "a teaser paragraph"  # stripped
+
+
+@pytest.mark.asyncio
+async def test_fetch_rss_no_summary_gives_none_description():
+    entries = [_make_entry(summary="")]
+    feed = _make_feed(entries=entries)
+
+    with patch("app.crawl.fetchers.feed_fetcher.feedparser.parse", return_value=feed):
+        result = await fetch_rss("https://example.com/rss")
+
+    assert result[0].description is None
 
 
 # ---------------------------------------------------------------------------

@@ -2,18 +2,14 @@ import logging
 
 from playwright.async_api import Browser, BrowserContext, async_playwright
 
+from app.common.browser_identity import DEFAULT_ACCEPT_LANGUAGE, DEFAULT_USER_AGENT
+
 logger = logging.getLogger(__name__)
 
-# Realistic desktop Chrome UA — paired with zh-HK locale/Accept-Language so the
-# context looks like a regular HK visitor. MingPao's Cloudflare challenge blocks
-# the default headless-shell UA; keeping these defaults on the shared manager
-# also improves robustness on any future CF-gated source.
-_DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-)
-_DEFAULT_LOCALE = "zh-HK"
-_DEFAULT_ACCEPT_LANGUAGE = "zh-HK,zh;q=0.9,en;q=0.8"
+# MingPao's Cloudflare challenge blocks the default headless-shell UA — the
+# shared DEFAULT_USER_AGENT/DEFAULT_ACCEPT_LANGUAGE (app/common/browser_identity.py)
+# fix that, and also improve robustness on any future CF-gated source.
+_DEFAULT_LOCALE = "zh-HK"  # Playwright-only — httpx has no locale concept
 
 
 class BrowserManager:
@@ -58,9 +54,9 @@ class BrowserManager:
         if self._browser is None:
             raise RuntimeError("BrowserManager not started. Call start() first.")
         return await self._browser.new_context(
-            user_agent=_DEFAULT_USER_AGENT,
+            user_agent=DEFAULT_USER_AGENT,
             locale=_DEFAULT_LOCALE,
-            extra_http_headers={"Accept-Language": _DEFAULT_ACCEPT_LANGUAGE},
+            extra_http_headers={"Accept-Language": DEFAULT_ACCEPT_LANGUAGE},
         )
 
     async def release_context(self, context: BrowserContext) -> None:
