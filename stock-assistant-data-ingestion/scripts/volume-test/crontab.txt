@@ -1,0 +1,21 @@
+# Install on the GCP VM with: crontab scripts/volume-test/crontab.txt
+# Assumes: (1) VM timezone set to Asia/Hong_Kong (see Setup checklist in
+# volume-test-plan.md) so these times are HKT directly, no offset math;
+# (2) repo deployed at /opt/sadi with the stack already started
+# via `docker compose -f docker-compose-dev.yml up -d` from that directory —
+# these scripts trigger against localhost:8000 and exec into the
+# already-running containers, they don't start the stack.
+#
+# HKEX first (slowest — Playwright pagination + PDF fetch, ~94-150s in past
+# live tests) with its own docker-stats sampling window, then the 3
+# httpx/RSS-only sources 10 min apart for clean, non-overlapping logs, then
+# a health check once everything should have completed.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+30 23 * * * /opt/sadi/scripts/volume-test/capture_hkex_stats.sh   >> /opt/sadi/logs/cron.log 2>&1
+40 23 * * * /opt/sadi/scripts/volume-test/trigger_crawl.sh MINGPAO   >> /opt/sadi/logs/cron.log 2>&1
+45 23 * * * /opt/sadi/scripts/volume-test/trigger_crawl.sh AASTOCKS  >> /opt/sadi/logs/cron.log 2>&1
+50 23 * * * /opt/sadi/scripts/volume-test/trigger_crawl.sh YAHOO_HK  >> /opt/sadi/logs/cron.log 2>&1
+55 23 * * * /opt/sadi/scripts/volume-test/daily_healthcheck.sh    >> /opt/sadi/logs/cron.log 2>&1
