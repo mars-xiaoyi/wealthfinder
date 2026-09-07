@@ -297,6 +297,7 @@ Base URL: `http://sapi/v1`
 |---|---|---|
 | `GET` | `/health` | Service health check |
 | `GET` | `/morning-brief` | Fetch scored Morning Brief events |
+| `POST` | `/hkex-master-list-sync` | Trigger a refresh of the HKEx master list cache; called by Admin on a schedule |
 
 ---
 
@@ -312,6 +313,7 @@ Returns service health status.
     "database": "ok",
     "redis_stream": "ok",
     "redis_state": "ok",
+    "hkex_master_list": "ok",
     "layers": {
         "nlp": "ok",
         "aggregation": "ok",
@@ -327,6 +329,7 @@ Returns service health status.
 | `database` | `ok` / `error` | PostgreSQL connectivity |
 | `redis_stream` | `ok` / `error` | `RedisStreamClient` connectivity |
 | `redis_state` | `ok` / `error` | `RedisStateClient` connectivity |
+| `hkex_master_list` | `ok` / `not_ready` | `ok` once loaded (entries > 0); `not_ready` at 0 entries — covers both "still loading" and "fetch failed," which aren't distinguished from cache state alone |
 | `layers.nlp` | `ok` / `error` | NLP Layer consumer coroutine status |
 | `layers.aggregation` | `ok` / `error` | Aggregation Layer consumer coroutine status |
 | `layers.scoring` | `ok` / `error` | Scoring Layer consumer coroutine status |
@@ -335,7 +338,7 @@ Returns service health status.
 **HTTP status codes:**
 - All components healthy → `200` with `status: healthy`
 - Any layer degraded → `200` with `status: degraded`
-- Database or Redis unreachable → `503` with `status: unhealthy`
+- Database or Redis unreachable, or `hkex_master_list` is `not_ready` → `503` with `status: unhealthy`
 
 ---
 
@@ -347,7 +350,7 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 
 | Parameter | Type | Required | Constraints | Description |
 |---|---|---|---|---|
-| `stocks` | String | Yes | Comma-separated HK stock codes; min 1 | Client watchlist stock codes, e.g. `00700,09988,03690` |
+| `stocks` | String | Yes | Comma-separated HK stock codes; min 1 | Client watchlist stock codes, `.HK`-suffixed e.g. `00700.HK,09988.HK,03690.HK` — same canonical form as `events[].stock_code`, no conversion needed either direction |
 | `k` | Integer | No | 1–50; default 20 | Number of events to return |
 
 **Response `HTTP 200` — normal:**
@@ -414,7 +417,7 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 | `events[].stock_code` | String | HK stock code, e.g. `00700.HK` |
 | `events[].event_type_primary` | String | Primary event classification |
 | `events[].abs_final_score` | Float | Final score including real-time recency; primary sort key |
-| `events[].base_rule_score` | Float | Rule score including real-time recency; secondary sort key |
+| `events[].base_rule_score` | Float | Signed rule score including real-time recency; magnitude (`\|base_rule_score\|`) is the secondary sort key; sign indicates direction — positive (利好) / negative (利空) — for client display |
 | `events[].first_seen_at` | ISO 8601 datetime (UTC) | Earliest constituent article publish time |
 | `events[].last_seen_at` | ISO 8601 datetime (UTC) | Most recent constituent article publish time |
 | `events[].event.event_type_secondary` | Array of String | Up to 2 secondary event types; empty array if none |
@@ -447,6 +450,35 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 | `COMMON-4001` | 400 | Validation failed: `stocks` missing or empty, `k` out of range |
 | `SAPI-5001` | 503 | Morning Brief cache unavailable |
 | `COMMON-5001` | 503 | Redis unavailable |
+
+---
+
+### 3.4 `POST /v1/hkex-master-list-sync`
+
+Triggers a synchronous refresh of the HKEx master list cache used by `lookup_stock` (SAPI TAD §9.2.1). Fetches HKEXnews's bilingual stock-list JSON endpoints, cross-checks against the official "List of Securities" for equity filtering, and replaces the cache on success. Called by Admin's `MASTER_LIST_SYNC` job on a daily schedule (`admin-tad.md`); not required for SAPI's own startup, which performs this same fetch eagerly and independently.
+
+**Request:** no body.
+
+**Response `HTTP 200`:**
+
+```json
+{
+    "status": "success",
+    "entries_loaded": 2431
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | String | Always `success` on `HTTP 200` |
+| `entries_loaded` | Integer | Number of equity entries written to the cache after filtering |
+
+**Error codes:**
+
+| Error Code | HTTP Status | Trigger |
+|---|---|---|
+| `COMMON-5002` | 503 | HKEXnews JSON endpoints or the official "List of Securities" download unreachable/failed; existing cache left untouched |
+| `COMMON-5001` | 503 | Redis write failed; existing cache left untouched |
 
 ---
 

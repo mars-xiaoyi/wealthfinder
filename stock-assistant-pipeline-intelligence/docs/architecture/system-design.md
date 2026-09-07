@@ -1,17 +1,14 @@
 # Stock Assistant Pipeline Intelligence (SAPI)
-## Technical Architecture Document — v0.7
+## Technical Architecture Document
 
 | Field | Detail |
 |---|---|
 | Service Name | Stock Assistant Pipeline Intelligence (SAPI) |
-| Document Version | TAD v0.7 |
 | Parent System | HK Stock AI Research Assistant |
 | Service Responsibility | NLP enrichment, event aggregation, scoring, and cache population |
 | Tech Stack | Python + asyncio + Redis |
 | Dependencies | PostgreSQL 16, Redis, LLM API (Vertex AI), SADI (via API + Redis Streams), Admin API |
 | Document Status | DRAFT — Work in progress |
-
-**Supersedes TAD v0.6 · Updates: Removed stale is_aggregated index from entity_events index strategy (replaced by event_entity_map in v0.6); DB Write Failure retry strategy fully specified in Section 12.1 (exponential backoff, failure classification, retry parameters — previously deferred to separate document)**
 
 ---
 
@@ -177,12 +174,12 @@ All signals use Redis Streams via `RedisStreamClient`. Each stream serves as bot
 
 | Stream | Producer | Consumer Group | Message Fields | Role |
 |---|---|---|---|---|
-| `stream:raw_news_cleaned` | SADI | `sapi-nlp` | `cleaned_id`, `execution_id`, `v` | NLP Layer input queue |
+| `stream:raw_news_cleaned` | SADI | `sapi-nlp` | `cleaned_id`, `v` | NLP Layer input queue |
 | `stream:entity_event_completed` | NLP Layer | `sapi-aggregation` | `entity_event_id`, `v` | Aggregation Layer input queue |
 | `stream:event_aggregated` | Aggregation Layer | `sapi-scoring` | `event_id`, `v` | Scoring Layer input queue |
 | `stream:event_scored` | Scoring Layer | `sapi-cache` | `event_id`, `v` | Cache Layer input queue |
 
-> `execution_id` is carried only in `stream:raw_news_cleaned` for SADI-to-SAPI traceability. Downstream streams carry only the business ID relevant to each layer.
+> **No `execution_id` traceability.** SADI's `raw_news` table has no `execution_id` column — it's only recorded for failed crawl attempts (`crawl_error_log`), not successfully-ingested articles. There is no way to join a `cleaned_id`/`entity_event_id`/`event_id` back to the specific crawl execution that produced it. If this is ever needed for debugging a specific pipeline run, approximate it via `published_at`/`created_at` falling within that execution's known time window (Admin's `job_executions` tracks start/end time per run) rather than an exact join.
 
 > **Persistence guarantee:** Redis Streams persist messages until ACKed. On service restart, each layer resumes from its last consumed position via Consumer Group with no data loss.
 
@@ -249,6 +246,7 @@ Safe for asyncio single-threaded concurrency — no locking required.
 | `NLP_BATCH_TIMEOUT_MS` | XREADGROUP block timeout (ms) |
 | `NLP_MAX_CONCURRENT` | Worker Pool concurrency limit; constrained by LLM API rate limits |
 | `NLP_MAX_RETRY` | Max delivery attempts before Dead Letter |
+| `NAME_MATCH_MIN_OVERLAP_RATIO` | Minimum character-overlap ratio for `lookup_stock` fuzzy name matching (§9.2) |
 
 ### 3.6 Error Handling
 
@@ -258,6 +256,7 @@ Safe for asyncio single-threaded concurrency — no locking required.
 | LLM schema violation (Instructor exhausted retries) | No DB record written; log error; do not ACK → redelivery → Dead Letter at `NLP_MAX_RETRY` |
 | `LLMRateLimitError` | Pause entire Worker Pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
 | All entities filtered by stock verification | Write empty `entities=[]` record; emit signal; ACK — valid outcome |
+| `cleaned_id` missing from SADI's `cleaned_news` response (silently omitted per `api.md` §2.5, not an HTTP error) | Log warning with `cleaned_id`; ACK — skip this article. Retrying would not recover an ID that isn't in SADI's response. Not expected in normal operation today (SADI has no `cleaned_news` retention/purge job as of this writing) — the log exists to surface it if that changes |
 | DB write failure | See Section 12.1 DB Write Failure policy |
 | SADI API failure | Do not ACK → redelivery → Dead Letter at `NLP_MAX_RETRY` |
 | RedisStreamClient unreachable | See Section 12.1 RedisStreamClient policy |
@@ -275,7 +274,7 @@ Consume `EntityEvent` records, route to per-group coroutines for sliding window 
 ```mermaid
 flowchart TD
     A[Read batch messages] --> B{Messages received?}
-    B -->|Timeout / Flush interval\nor graceful shutdown| D[DB Flush\nUpsert Events + Mark is_aggregated\nEmit signals]
+    B -->|Timeout / Flush interval\nor graceful shutdown| D[DB Flush\nUpsert Events + event_entity_map\nEmit signals]
     B -->|Yes| C[Fetch EntityEvents from DB\nuse created_at when published_at absent]
     C --> E[Coroutine Manager\nroute by group key]
     E --> F{Group exists?}
@@ -305,8 +304,10 @@ Within each Group Coroutine, EntityEvents are processed in arrival order from th
 
 - **Merge condition:** `entity_event.published_at - event.last_seen_at <= SLIDING_WINDOW_HOURS` AND `remaining_lifespan > 0`
 - **Hard cap:** `remaining_lifespan = EVENT_MAX_TIMESPAN_HOURS - (entity_event.published_at - event.first_seen_at)`
-- **On merge:** update `last_seen_at`; reset Redis TTL to `min(SLIDING_WINDOW_HOURS, remaining_lifespan)`
+- **On merge:** `last_seen_at = max(last_seen_at, entity_event.published_at)`; `first_seen_at = min(first_seen_at, entity_event.published_at)`; reset Redis TTL to `min(SLIDING_WINDOW_HOURS, remaining_lifespan)`
 - **On no merge:** create new Event in memory and Redis
+
+> **Out-of-order arrival:** messages are processed in the order they're read from the Stream, not article publication order — a crawler batch, retry, or multi-source timing skew can deliver an EntityEvent whose `published_at` is *earlier* than one already merged into the same group. `last_seen_at`/`first_seen_at` must therefore be updated via `max`/`min`, not blind overwrite — a blind overwrite would let `last_seen_at` regress, and never updating `first_seen_at` after Event creation would understate the group's true elapsed span in the hard-cap calculation, letting merges through that `EVENT_MAX_TIMESPAN_HOURS` should have rejected.
 
 > **`published_at` fallback:** Retrieved via `COALESCE(published_at, created_at)` at query time. Source data is not modified.
 
@@ -419,13 +420,58 @@ processing_events: Dict[event_id, aggregation_updated_at]
 | After Rule Score + EventScoringSkill | Same in-memory comparison |
 | Score Fusion write | Conditional `UPDATE event_scores WHERE event_id = :id AND events.aggregation_updated_at = :expected`; 0 rows = stale |
 
-### 5.6 Rule Score — Recency and Direction Exclusion
+### 5.6 Rule Score — Dimensions, Weights, and Recency/Direction Exclusion
 
-`recency_score` and direction coefficient are both excluded from Rule Score computation. `base_rule_score` is a pure unsigned weighted sum of the remaining four dimensions:
+`recency_score` and direction coefficient are both excluded from Rule Score computation — recency is computed live by the Cache Layer (§6.3); direction is applied in Score Fusion (§5.7). `base_rule_score` is a pure unsigned weighted sum of the remaining four dimensions.
+
+**Weights** — PRD §8.2 weights five dimensions as a single weighted average summing to 1.0 (dimension range `[0,10]`), including `recency_score` at 0.20. SAPI computes this in two steps instead of one: the four non-recency weights below **keep their original PRD values** (summing to 0.80, so `stored_base_rule_score ∈ [0,8]`); the Cache Layer (§6.3) adds recency's exact remaining share back in via `recency_score × recency_weight(0.20)` (∈ `[0,2]`), reconstructing the PRD's `[0,10]` range at that point. The four weights are **not** re-normalized to sum to 1.0 on their own — doing so would double-count against `recency_weight(0.20)` in §6.3 and push the combined range to `[0,12]`.
+
+| Dimension | Weight (unchanged from PRD §8.2) |
+|---|---|
+| `event_type_score` | 0.30 |
+| `source_authority_score` | 0.25 |
+| `sentiment_strength_score` | 0.15 |
+| `source_heat_score` | 0.10 |
 
 ```
-base_rule_score (stored) = Σ(dimension_score × weight) excluding recency_score
+stored_base_rule_score = Σ(dimension_score × weight), dimension_score ∈ [0,10]   (∈ [0,8]; recency's 0.20 share is added later — see §6.3)
 ```
+
+**`event_type_score` enum mapping:**
+
+| `event_type_primary` | `event_type_score` |
+|---|---|
+| EARNINGS | 9.0 |
+| MA | 8.5 |
+| REGULATORY | 8.0 |
+| BUYBACK | 7.0 |
+| MANAGEMENT_CHANGE | 7.0 |
+| DIVIDEND | 6.0 |
+| ANALYST_RATING | 5.0 |
+| GENERAL_ANNOUNCEMENT | 4.0 |
+
+> EARNINGS/MA/REGULATORY/GENERAL_ANNOUNCEMENT come from PRD §12.1. BUYBACK/MANAGEMENT_CHANGE/DIVIDEND/ANALYST_RATING were added during TAD review, anchored to the existing four by typical HK-market price-impact materiality (BUYBACK/MANAGEMENT_CHANGE: strong but often secondary/variable-impact signals; DIVIDEND: meaningful but usually anticipated; ANALYST_RATING: re-rates already-public information, smallest average impact of the eight).
+
+> **Future enhancement — score model tuning via customer feedback:** This calibration (and the Rule Score model generally) is an MVP starting point, not derived from real HK market data. Post-MVP, `event_type_score` and the other dimension scores/weights should be revisited using customer/analyst feedback — e.g. manual re-ranking signals, realized price-impact correlation against `stock_impact_score` (§9.8's Option C analysis) — rather than treated as fixed. This is the same direction as PRD §3.3's "Analyst feedback loop: manual re-ranking feeds into dynamic weight adjustment" and §16.1's "Dynamic scoring weights via analyst feedback" Post-MVP item; `event_type_score` should be explicitly in scope when that feedback loop is designed.
+
+**`source_authority_score` and `source_heat_score` formulas:**
+
+```
+source_authority_score = MAX(source_authority_weight) over distinct source_name in event.source_list
+```
+
+> Uses MAX, not an average, and reuses the same precedent as §5.9's `BriefSummarySkill` fallback ("constituent EntityEvent with highest source authority"). An average would let a lower-tier source *dilute* an event a top-tier source already validated — e.g. an Event corroborated by HKEX + AASTOCKS + MINGPAO would score *lower* on authority under averaging than an Event HKEX alone reported, even though the first Event is objectively better-attested. That would also double-count against `source_heat_score`, which already rewards the same broader corroboration separately — PRD §8.2 treats "source credibility" and "corroboration breadth" as two independent signals, and MAX preserves that independence; averaging doesn't.
+
+```
+source_heat_score = min(10, (source_count / TOTAL_ACTIVE_SOURCES) × 10)
+TOTAL_ACTIVE_SOURCES = HLEN source:config
+```
+
+> Normalizes by the *live* count of active sources rather than a hardcoded constant, so it doesn't go stale if a 5th+ source is added post-MVP. `TOTAL_ACTIVE_SOURCES` is computed via `HLEN` in the same code path as the existing `source:config` refresh-on-miss flow (§1.5) — no new fetch needed, since that flow already guarantees the hash is fully populated before any read. `min(10, ...)` is defensive only; `source_count` can't exceed `TOTAL_ACTIVE_SOURCES` by construction.
+>
+> **Cold-start edge case:** if `source:config` is both cache-cold *and* Admin API is unreachable (dual failure, first-ever run), there's no hash to `HLEN` and the P1/P2/P3 fallback (§1.5) is tier-level, not a source count. Falls back to `TOTAL_ACTIVE_SOURCES_DEFAULT = 4` (matching today's 4 configured MVP sources) in that specific case only.
+>
+> **Validation note:** with only 4 MVP sources, this is coarse (each source is a 2.5-point jump) and untested against real cross-source corroboration rates — flagged as a Week 1/2 calibration item alongside Q-1/Q-2/Q-7-style validation questions, not solved here.
 
 Direction is applied in Score Fusion (Step 7), not in Rule Score (Step 6a). This keeps the two steps independent and parallel.
 
@@ -437,29 +483,28 @@ Direction is derived from `stock_impact_score` in Score Fusion, not from `sentim
 direction = sign(stock_impact_score)
     stock_impact_score > 0 → +1
     stock_impact_score < 0 → -1
-    stock_impact_score = 0 → derived from sentiment_label (fallback when llm_fallback=true)
+    stock_impact_score = 0 → sign(weighted_signed_score) from Sentiment Aggregation (§5.8); fallback when llm_fallback=true
 
 rule_score = base_rule_score × direction
 raw_final_score = rule_score × 0.67 + stock_impact_score × 0.33 × 2
 abs_final_score = |raw_final_score|
 ```
 
-> **Score cross-type comparability:** `event_type_score` (weight 0.30) assigns higher base scores to more impactful event types (EARNINGS=9.0, REGULATORY=8.0, GENERAL=4.0). This ensures `abs_final_score` is comparable across different `event_type_primary` values without additional normalisation.
+> **Persistence:** The computed `direction` (±1) is written to `event_scores.direction`. This lets the Cache Layer (§6.3) correctly reapply direction when recomputing `final_abs_final_score` with real-time recency, without re-deriving the sentiment fallback.
+
+> **Score cross-type comparability:** `event_type_score` (weight 0.30) assigns higher base scores to more impactful event types (EARNINGS=9.0, REGULATORY=8.0, GENERAL_ANNOUNCEMENT=4.0). This ensures `abs_final_score` is comparable across different `event_type_primary` values without additional normalisation.
 
 ### 5.8 Sentiment Aggregation
 
-Event-level sentiment is computed from all constituent EntityEvents, weighted by source authority from `source:config`. The result is used for display purposes (利好/利空/中性 label) and as a direction fallback when `llm_fallback=true`.
+Event-level sentiment is computed from all constituent EntityEvents, weighted by source authority from `source:config`. `weighted_signed_score` supplies the direction fallback used in Score Fusion (§5.7) when `stock_impact_score = 0` (`llm_fallback=true`). `sentiment_strength_score` feeds the Rule Score dimension (§5.6).
+
+> **Display label:** The Morning Brief's 利好/利空/中性 label is not computed or exposed by SAPI at all — see §6.6. The client derives it from the sign of `base_rule_score`, which already carries `event_scores.direction` (§6.3). This works uniformly regardless of `llm_fallback`, since `direction` (and therefore `base_rule_score`'s sign) is always set via the fallback derived here — the client never needs `stock_impact_score`'s sign specifically.
 
 ```
 signed_score = sentiment_score × direction_coefficient
     where POSITIVE=+1, NEUTRAL=0, NEGATIVE=-1
 
 weighted_signed_score = Σ(signed_score × source_authority_weight) ÷ Σ(source_authority_weight)
-
-sentiment_label:
-    weighted_signed_score > SENTIMENT_THRESHOLD   → POSITIVE
-    weighted_signed_score < -SENTIMENT_THRESHOLD  → NEGATIVE
-    otherwise                                      → NEUTRAL
 
 sentiment_strength_score:
     Σ(sentiment_score × source_authority_weight) ÷ Σ(source_authority_weight)
@@ -469,7 +514,7 @@ sentiment_strength_score:
 
 **BriefSummarySkill failure:** `summary_short` populated from `headline` of constituent EntityEvent with highest source authority; ties broken by latest `published_at`. `summary_full` set equal to `summary_short`. `key_numbers` set to empty list `[]`. Log warning `brief_summary_fallback`.
 
-**EventScoringSkill failure:** `stock_impact_score = 0`; `llm_fallback = true`; direction falls back to `sentiment_label` derived value; scoring continues. Log warning `event_scoring_fallback`.
+**EventScoringSkill failure:** `stock_impact_score = 0`; `llm_fallback = true`; direction falls back to `sign(weighted_signed_score)` from Sentiment Aggregation (§5.8); scoring continues. Log warning `event_scoring_fallback`.
 
 **EventScoringSkill receiving fallback input:** When `events.brief_output` was produced by BriefSummarySkill fallback, EventScoringSkill proceeds normally but records `input_from_fallback: true` in the `event_scoring_completed` log event. This flags the resulting score as potentially lower quality for monitoring purposes without affecting the business flow.
 
@@ -483,7 +528,7 @@ sentiment_strength_score:
 | `SCORING_MAX_RETRY` | Max delivery attempts before Dead Letter |
 | `SOURCE_CONFIG_TTL_S` | Source configuration cache TTL in Redis |
 | `MWP_ADMIN_API_URL` | Admin service API endpoint |
-| `SENTIMENT_THRESHOLD` | Threshold for classifying weighted_signed_score as POSITIVE or NEGATIVE |
+| `TOTAL_ACTIVE_SOURCES_DEFAULT` | Fallback source count for `source_heat_score` (§5.6) when `source:config` is cold and Admin API is unreachable simultaneously |
 
 ### 5.11 Error Handling
 
@@ -530,22 +575,24 @@ At each cache build, `recency_score` is computed for all Events using `event.agg
 recency_score = 10 × e^(-λ × hours_elapsed)
 hours_elapsed = now() - event.aggregation_updated_at
 
-final_base_rule_score = stored_base_rule_score + recency_score × recency_weight(0.20)
+final_base_rule_score = (stored_base_rule_score + recency_score × recency_weight(0.20)) × event_scores.direction
 final_abs_final_score = |final_base_rule_score × 0.67 + stock_impact_score × 0.33 × 2|
 ```
 
-Sorting uses `final_abs_final_score`. The stored `abs_final_score` in `event_scores` is a historical snapshot excluding recency.
+> `direction` is read from the persisted `event_scores.direction` column (§5.7, §10.3) — not recomputed from `sign(stock_impact_score)` — so the sentiment-derived fallback direction (used when `stock_impact_score = 0` under `llm_fallback=true`) is preserved correctly during recency recomputation.
+
+Sorting uses `final_abs_final_score`. The stored `abs_final_score` in `event_scores` is a historical snapshot excluding recency — and is also the value `NOISE_FILTER_THRESHOLD` gates on for cache inclusion (§6.4); recency affects only sort order, never membership.
 
 ### 6.4 Incremental Merge Rules
 
-Merge decisions use `final_abs_final_score` (real-time computed value including recency):
+Merge decisions (inclusion/exclusion) use the **stored** `abs_final_score` from `event_scores` — recency-excluded — not `final_abs_final_score`. `NOISE_FILTER_THRESHOLD` is a filter on intrinsic event impact, not freshness: whether an event is noteworthy enough to show shouldn't depend on how recently it happened, only on how significant it is. This also keeps the "first run" full DB fetch (§6.2, which necessarily filters before recency is ever computed) and incremental merge consistent with each other — the same event is gated by the same criterion regardless of whether it was present at cold start or arrives later via an update. Recency only affects **sort order** among already-included Events (§6.3), never membership — so decay alone can never silently remove an Event; only a genuine re-score (a new `stream:event_scored` message) can change inclusion status.
 
 | Condition | Action |
 |---|---|
-| Updated Event, `final_abs_final_score >= NOISE_FILTER_THRESHOLD`, already in cache | Replace |
-| Updated Event, `final_abs_final_score >= NOISE_FILTER_THRESHOLD`, not in cache | Insert |
-| Updated Event, `final_abs_final_score < NOISE_FILTER_THRESHOLD`, already in cache | Remove |
-| Updated Event, `final_abs_final_score < NOISE_FILTER_THRESHOLD`, not in cache | Ignore |
+| Updated Event, `abs_final_score >= NOISE_FILTER_THRESHOLD`, already in cache | Replace |
+| Updated Event, `abs_final_score >= NOISE_FILTER_THRESHOLD`, not in cache | Insert |
+| Updated Event, `abs_final_score < NOISE_FILTER_THRESHOLD`, already in cache | Remove |
+| Updated Event, `abs_final_score < NOISE_FILTER_THRESHOLD`, not in cache | Ignore |
 
 ### 6.5 Versioned Cache Replacement
 
@@ -578,7 +625,7 @@ Each item in the Morning Brief cache is a Scored Event. Top-level fields are use
         "source_count": 3,
         "source_list": [
             {
-                "source_name": "REUTERS",
+                "source_name": "MINGPAO",
                 "url": "https://...",
                 "published_at": "2025-01-15T00:00:00Z"
             }
@@ -594,6 +641,7 @@ Each item in the Morning Brief cache is a Scored Event. Top-level fields are use
     "score": {
         "stock_impact_score": 3.8,
         "llm_fallback": false,
+        "sentiment_label": "POSITIVE",
         "rule_score_detail": {
             "event_type_score": 9.0,
             "source_authority_score": 8.5,
@@ -609,7 +657,9 @@ Each item in the Morning Brief cache is a Scored Event. Top-level fields are use
 }
 ```
 
-> **`abs_final_score` and `base_rule_score`** are real-time computed values including `recency_score`, not the stored snapshots from `event_scores`.
+> **`abs_final_score` and `base_rule_score`** are real-time computed values including `recency_score`, not the stored snapshots from `event_scores`. **`base_rule_score` is signed** — it carries `event_scores.direction` (§6.3), positive for 利好 and negative for 利空. This is the field the client should use for the display direction label; sorting/tie-breaking (§6.2, §6.4) uses `|base_rule_score|`, not its raw signed value.
+
+> **No `sentiment_label`/direction-label field is exposed.** The 利好/利空 label is a display concern the client derives from the sign of `base_rule_score`, not computed or stored server-side. This works uniformly including when `llm_fallback=true`, since `direction` (and therefore `base_rule_score`'s sign) is always set via the Sentiment Aggregation fallback (§5.8) in that case.
 
 **Top-level field rationale:**
 
@@ -618,7 +668,7 @@ Each item in the Morning Brief cache is a Scored Event. Top-level fields are use
 | `exchange`, `stock_code` | Query filter conditions |
 | `event_type_primary` | Potential future filter condition |
 | `abs_final_score` | Primary sort key (includes real-time recency) |
-| `base_rule_score` | Secondary sort key for tie-breaking (includes real-time recency) |
+| `base_rule_score` | Signed (carries `direction`); `\|base_rule_score\|` used as secondary sort key for tie-breaking (includes real-time recency); sign is the client's source for the 利好/利空 display label |
 | `first_seen_at`, `last_seen_at` | Additional tie-breaking sort keys |
 
 **Excluded fields:** `nlp_output`, `aggregation_updated_at`, `updated_at`, `created_at`, `metadata`, `recency_score` — internal fields not relevant to Morning Brief display.
@@ -630,7 +680,7 @@ Each item in the Morning Brief cache is a Scored Event. Top-level fields are use
 | `CACHE_BATCH_SIZE` | Max messages per XREADGROUP read |
 | `CACHE_BATCH_TIMEOUT_MS` | XREADGROUP block timeout (ms) |
 | `CACHE_MAX_RETRY` | Max delivery attempts before Dead Letter |
-| `NOISE_FILTER_THRESHOLD` | Minimum `final_abs_final_score` for Morning Brief cache inclusion |
+| `NOISE_FILTER_THRESHOLD` | Minimum stored `abs_final_score` (recency-excluded) for Morning Brief cache inclusion — §6.4 |
 | `CACHE_ORPHAN_CLEANUP_INTERVAL_S` | Interval for scanning and deleting orphaned `morning_brief:v*` keys |
 
 ### 6.8 Error Handling
@@ -661,6 +711,7 @@ GET /health
 | `database` | ok / error | PostgreSQL connectivity |
 | `redis_stream` | ok / error | RedisStreamClient connectivity |
 | `redis_state` | ok / error | RedisStateClient connectivity |
+| `hkex_master_list` | ok / not_ready | HKEx master list readiness (§9.2.1). `ok` once loaded (entries > 0); `not_ready` at 0 entries — covers both "still loading" and "fetch failed," which aren't distinguished from cache state alone |
 | `layers.nlp` | ok / error | NLP Layer consumer coroutine status |
 | `layers.aggregation` | ok / error | Aggregation Layer consumer coroutine status |
 | `layers.scoring` | ok / error | Scoring Layer consumer coroutine status |
@@ -669,19 +720,19 @@ GET /health
 **HTTP response codes:**
 - All healthy → `200 healthy`
 - Any layer degraded → `200 degraded`
-- Database or Redis unreachable → `503 unhealthy`
+- Database or Redis unreachable, or `hkex_master_list` is `not_ready` → `503 unhealthy`
 
 > Post-MVP extension: add Dead Letter Stream backlog monitoring per layer to detect processing failures earlier.
 
 ### 7.2 Morning Brief Endpoint
 
 ```
-GET /morning-brief?stocks=00700,09988,03690&k=20
+GET /morning-brief?stocks=00700.HK,09988.HK,03690.HK&k=20
 ```
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `stocks` | string | Yes | Comma-separated HK stock codes from client watchlist |
+| `stocks` | string | Yes | Comma-separated HK stock codes from client watchlist, `.HK`-suffixed e.g. `00700.HK` — same canonical form as `events[].stock_code` and the client's own watchlist storage (PRD §3.2), no conversion needed either direction |
 | `k` | integer | No | Max results to return; default `TOP_K_DEFAULT = 20` |
 
 ### 7.3 Server Processing Logic
@@ -725,7 +776,7 @@ Return results
                 "source_count": 3,
                 "source_list": [
                     {
-                        "source_name": "REUTERS",
+                        "source_name": "MINGPAO",
                         "url": "https://...",
                         "published_at": "2025-01-15T00:00:00Z"
                     }
@@ -773,7 +824,7 @@ Return results
 ```json
 {
     "error": "system_error",
-    "error_code": "CACHE_UNAVAILABLE"
+    "error_code": "SAPI-5001"
 }
 ```
 
@@ -963,7 +1014,6 @@ Used exclusively by EntityAnalysisSkill. Executed by the Skill layer (async Redi
 | `stock_code` | string / null | Standardised stock code e.g. `00700.HK`; null when `found=false` |
 | `company_name_zh` | string / null | Chinese company name |
 | `company_name_en` | string / null | English company name |
-| `sector` | string / null | Sector classification matching PRD enum |
 
 **Execution logic (Skill layer):**
 
@@ -971,12 +1021,68 @@ Used exclusively by EntityAnalysisSkill. Executed by the Skill layer (async Redi
 Input: name_or_code
     ↓
 Format detection:
-├── Numeric only or contains .HK → query Redis by stock_code
-└── Text → fuzzy match query Redis by company_name
+├── Numeric only or contains .HK → exact lookup by stock_code (normalize first — below)
+└── Text → fuzzy name match (below)
     ↓
-Match found → return found=true + full fields
+Match found → return found=true + full fields (stock_code re-standardized to .HK form — below)
 No match    → return found=false + all other fields null
 ```
+
+**Code format normalization:** the master list's native format (both HKEXnews and the official "List of Securities") is a bare 5-digit zero-padded code, e.g. `"00700"` — no `.HK` suffix. `hkex:master_list` (§11.3.1) is keyed by this native form directly, with no transformation at load time. Two conversions happen only at the `lookup_stock` boundary:
+
+- **Inbound:** strip any non-digit characters from `name_or_code` (drops a `.HK` suffix if present), then zero-pad the remaining digits to 5 — `"700"`, `"0700"`, and `"00700.HK"` all normalize to the same key, `"00700"`, before the Redis lookup.
+- **Outbound:** the returned `stock_code` field appends `.HK` to the stored native code — `"00700"` → `"00700.HK"` — matching the format documented in the Return structure above.
+
+**Fuzzy name matching:** the master list (§9.2.1) is small (~2,000–2,600 equities after filtering) and loaded into SAPI's own process memory alongside the Redis cache — matching runs in-process, not against Redis, since Redis has no native fuzzy text search. No external fuzzy-matching library is needed; both steps below are cheap standard operations at this scale.
+
+```
+For each candidate (matched against company_name_zh or company_name_en per the query's script):
+    char_overlap_count = |multiset(query) ∩ multiset(candidate)|
+    overlap_ratio = char_overlap_count / len(query)
+
+Discard candidates where overlap_ratio < NAME_MATCH_MIN_OVERLAP_RATIO
+    → no candidates remain → found=false
+
+Among remaining candidates, rank by:
+    1. char_overlap_count DESC
+    2. lcs_length DESC   (longest common subsequence — order-preserving match strength; tie-break only)
+
+Pick top 1 → found=true
+```
+
+> `overlap_ratio` is normalized by `len(query)`, not the candidate's length — this is what makes a short, abbreviated query (e.g. `"阿里"` against `"阿里巴巴集團控股有限公司"`) score 100% regardless of how much longer the candidate name is, matching the common case of partial/abbreviated company names in news text.
+
+> **`NAME_MATCH_MIN_OVERLAP_RATIO` default: 0.6.** Deliberately on the stricter side rather than a loose 50/50 split — HK company names are short (2–6 characters, per examples already in this doc), and with ~2,000 candidates, a loose floor risks a generic/common character sequence (e.g. "地產" appearing across many property companies) producing a confident but wrong match. This is a starting value for the real-data validation pass (§14), not a calibrated one.
+
+### 9.2.1 HKEx Master List — Data Source & Caching
+
+**Primary source — HKEXnews's own bilingual stock-list JSON files** (verified live, no API key):
+
+```
+https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json   (English names)
+https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_c.json   (Chinese names)
+```
+
+Each returns `[{"i": internal_id, "c": stock_code, "n": name, "s": sort_key}, ...]` — ~17,900 entries, matched index-for-index by `c` across both files (e.g. `c="00001"` → `n="CKH HOLDINGS"` in the EN file, `n="長和"` in the ZH file). Same `hkexnews.hk` domain as the authoritative "List of Securities" file, so no cross-provider code-format reconciliation is needed for `stock_code`/`company_name_zh`/`company_name_en` — one source covers all three.
+
+> **Equity filtering:** the ~17,900 entries include every security type (equities, warrants, CBBCs, bonds, ETFs), not just companies. Cross-check against HKEX's official daily "List of Securities" download (`Category = Equity`) to exclude non-equity codes before loading into Redis.
+
+> **Risk:** both JSON files are undocumented endpoints (no published API contract, versioning, or SLA) — likely the data files powering HKEX's own website search widget, which makes them lower-risk than a scraped HTML page, but they could still change shape or move without notice. No fallback is currently specified if they do; revisit if this becomes a reliability issue in practice.
+
+> **`sector` is removed from `lookup_stock`/`EntityAnalysisSkill` entirely for MVP**, not just left unsourced. It had no scoring-critical or API-facing consumer (only reached an LLM prompt as loose context, and sat unqueried in `nlp_output` JSONB), and with no bulk source it would be null for effectively every entity — a nullable field that's almost always empty adds schema/prompt-handling complexity for no real benefit, and doesn't save any future work either: PRD §13.4 lists "Sector / stock filtering UI" as Post-MVP, and building that later requires the same wiring regardless of whether a dead placeholder field existed here in the meantime.
+
+**Ownership: SAPI owns the fetch/filter/write code; Admin owns triggering ongoing refreshes.** Two distinct triggers write the same cache, both executing the same code path:
+
+1. **SAPI startup (eager, blocking):** `main.py` fetches, filters, and populates the master list *before* the NLP Layer's consumer coroutine starts pulling work — same rationale as before: a missing master list silently fails every entity in the first batch (§9.3's loop just treats them as `found=false`, no error surfaced), so this cannot be lazy-on-first-call the way `source:config` (§1.5) is.
+2. **`POST /v1/hkex-master-list-sync` (Admin-triggered, ongoing):** a new SAPI endpoint that re-runs the same fetch/filter/write synchronously on request. Admin's scheduler calls this daily (00:00 UTC, matching the existing `watchlist-sync` slot) via a new `MASTER_LIST_SYNC` job type — see `admin-tad.md`. No request body; response `200 {"status": "success", "entries_loaded": N}` on success, `503` on fetch failure (existing cache is left untouched on failure — see below).
+
+**No TTL.** The Redis key(s) are persistent (no expiry), the same pattern as `morning_brief:version_counter` (§11.4) — they are only ever *replaced* by a successful run of trigger 1 or 2 above, never auto-evicted by Redis just because time passed. This is a deliberate choice: with ongoing refresh now depending on Admin's job firing (not a TTL check), a TTL would mean a delayed/failed Admin job silently empties the cache via Redis eviction — exactly the failure mode this design is trying to avoid. A companion key `hkex:master_list:last_refreshed_at` (mirroring `morning_brief:last_updated`, §11.4) tracks staleness for observability instead, without gating availability on it.
+
+> **Startup readiness gate:** while the master list is still 0 entries — whether the initial fetch is still in progress or has failed outright, a distinction not observable from cache state alone — `hkex_master_list` reports `not_ready` and `GET /health` reports `status: unhealthy` (`HTTP 503`), alongside `database`/`redis_stream`/`redis_state` in the health response (§7.1). This lets an orchestrator (k8s readiness probe or equivalent) correctly hold traffic until the list is actually usable. Since there's no TTL, this state is never entered due to staleness alone — only ever before the first successful load.
+
+> **On sync failure (either trigger):** log the error; leave the existing cache as-is (no partial overwrite, no eviction). A failed `POST /v1/hkex-master-list-sync` call returns `503` so Admin's job records it as `FAILED` — visible in `job_executions`, and `hkex:master_list:last_refreshed_at` stops advancing as the observability signal for "this hasn't synced in a while."
+
+This resolves §14 Q-14 in full — see Open Questions.
 
 ### 9.3 Function Calling Loop Control
 
@@ -1022,11 +1128,24 @@ LOOP:
 
     messages += [ASSISTANT(tool_calls=response.tool_calls), TOOL(tool_results=tool_results)]
 
-# Final structured output call
-output = generate_structured(messages, output_schema=EntityAnalysisOutput)
+# Final structured output call — LLM produces only LLMEntityRecord fields (§9.4);
+# company_name/exchange are not requested from the LLM at all
+output = generate_structured(messages, output_schema=LLMEntityAnalysisOutput)
 
 # Explicit stock verification filter — guarantees all output entities are verified
 output.entities = [e for e in output.entities if e.stock_code in verified_stocks]
+
+# Assemble final EntityRecord — company_name/exchange merged from verified_stocks,
+# never trusted from the LLM (verified_stocks[stock_code].company_name_zh is
+# authoritative; exchange is always "HKEX" in MVP scope)
+final_entities = [
+    EntityRecord(
+        **e.model_dump(),
+        company_name=verified_stocks[e.stock_code].company_name_zh,
+        exchange="HKEX",
+    )
+    for e in output.entities
+]
 ```
 
 ### 9.4 EntityAnalysisSkill
@@ -1094,20 +1213,20 @@ INPUT:
      監管機構宣佈就阿里巴巴（09988.HK）電商業務展開正式調查。
 
 TOOL CALLS:
-lookup_stock("騰訊控股") → {found: true, stock_code: "00700.HK", sector: "TECHNOLOGY"}
-lookup_stock("阿里巴巴") → {found: true, stock_code: "09988.HK", sector: "TECHNOLOGY"}
+lookup_stock("騰訊控股") → {found: true, stock_code: "00700.HK"}
+lookup_stock("阿里巴巴") → {found: true, stock_code: "09988.HK"}
 
 OUTPUT:
 entities: [
   {
-    stock_code: "00700.HK", company_name: "騰訊控股", sector: "TECHNOLOGY", exchange: "HKEX",
+    stock_code: "00700.HK",
     event_type_primary: "EARNINGS", event_type_secondary: null,
     sentiment_label: "POSITIVE", sentiment_score: 0.85,
     headline: "騰訊Q4廣告收入超預期32%",
     entity_summary: "騰訊控股第四季廣告收入按年增長32%，大幅超出市場預期，顯示廣告業務強勁復甦。"
   },
   {
-    stock_code: "09988.HK", company_name: "阿里巴巴", sector: "TECHNOLOGY", exchange: "HKEX",
+    stock_code: "09988.HK",
     event_type_primary: "REGULATORY", event_type_secondary: null,
     sentiment_label: "NEGATIVE", sentiment_score: 0.78,
     headline: "監管機構調查阿里電商業務",
@@ -1124,12 +1243,12 @@ INPUT:
      集團將採取更為審慎的擴張策略，暫緩部分非核心城市項目。
 
 TOOL CALLS:
-lookup_stock("碧桂園") → {found: true, stock_code: "02007.HK", sector: "PROPERTY"}
+lookup_stock("碧桂園") → {found: true, stock_code: "02007.HK"}
 
 OUTPUT:
 entities: [
   {
-    stock_code: "02007.HK", company_name: "碧桂園", sector: "PROPERTY", exchange: "HKEX",
+    stock_code: "02007.HK",
     event_type_primary: "GENERAL_ANNOUNCEMENT", event_type_secondary: "MANAGEMENT_CHANGE",
     sentiment_label: "NEGATIVE", sentiment_score: 0.62,
     headline: "碧桂園審慎擴張暫緩新項目",
@@ -1145,12 +1264,12 @@ INPUT:
 內文：香港交易所（00388.HK）公佈本年度董事會例行會議時間表，與往年安排基本一致。
 
 TOOL CALLS:
-lookup_stock("香港交易所") → {found: true, stock_code: "00388.HK", sector: "FINANCIALS"}
+lookup_stock("香港交易所") → {found: true, stock_code: "00388.HK"}
 
 OUTPUT:
 entities: [
   {
-    stock_code: "00388.HK", company_name: "香港交易所", sector: "FINANCIALS", exchange: "HKEX",
+    stock_code: "00388.HK",
     event_type_primary: "GENERAL_ANNOUNCEMENT", event_type_secondary: null,
     sentiment_label: "NEUTRAL", sentiment_score: 0.10,
     headline: "港交所公佈例行董事會日期",
@@ -1167,12 +1286,12 @@ INPUT:
      管理層同步下調全年盈利指引。
 
 TOOL CALLS:
-lookup_stock("舜宇光學") → {found: true, stock_code: "02382.HK", sector: "TECHNOLOGY"}
+lookup_stock("舜宇光學") → {found: true, stock_code: "02382.HK"}
 
 OUTPUT:
 entities: [
   {
-    stock_code: "02382.HK", company_name: "舜宇光學", sector: "TECHNOLOGY", exchange: "HKEX",
+    stock_code: "02382.HK",
     event_type_primary: "EARNINGS", event_type_secondary: null,
     sentiment_label: "NEGATIVE", sentiment_score: 0.58,
     headline: "舜宇光學收入增長惟毛利率收窄",
@@ -1184,12 +1303,14 @@ entities: [
 **Output Schema (Pydantic):**
 
 ```python
-class EntityRecord(BaseModel):
+# Instructor validates generate_structured's response against this schema —
+# the LLM is never asked for company_name or exchange. Both are mechanically
+# known once stock_code is verified (verified_stocks[stock_code]), so having
+# the LLM regenerate them would only add hallucination-transcription risk for
+# zero benefit — the same reasoning that keeps `sector` out of this schema
+# entirely (§9.2.1).
+class LLMEntityRecord(BaseModel):
     stock_code: str
-    company_name: str
-    sector: SectorEnum          # TECHNOLOGY | FINANCIALS | HEALTHCARE | CONSUMER |
-                                # ENERGY | PROPERTY | UTILITIES | INDUSTRIALS
-    exchange: Literal["HKEX"]
     event_type_primary: EventTypeEnum   # EARNINGS | BUYBACK | MA | REGULATORY |
                                         # MANAGEMENT_CHANGE | ANALYST_RATING |
                                         # DIVIDEND | GENERAL_ANNOUNCEMENT
@@ -1199,8 +1320,17 @@ class EntityRecord(BaseModel):
     headline: str                       # ≤20 Traditional Chinese characters
     entity_summary: str                 # ≤100 Traditional Chinese characters
 
+class LLMEntityAnalysisOutput(BaseModel):
+    entities: list[LLMEntityRecord]     # May be empty list; output_schema for generate_structured
+
+# Final record, assembled in §9.3 after the stock verification filter —
+# company_name and exchange are merged in from verified_stocks, not LLM output.
+class EntityRecord(LLMEntityRecord):
+    company_name: str                   # = verified_stocks[stock_code].company_name_zh
+    exchange: Literal["HKEX"]           # always "HKEX" in MVP scope
+
 class EntityAnalysisOutput(BaseModel):
-    entities: list[EntityRecord]        # May be empty list
+    entities: list[EntityRecord]        # final output — see §9.3 assembly step
 ```
 
 **Business constraint validation (post-Instructor, truncation policy):**
@@ -1223,7 +1353,7 @@ BriefSummarySkill receives the full list of constituent EntityEvent records quer
 
 ```
 【實體信息】
-stock_code, company_name, sector, event_type_primary, event_type_secondary
+stock_code, company_name, event_type_primary, event_type_secondary
 
 【各文章實體摘要】
 Selection rules (applied in order):
@@ -1298,7 +1428,7 @@ EventScoringSkill reads `events.brief_output` and constructs its own input. If `
 
 ```
 【實體信息】
-stock_code, company_name, sector, event_type_primary, event_type_secondary
+stock_code, company_name, event_type_primary, event_type_secondary
 
 【事件摘要（來自BriefSummarySkill）】
 summary_full: <brief_output.output.summary_full>
@@ -1566,12 +1696,12 @@ Written by NLP Layer. One record per entity per article. All fields are self-con
 | `sentiment_score` | FLOAT | No | Signal strength [0, 1]; Aggregation sentiment computation |
 | `headline` | TEXT | No | LLM-generated entity headline (Traditional Chinese, ≤20 chars); BriefSummarySkill fallback |
 | `entity_summary` | TEXT | No | LLM-generated entity-level summary (Traditional Chinese, ≤100 chars); BriefSummarySkill input |
-| `nlp_output` | JSONB | No | EntityAnalysisSkill output for this entity; structure: `{"version": "v1.0.0", "output": {"company_name": "...", "sector": "...", "event_type_secondary": "...", "headline": "...", "entity_summary": "..."}}` |
-| `metadata` | JSONB | No | Traceability: `{"cleaned_id": "uuid", "execution_id": "uuid"}` |
+| `nlp_output` | JSONB | No | EntityAnalysisSkill output for this entity; structure: `{"version": "v1.0.0", "output": {"company_name": "...", "event_type_secondary": "...", "headline": "...", "entity_summary": "..."}}` |
+| `metadata` | JSONB | No | Traceability: `{"cleaned_id": "uuid"}` |
 | `created_at` | TIMESTAMPTZ | No | Record creation time UTC |
 | `updated_at` | TIMESTAMPTZ | No | Last updated time UTC |
 
-> `event_type_secondary` and `company_name` and `sector` are stored in `nlp_output.output` only — they have no independent query requirement. `sentiment_label`, `sentiment_score`, `headline`, and `entity_summary` are promoted to independent columns because they are read directly by Aggregation Layer and Scoring Layer without JSONB parsing.
+> `event_type_secondary` and `company_name` are stored in `nlp_output.output` only — they have no independent query requirement. `sentiment_label`, `sentiment_score`, `headline`, and `entity_summary` are promoted to independent columns because they are read directly by Aggregation Layer and Scoring Layer without JSONB parsing.
 
 **Index strategy:**
 - `source_url` — unique index; `INSERT ON CONFLICT (source_url) DO NOTHING` for idempotency
@@ -1617,6 +1747,7 @@ Written by Scoring Layer via Upsert. One record per Event. Overwritten on each r
 | `abs_final_score` | FLOAT | No | Score Fusion result excluding recency; Cache Layer filter and sort |
 | `base_rule_score` | FLOAT | No | Unsigned weighted rule score excluding recency and direction; Cache Layer recency recomputation baseline |
 | `stock_impact_score` | FLOAT | No | EventScoringSkill output; Score Fusion direction computation; promoted to independent column for direct read without JSONB parsing |
+| `direction` | SMALLINT | No | ±1; Score Fusion direction (§5.7): `sign(stock_impact_score)`, or sentiment-derived when `stock_impact_score = 0` under `llm_fallback=true`. Persisted so the Cache Layer can reapply it during real-time recency recomputation (§6.3) without re-deriving the sentiment fallback |
 | `llm_fallback` | BOOLEAN | No | True if EventScoringSkill failed; direction falls back to sentiment_label; monitoring queries |
 | `rule_score_detail` | JSONB | No | Rule Score output; structure: `{"version": "v1.0.0", "output": {"event_type_score": 9.0, "source_authority_score": 8.5, "sentiment_strength_score": 8.5, "source_heat_score": 7.0}}` |
 | `llm_score_output` | JSONB | No | EventScoringSkill output; structure: `{"version": "v1.0.0", "output": {"stock_impact_score": 3.8, "adjustment_reason": "..."}}` |
@@ -1680,6 +1811,13 @@ TTL = `min(SLIDING_WINDOW_HOURS, remaining_lifespan)`. Expires naturally when sl
 | Key | Type | Description |
 |---|---|---|
 | `source:config` | HASH | `{source_name: authority_weight}`; TTL = `SOURCE_CONFIG_TTL_S`; auto-refreshed from Admin API on expiry; queried via `HMGET` for batch weight lookups |
+
+### 11.3.1 HKEx Master List
+
+| Key | Type | Description |
+|---|---|---|
+| `hkex:master_list` | HASH | `{stock_code: {company_name_zh, company_name_en, ...}}`, keyed by the native 5-digit code (e.g. `"00700"`, no `.HK` suffix — see §9.2's code format normalization); no TTL — see §9.2.1. Populated by SAPI startup and `POST /hkex-master-list-sync`; loaded into process memory by `lookup_stock` for fuzzy name matching (§9.2), and read directly for exact code lookups |
+| `hkex:master_list:last_refreshed_at` | TIMESTAMP | Time of last successful sync (startup or Admin-triggered); observability only, does not gate availability |
 
 ### 11.4 Cache Layer — Morning Brief
 
@@ -1851,6 +1989,7 @@ This lightweight mechanism handles coroutine crash recovery without requiring ha
 | `NLP_BATCH_TIMEOUT_MS` | 5000 | NLP XREADGROUP BLOCK timeout (ms) |
 | `NLP_MAX_CONCURRENT` | 10 | NLP Worker Pool concurrency limit |
 | `NLP_MAX_RETRY` | 3 | NLP max delivery attempts before Dead Letter |
+| `NAME_MATCH_MIN_OVERLAP_RATIO` | 0.6 | Minimum character-overlap ratio for `lookup_stock` fuzzy name matching |
 | `AGG_BATCH_SIZE` | 20 | Aggregation XREADGROUP COUNT |
 | `AGG_BATCH_TIMEOUT_MS` | 5000 | Aggregation XREADGROUP BLOCK timeout (ms) |
 | `AGG_MAX_CONCURRENT` | 20 | Max concurrent active Group Coroutines |
@@ -1863,12 +2002,12 @@ This lightweight mechanism handles coroutine crash recovery without requiring ha
 | `SCORING_BATCH_TIMEOUT_MS` | 10000 | Scoring XREADGROUP BLOCK timeout (ms) |
 | `SCORING_MAX_CONCURRENT` | 5 | Scoring Layer concurrency limit |
 | `SCORING_MAX_RETRY` | 3 | Scoring max delivery attempts before Dead Letter |
-| `SENTIMENT_THRESHOLD` | 0.1 | Threshold for classifying weighted sentiment as POSITIVE or NEGATIVE |
 | `SOURCE_CONFIG_TTL_S` | 3600 | Source configuration cache TTL (seconds) |
+| `TOTAL_ACTIVE_SOURCES_DEFAULT` | 4 | Fallback source count for `source_heat_score` when `source:config` is cold and Admin API is unreachable simultaneously; matches today's 4 configured MVP sources |
 | `CACHE_BATCH_SIZE` | 20 | Cache XREADGROUP COUNT |
 | `CACHE_BATCH_TIMEOUT_MS` | 5000 | Cache XREADGROUP BLOCK timeout (ms) |
 | `CACHE_MAX_RETRY` | 3 | Cache max delivery attempts before Dead Letter |
-| `NOISE_FILTER_THRESHOLD` | 3.0 | Minimum `final_abs_final_score` for Morning Brief cache inclusion |
+| `NOISE_FILTER_THRESHOLD` | 3.0 | Minimum stored `abs_final_score` (recency-excluded) for Morning Brief cache inclusion |
 | `CACHE_ORPHAN_CLEANUP_INTERVAL_S` | 3600 | Orphaned cache version cleanup interval (seconds) |
 | `RECENCY_DECAY_LAMBDA` | 0.1 | λ for recency score decay formula |
 | `DB_WRITE_MAX_RETRY` | 3 | Max DB write retry attempts |
@@ -1890,8 +2029,9 @@ sapi/
 │   ├── nlp/
 │   │   ├── nlp_service.py               # XREADGROUP consumer; batch orchestration; idempotency Set
 │   │   ├── worker_pool.py               # asyncio.Semaphore concurrency control
-│   │   ├── entity_analysis_skill.py     # EntityAnalysisSkill; Function Calling loop; stock verification filter
-│   │   └── lookup_stock.py              # lookup_stock tool execution; async Redis query
+│   │   ├── entity_analysis_skill.py     # EntityAnalysisSkill; Function Calling loop; stock verification filter; verified_stocks merge (§9.3)
+│   │   ├── lookup_stock.py              # lookup_stock tool; exact code lookup (Redis) + in-process fuzzy name matching (§9.2)
+│   │   └── hkex_master_list.py          # HKEXnews fetch + equity filter + Redis cache; startup load + POST /hkex-master-list-sync handler (§9.2.1)
 │   ├── aggregation/
 │   │   ├── aggregation_service.py       # XREADGROUP consumer; coroutine manager; DB flush; graceful shutdown
 │   │   ├── group_coroutine.py           # Per-group asyncio.Queue + sliding window merge
@@ -1905,7 +2045,8 @@ sapi/
 │   ├── cache/
 │   │   └── cache_service.py             # XREADGROUP consumer; incremental merge; recency recomputation; atomic versioned replacement; orphan cleanup
 │   ├── api/
-│   │   └── morning_brief.py             # GET /health + GET /morning-brief endpoints
+│   │   ├── morning_brief.py             # GET /health + GET /morning-brief endpoints
+│   │   └── hkex_master_list_sync.py     # POST /hkex-master-list-sync endpoint (§9.2.1); delegates to nlp/hkex_master_list.py
 │   ├── llm/
 │   │   ├── adapter.py                   # LLMAdapter abstract base class; standard data structures; exception types
 │   │   └── vertex_adapter.py            # Vertex AI implementation; generate_raw (google-genai SDK); generate_structured (Instructor)
@@ -1917,7 +2058,7 @@ sapi/
 │   │   └── state_client.py              # RedisStateClient — state storage
 │   ├── logger.py                        # Unified system logger; structlog; stdout JSON output
 │   ├── config.py                        # Environment variable loading
-│   └── main.py                          # Service entry point; Task creation + done_callback monitoring
+│   └── main.py                          # Service entry point; eager blocking HKEx master list fetch (§9.2.1) before Task creation; Task creation + done_callback monitoring
 ├── alembic/
 │   └── versions/
 │       └── 001_create_tables.py         # entity_events + events + event_entity_map + event_scores schema
@@ -1935,15 +2076,20 @@ sapi/
 | Q-1 | Validate batch size and timeout defaults against real throughput | Latency and efficiency tuning | Week 1 |
 | Q-2 | Validate `SCORING_MAX_CONCURRENT` against LLM API rate limits | Scoring Layer throughput | Week 1 |
 | Q-3 | Post-MVP: Dead Letter Stream consumption and reprocessing pipeline | Service reliability | Post-MVP |
-| Q-4 | Post-MVP: migrate source configuration from local defaults to Admin database | Source authority management | Post-MVP |
-| Q-5 | DB Write Failure unified retry implementation details | Implementation specification | Separate document |
+| Q-4 | ~~Post-MVP: migrate source configuration from local defaults to Admin database~~ | Source authority management | **Resolved** — stale; contradicted §1.5, which already specifies live Admin API integration as MVP (hardcoded P1/P2/P3 defaults are a fallback for Admin-unreachable only, not the MVP baseline). Admin's `GET /sources` is a resolved MVP contract (`admin-tad.md` §4.2). Weight *value* calibration (P1=9/P2=6/P3=4) is tracked separately in `admin-tad.md`'s own Q-4 and PRD OQ-2 |
+| Q-5 | ~~DB Write Failure unified retry implementation details~~ | Implementation specification | **Resolved** — stale; same issue as Q-4. §12.1 already fully specifies this (failure classification, retry parameters, exponential backoff formula) — nothing deferred to a separate document |
 | Q-6 | Post-MVP: entity_event_processing_status table for state machine tracking and quality monitoring | Observability | Post-MVP |
 | Q-7 | Validate `MAX_FC_ROUNDS=3` and `MAX_FC_RETRIES_PER_ENTITY=2` against real HK news data; adjust if LLM requires more rounds for cold-stock identification | EntityAnalysisSkill accuracy | Week 2 |
 | Q-8 | Validate BriefSummarySkill input character cap (200 chars total entity_summary) against real aggregated Events; adjust if key_numbers extraction quality is insufficient | BriefSummarySkill output quality | Week 2 |
 | Q-9 | Validate `RATE_LIMIT_BACKOFF_S=60` against actual Vertex AI rate limit reset window; adjust if provider reset is faster or slower | LLM throughput | Week 1 |
 | Q-10 | Post-MVP: Design quality monitoring Service — log ingestion pipeline, LLM-as-Judge evaluation for EntityAnalysisSkill and BriefSummarySkill, post-event price correlation analysis for EventScoringSkill (Option C) | LLM quality improvement | Post-MVP |
 | Q-11 | Validate `LLM_API_TIMEOUT_S=30` and `SADI_API_TIMEOUT_S=10` against real latency measurements in Week 1; Vertex AI asia-east1 median latency may differ from defaults | Latency tuning | Week 1 |
+| Q-12 | ~~`event_type_score` enum mapping (§5.6) is only defined for EARNINGS/MA/REGULATORY/GENERAL_ANNOUNCEMENT (per PRD §12.1). `BUYBACK`, `MANAGEMENT_CHANGE`, `ANALYST_RATING`, `DIVIDEND` have no assigned score~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — full 8-value mapping added in §5.6, with rationale. Flagged there as an MVP starting calibration to be revisited via customer/analyst feedback post-MVP (see PRD §3.3, §16.1) |
+| Q-13 | ~~`source_authority_score` and `source_heat_score` (§5.6) have no defined computation formula — only example output values exist.~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — formulas added in §5.6 (MAX for authority; `source_count / TOTAL_ACTIVE_SOURCES` for heat) |
+| Q-14 | ~~HKEx master list for `lookup_stock` (§9.2): no single free source provides `{stock_code, company_name_zh, company_name_en, sector}` in the required shape. Also unresolved: which service owns the ingestion job.~~ | Blocks EntityAnalysisSkill implementation | **Resolved** — see §9.2.1. Data source: HKEXnews's own bilingual JSON endpoints, cross-checked against the official "List of Securities" for equity filtering. `sector` removed from `lookup_stock`/`EntityAnalysisSkill` entirely (no consumer, no bulk source — see §9.2.1). Ownership: SAPI owns the fetch/filter/write code (eager blocking fetch at startup); Admin owns triggering ongoing refresh via a new `MASTER_LIST_SYNC` job calling `POST /v1/hkex-master-list-sync`. No TTL — persistent cache, replaced only on a successful sync. `GET /health` gates readiness on 0-entry state |
+| Q-15 | Validate `source_heat_score`'s `source_count / TOTAL_ACTIVE_SOURCES` formula (§5.6) against real cross-source corroboration rates. With only 4 MVP sources it's coarse (each source is a 2.5-point jump); untested whether Events typically get corroborated across multiple sources at all | `source_heat_score` calibration | Week 1-2 |
+| Q-16 | Validate `lookup_stock`'s fuzzy name-matching (§9.2) against real HK news article entity mentions — is `NAME_MATCH_MIN_OVERLAP_RATIO=0.6` correctly separating genuine abbreviated/partial company names from false-positive matches on generic shared characters (e.g. "地產" across property companies)? Adjust threshold, or add a top-2-candidate ambiguity margin check, based on findings | EntityAnalysisSkill accuracy; false-positive entity verification risk | Week 2 |
 
 ---
 
-*— End of Document | SAPI TAD v0.7 | Work in progress —*
+*— End of Document | SAPI TAD | Work in progress —*

@@ -17,11 +17,12 @@
 
 1. [Scheduler Framework](#1-scheduler-framework)
 2. [CrawlHandler](#2-crawlhandler)
-3. [Source API](#3-source-api)
-4. [Redis Stream Signal Specification](#4-redis-stream-signal-specification)
-5. [API](#5-api)
-6. [Deployment](#6-deployment)
-7. [Open Questions](#7-open-questions)
+3. [MasterListSyncHandler](#3-masterlistsynchandler)
+4. [Source API](#4-source-api)
+5. [Redis Stream Signal Specification](#5-redis-stream-signal-specification)
+6. [API](#6-api)
+7. [Deployment](#7-deployment)
+8. [Open Questions](#8-open-questions)
 
 ---
 
@@ -63,6 +64,7 @@ Stores job configuration. One record per named job. Modified by operators only.
 | `mingpao-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "MINGPAO"}` | 00:00 UTC | 1 / `HOUR` |
 | `aastocks-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "AASTOCKS"}` | 00:00 UTC | 1 / `HOUR` |
 | `yahoo-hk-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "YAHOO_HK"}` | 00:00 UTC | 1 / `HOUR` |
+| `hkex-master-list-sync` | `RECURRING` | `MASTER_LIST_SYNC` | `{}` | 00:00 UTC | 1 / `DAY` |
 
 > **HKEX:** Two daily executions — evening (14:00 UTC = 22:00 HKT, post-market) and morning (01:00 UTC = 09:00 HKT, pre-open). Both use `interval = 1 DAY`, generating exactly one trigger per day each.
 >
@@ -304,9 +306,45 @@ Logs a CRITICAL alert with fields: `job_id`, `execution_id`, `source_name`, `err
 
 ---
 
-## 3. Source API
+## 3. MasterListSyncHandler
 
-### 3.1 `data_sources` Table
+### 3.1 Overview
+
+`MASTER_LIST_SYNC` triggers SAPI's HKEx master list cache refresh (SAPI TAD §9.2.1) via a synchronous HTTP call. Unlike `CRAWL`, no Redis Stream await is needed — the operation (fetch, filter, Redis write) completes within a normal request/response cycle, so `execute()` just awaits the HTTP response directly.
+
+| handler_key | Handles |
+|---|---|
+| `MASTER_LIST_SYNC` | Daily HKEx master list cache refresh on SAPI |
+
+### 3.2 `init()`
+
+Same check as `CRAWL`'s `init()` (§2.2): query `job_executions` for an existing `RUNNING` record for this `job_id`; if found, insert a retry `PENDING` trigger and return `False`; otherwise return `True`.
+
+### 3.3 `execute()`
+
+```mermaid
+flowchart TD
+    A([execute called]) --> B[POST /v1/hkex-master-list-sync\non SAPI]
+    B --> C{Result?}
+    C -->|200| D([return normally])
+    C -->|503, timeout, or connection failure\ne.g. SAPI unreachable| E([raise MasterListSyncFailedError])
+```
+
+> `execute()` is subject to `Future.get(execution_timeout_s)` timeout enforced by `JobExecutor`, same as `CRAWL`. SAPI's own startup fetch (independent of this handler) means a failed or delayed sync here degrades freshness, not availability — see SAPI TAD §9.2.1. A connection failure (SAPI unreachable) is treated identically to a `503` response — both just raise and let the framework mark the execution `FAILED`; there is no separate error code for it, since there's no HTTP response to carry one.
+
+### 3.4 `complete_with_success()`
+
+No-op in MVP.
+
+### 3.5 `complete_with_error()`
+
+Logs a CRITICAL alert with fields: `job_id`, `execution_id`, `error_detail`.
+
+---
+
+## 4. Source API
+
+### 4.1 `data_sources` Table
 
 Stores configuration for all news sources. Owned and managed exclusively by Admin Service. SAPI is the sole read-only consumer via `GET /sources`.
 
@@ -345,11 +383,11 @@ Stores configuration for all news sources. Owned and managed exclusively by Admi
 > network, not the deployment target — revisit upward if Ming Pao's block
 > turns out to be network-specific once running from the real server.
 
-### 3.2 `GET /sources`
+### 4.2 `GET /sources`
 
 Returns all `is_active = true` source records. Consumed by SAPI for `authority_weight` lookup. Full API contract defined in API specification document.
 
-### 3.3 Consumer Caching
+### 4.3 Consumer Caching
 
 | Consumer | Fields used | Redis key | Fallback |
 |---|---|---|---|
@@ -357,7 +395,7 @@ Returns all `is_active = true` source records. Consumed by SAPI for `authority_w
 
 ---
 
-## 4. Redis Stream Signal Specification
+## 5. Redis Stream Signal Specification
 
 Admin Service consumes one Redis Stream produced by SADI, used by CrawlHandler `execute()` to detect crawl completion.
 
@@ -380,16 +418,16 @@ Dead Letter message fields: `execution_id`, `error_detail`, `delivery_count`, `f
 
 ---
 
-## 5. API
+## 6. API
 
-### 5.1 Endpoints (MVP)
+### 6.1 Endpoints (MVP)
 
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/health` | Service health check |
 | GET | `/sources` | Return all active source records; full API contract in API specification document |
 
-### 5.2 `GET /health` Response
+### 6.2 `GET /health` Response
 
 | Field | Values | Description |
 |---|---|---|
@@ -405,9 +443,9 @@ HTTP response codes:
 
 ---
 
-## 6. Deployment
+## 7. Deployment
 
-### 6.1 Tech Stack
+### 7.1 Tech Stack
 
 | Component | Choice | Rationale |
 |---|---|---|
@@ -419,7 +457,7 @@ HTTP response codes:
 | DB migration | Flyway | Standard migration tool for Spring Boot |
 | Containerisation | Docker | Independent deployment; docker-compose for local development |
 
-### 6.2 Container Configuration
+### 7.2 Container Configuration
 
 | Service | Image | Notes |
 |---|---|---|
@@ -427,7 +465,7 @@ HTTP response codes:
 | postgres | postgres:16-alpine | Shared with SADI and SAPI; persistent volume mounted |
 | redis | redis:7-alpine | Shared with SADI and SAPI |
 
-### 6.3 Environment Variables
+### 7.3 Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -436,6 +474,7 @@ HTTP response codes:
 | `SPRING_DATASOURCE_PASSWORD` | — | PostgreSQL password; required |
 | `SPRING_REDIS_URL` | — | Redis connection string; required |
 | `SADI_API_URL` | — | SADI service API endpoint; required |
+| `SAPI_API_URL` | — | SAPI service API endpoint; required for `MASTER_LIST_SYNC` |
 | `DEFAULT_EXECUTION_TIMEOUT_S` | 1800 | Global job execution timeout (seconds) |
 | `SCHEDULER_LOOP_INTERVAL_S` | 60 | Scheduler main loop wake interval (seconds) |
 | `TRIGGER_GENERATION_TIME` | 00:00 UTC | Daily trigger generation time |
@@ -444,7 +483,7 @@ HTTP response codes:
 | `STREAM_CLAIM_TIMEOUT_MS` | 30000 | Pending message idle time before XAUTOCLAIM redelivery (ms) |
 | `CRAWL_STREAM_MAX_RETRY` | 3 | Max delivery attempts for `stream:crawl_completed` before Dead Letter |
 
-### 6.4 Project Structure
+### 7.4 Project Structure
 
 ```
 admin/
@@ -455,7 +494,8 @@ admin/
 │   │   ├── TriggerGenerator.java        # RECURRING calculation; daily generation
 │   │   └── JobHandler.java              # JobHandler interface; JobContext class
 │   ├── handlers/
-│   │   └── CRAWL.java                   # class CRAWL implements JobHandler; reads source_name from job_params
+│   │   ├── CRAWL.java                   # class CRAWL implements JobHandler; reads source_name from job_params
+│   │   └── MASTER_LIST_SYNC.java        # class MASTER_LIST_SYNC implements JobHandler; POST /hkex-master-list-sync on SAPI
 │   ├── stream/
 │   │   └── CrawlCompletedConsumer.java  # XREADGROUP consumer for stream:crawl_completed; XAUTOCLAIM; Dead Letter
 │   ├── api/
@@ -478,7 +518,7 @@ admin/
 
 ---
 
-## 7. Open Questions
+## 8. Open Questions
 
 | # | Question | Impact | Target |
 |---|---|---|---|
