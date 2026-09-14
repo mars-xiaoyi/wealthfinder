@@ -90,7 +90,7 @@ Always read the relevant documents before implementing any feature. All design d
 - [x] System design documentation complete (SADI, SAPI, Admin)
 - [x] API specification complete
 - [x] SADI data source probe validated (all 4 sources pass)
-- [x] SADI service implementation — all 10 phases done: config, DB/Redis clients, models, 4 crawlers (HKEX, Ming Pao, AAStocks, Yahoo HK), cleaning pipeline, API routes, Alembic migrations, Dockerfile. 2 open questions remain unresolved in `progress.md` (Q-2: unvalidated `CLEAN_BODY_MIN_LENGTH`; Q-9: per-record DB round-trips, batching not designed) — do not implement around them.
+- [x] SADI service implementation — all 10 phases done: config, DB/Redis clients, models, 4 crawlers (HKEX, Ming Pao, AAStocks, Yahoo HK), cleaning pipeline, API routes, Alembic migrations, Dockerfile. Q-2 and Q-9 (previously open in `progress.md`) were both resolved 2026-09-14 via an 11-day real-traffic volume test — see `progress.md` (Open Questions): `CLEAN_BODY_MIN_LENGTH=50` validated as-is, and per-record DB batching determined not worth the complexity at observed volume.
 - [ ] SAPI service implementation — not started, design-only
 - [ ] Admin service implementation — not started, design-only, `admin/` directory does not exist yet
 - [x] Docker Compose setup — done for SADI (`sadi` + `postgres:16-alpine` + `redis:7-alpine`); not yet extended to SAPI/Admin

@@ -41,10 +41,10 @@ A hard bug class: the error code lied about the mechanism.
 - HKEX regex date parsing matched the wrong DOM text and produced
   `published_at=None` for 100% of rows before it was caught by an audit
   ([progress.md:107, Q-8](stock-assistant-data-ingestion/progress.md#L107)).
-- A timezone bucketing bug was caught *before* shipping: grouping by
-  `published_at` under Postgres's UTC session default would silently misfile
-  anything published HKT 00:00–07:59 into the previous day
-  ([volume-test-plan.md:185-192](stock-assistant-data-ingestion/docs/volume-test-plan.md#L185)).
+- A timezone bucketing bug was caught *before* shipping, while designing the
+  daily-volume SQL query for the SADI volume test: grouping by `published_at`
+  under Postgres's UTC session default would silently misfile anything
+  published HKT 00:00–07:59 into the previous day.
 
 Neither of these throws an exception — both need an engineer who distrusts "it ran
 without errors."
@@ -52,8 +52,7 @@ without errors."
 **e) Deciding what *not* to build yet.**
 Two open questions (Q-2 body-length threshold, Q-9 DB round-trip batching) were
 deliberately left unresolved rather than guessed at, and a volume-test plan was
-designed specifically to generate the missing data instead of debating it further
-([volume-test-plan.md:11-29](stock-assistant-data-ingestion/docs/volume-test-plan.md#L11)).
+designed specifically to generate the missing data instead of debating it further.
 The plan itself was later revised to *shrink* scope (dropped production-sizing as a
 goal) once the team realized SAPI doesn't exist yet, so hardware sizing now would be
 optimizing a step that might get thrown away.
@@ -72,7 +71,7 @@ optimizing a step that might get thrown away.
 | Recognizing "ran successfully" ≠ "worked" | (1c) and (1d) — both bugs passed at the HTTP-status level |
 | Timezone-correctness under implicit defaults | (1d), second bullet — Postgres session TZ silently defaulting to UTC |
 | Scoping a data-gathering exercise instead of guessing | Q-2/Q-9 handling, and the volume-test revision itself (1e) |
-| Infra cost/risk trade-off reasoning | Server choice in volume-test-plan — free ARM (Oracle) rejected due to unvalidated arm64 compatibility risk on an *unattended* 2-week run, spot instances rejected for reclaim risk, landed on GCP trial credit ([volume-test-plan.md:95-103](stock-assistant-data-ingestion/docs/volume-test-plan.md#L95)) |
+| Infra cost/risk trade-off reasoning | Server choice for the volume test — free ARM (Oracle) rejected due to unvalidated arm64 compatibility risk on an *unattended* 2-week run, spot instances rejected for reclaim risk, landed on GCP trial credit |
 
 ---
 
@@ -133,9 +132,7 @@ Pick based on what kind of interview you're prepping for:
   tracking one article's journey crawl → clean → NLP → brief across services.
 
 - **Infrastructure-as-code.** The volume-test GCP VM was created by hand with a
-  manual checklist
-  ([volume-test-plan.md:125-129](stock-assistant-data-ingestion/docs/volume-test-plan.md#L125)).
-  Terraform-ing that VM + firewall rule + docker-compose deploy is a small,
+  manual checklist. Terraform-ing that VM + firewall rule + docker-compose deploy is a small,
   realistic first IaC project with an existing manual process to compare against.
 
 - **CI/CD.** No pipeline exists yet — tests run manually (`pytest -m live` is

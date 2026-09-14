@@ -121,7 +121,7 @@ class HKEXCrawler(BaseCrawler):
             await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
 
             for click_idx in range(MAX_LOAD_MORE_CLICKS):
-                pagination_text = await page.text_content(PAGINATION_SELECTOR) or ""
+                pagination_text = await page.text_content(PAGINATION_SELECTOR, timeout=nav_timeout_ms) or ""
                 showing, total = self._parse_pagination_counts(pagination_text)
                 logger.debug(
                     "[hkex_crawler] Pagination state: showing=%d total=%d", showing, total

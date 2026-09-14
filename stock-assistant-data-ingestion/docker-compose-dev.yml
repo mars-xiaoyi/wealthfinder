@@ -1,5 +1,5 @@
-# Standalone dev-environment compose file — currently used to run the
-# 7-14 day volume test (see docs/volume-test-plan.md). Full copy of the base
+# Standalone dev-environment compose file — currently used to run a
+# 7-14 day volume test. Full copy of the base
 # docker-compose.yml services plus what an unattended multi-day run needs:
 # restart-on-crash and pg_stat_statements for Q-9 data collection. Kept as
 # one complete file (not a base+override merge) so the whole picture is
@@ -12,6 +12,12 @@ services:
   sadi:
     build: .
     restart: unless-stopped
+    # uvicorn runs as PID 1 with no init process in front of it, so orphaned
+    # Playwright/Chromium helper processes (chrome_crashpad) re-parent to PID 1
+    # and are never reaped — one zombie pair left behind per HKEX crawl,
+    # observed accumulating during a SADI volume test. `init: true` makes
+    # Docker insert tini as real PID 1, which does reap them.
+    init: true
     ports:
       - "8000:8000"
     env_file: .env
@@ -29,7 +35,7 @@ services:
     restart: unless-stopped
     # shared_preload_libraries requires this at server start; the extension
     # itself is created once via the mounted init script below. Feeds the
-    # Q-9 analysis in docs/volume-test-plan.md — no app code changes needed,
+    # Q-9 volume-test analysis (see progress.md) — no app code changes needed,
     # this is Postgres-side observability only.
     command: postgres -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all -c pg_stat_statements.max=1000
     environment:

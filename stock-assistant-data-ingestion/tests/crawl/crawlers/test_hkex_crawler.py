@@ -6,7 +6,11 @@ import pytest
 from app.config import CrawlConfig, CrawlSourceConfig
 from app.common.error_codes import CrawlErrorCode, DocumentParseErrorCode
 from app.crawl.exceptions import CrawlBlockedException, CrawlFatalException
-from app.crawl.crawlers.hkex_crawler import HKEXAnnouncement, HKEXCrawler
+from app.crawl.crawlers.hkex_crawler import (
+    PAGINATION_SELECTOR,
+    HKEXAnnouncement,
+    HKEXCrawler,
+)
 from app.crawl.parsers.pdf_parser import PdfEncryptedException, PdfParseException
 
 
@@ -501,6 +505,32 @@ class TestCollectAnnouncements:
         # Each click must be followed by wait_for_function polling the counter;
         # domcontentloaded is not a reliable signal for the LOAD MORE XHR.
         assert page.wait_for_function.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_pagination_read_uses_configured_nav_timeout(self):
+        # Regression test: text_content() used to be called with no timeout
+        # argument, silently falling back to Playwright's hardcoded 30000ms
+        # default instead of CRAWL_BROWSER_NAV_TIMEOUT_MS — unlike goto/click
+        # in this same method, which already passed timeout=nav_timeout_ms.
+        # Caused two real full-day HKEX outages during the 2026-09 volume
+        # test (see progress.md) before being caught and fixed here.
+        row = _make_fake_row(
+            pdf_href="/listedco/test.pdf",
+            headline="Title",
+            release="02/04/2026 22:59",
+            stock="00700",
+        )
+        page = _make_fake_page(
+            pagination_states=["Showing 2 of 2 records"], rows=[row]
+        )
+        bm = _make_fake_browser_manager(page)
+        crawler = make_crawler()  # nav timeout = 15000, per make_page_crawler()
+
+        await crawler._collect_announcements(bm, date(2026, 4, 2))
+
+        page.text_content.assert_called_once_with(
+            PAGINATION_SELECTOR, timeout=15000
+        )
 
 
 # ---------------------------------------------------------------------------
