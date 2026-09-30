@@ -14,7 +14,7 @@ Status: Draft · 2025-Q2 · MVP Scope
 
 ### 1.1 Product Definition
 
-An AI-driven Hong Kong equity research assistant system that automatically aggregates multi-source news, performs structured entity-level NLP enrichment, scores Entity-Event Pairs by relevance and urgency, and delivers a prioritised Morning Brief to professional buy-side and sell-side users.
+An AI-driven Hong Kong equity research assistant system that automatically aggregates multi-source news, performs structured entity-level analysis and enrichment, scores Entity-Event Pairs by relevance and urgency, and delivers a prioritised Morning Brief to professional buy-side and sell-side users.
 
 ### 1.2 Target Users
 
@@ -64,7 +64,7 @@ MVP operates in single-user mode. No authentication, no user database, no multi-
 
 ### 3.2 Stock Watchlist
 
-- User maintains a personal watchlist of HK stock codes (e.g. 00700.HK, 09988.HK)
+- User maintains a personal watchlist of bare HK stock codes, no exchange suffix (e.g. 00700, 09988) — same canonical form the server uses throughout (SAPI TAD §9.2); an exchange indicator (e.g. `HKEX`) is carried as its own field where needed, never folded into the code string
 
 - MVP: watchlist stored in local configuration file on client; passed as request parameter to server at query time
 
@@ -92,20 +92,20 @@ MVP operates in single-user mode. No authentication, no user database, no multi-
 
 *MVP Scope: Hong Kong equity news sources only. US market content (ADR post-market, Fed policy, sector contagion) is deferred to Post-MVP. See Section 13.2 for Post-MVP roadmap.*
 
-| **Source**               | **Type**         | **Language** | **Coverage**                   | **Priority** |
-|:-------------------------|:-----------------|:-------------|:-------------------------------|:-------------|
-| South China Morning Post | Web scrape / RSS | English      | HK market, macro, corporate    | P1           |
-| Reuters Asia             | RSS feed         | English      | Corp actions, earnings, M&A    | P1           |
-| Bloomberg HK (public)    | RSS / Web        | English      | Market-moving events           | P1           |
-| AAStocks 阿斯達克        | Web scrape       | Chinese      | HK-specific corp announcements | P2           |
-| HKEx NEWSLINE            | Official RSS     | Bilingual    | Regulatory filings, circulars  | P2           |
-| Yahoo Finance HK         | API / RSS        | English      | Earnings, analyst ratings      | P3           |
+| **Source**            | **Type**                | **Language**        | **Coverage**                                           | **Priority** |
+|:----------------------|:-------------------------|:---------------------|:--------------------------------------------------------|:-------------|
+| HKEX NEWSLINE          | Official filings (PDF)   | Bilingual (EN/ZH)    | Regulatory announcements & circulars, tagged by stock code | P1           |
+| Ming Pao 明報          | RSS (teaser only — see note) | Traditional Chinese  | General HK economy & corporate news                      | P2           |
+| AAStocks 阿斯達克      | Web scrape               | Traditional Chinese  | HK-specific stock/financial news                          | P2           |
+| Yahoo Finance HK       | RSS feed                 | English               | General finance news                                       | P2           |
+
+*This table reflects the 4 sources SADI actually implements (`CrawlSourceName`: `HKEX`/`MINGPAO`/`AASTOCKS`/`YAHOO_HK`), replacing this section's original v0.5 6-source plan (South China Morning Post, Reuters Asia, Bloomberg HK, AAStocks, HKEx NEWSLINE, Yahoo Finance HK) — SADI's docs don't state why the source list changed during implementation, only that it did. Priority tiers match Admin's live `data_sources` seed data (`admin-tad.md` §4.1); no source is currently seeded at P3. Ming Pao's body is currently a ~150–250 char RSS `<description>` teaser, not full article text, due to a Cloudflare block encountered on SADI's dev network (2026-08-31, `admin-tad.md` §4.1's revision note) — full-article fetch for HKEX, AAStocks, and Yahoo HK was unaffected; revisit Ming Pao upward if this proves network-specific once running from the real deployment target.*
 
 ### 4.2 Crawl Frequency & Strategy
 
 | **Job**        | **UTC Trigger** | **HKT Equivalent**           | **Crawl Window**                                              | **Actions**                                                                    |
 |:---------------|:----------------|:-----------------------------|:--------------------------------------------------------------|:-------------------------------------------------------------------------------|
-| morning-crawl  | 14:00 UTC       | 22:00 HKT (~6hrs post-close) | last_successful_run_at → 14:00 UTC (dynamic, not fixed hours) | Full pipeline: crawl P1+P2+P3 → clean → NLP → aggregate → score → cache        |
+| morning-crawl  | 14:00 UTC       | 22:00 HKT (~6hrs post-close) | last_successful_run_at → 14:00 UTC (dynamic, not fixed hours) | Full pipeline: crawl P1+P2+P3 → clean → Entity Analysis → aggregate → score → cache        |
 | pre-open-crawl | 00:30 UTC       | 08:30 HKT (pre-market)       | last_successful_run_at → 00:30 UTC                            | Incremental pipeline; refresh Morning Brief cache. Must complete by 01:00 UTC. |
 | watchlist-sync | 00:00 UTC daily | 08:00 HKT                    | n/a                                                           | Reload watchlist config from local file                                        |
 
@@ -118,7 +118,7 @@ MVP operates in single-user mode. No authentication, no user database, no multi-
 | **Field**     | **Type**        | **Description**                                    |
 |:--------------|:----------------|:---------------------------------------------------|
 | raw_id        | UUID            | Primary key, generated at ingest                   |
-| source_name   | String          | Canonical source identifier (e.g. SCMP, REUTERS)   |
+| source_name   | String          | Canonical source identifier (e.g. HKEX, MINGPAO)   |
 | source_url    | String          | Original article URL                               |
 | title         | String          | Article headline (raw)                             |
 | body          | Text            | Full article body text (raw, HTML-stripped)        |
@@ -133,7 +133,7 @@ MVP operates in single-user mode. No authentication, no user database, no multi-
 
 - Source unavailable: log failure, skip source for current run, alert on 3 consecutive failures
 
-- Partial content (paywall): store available content, flag partial=true; exclude from NLP layer
+- Partial content (paywall): store available content, flag partial=true; exclude from Entity Analysis layer
 
 - Encoding issues: normalise to UTF-8 at ingest; discard records with \>5% undecodable characters
 
@@ -158,7 +158,7 @@ Deduplication operates at two distinct layers. This section covers crawl-level d
 
 ### 5.1 News-Level De-duplication
 
-Applied immediately after crawl, before NLP processing. Only deterministic rules — no fuzzy matching at this layer.
+Applied immediately after crawl, before Entity Analysis processing. Only deterministic rules — no fuzzy matching at this layer.
 
 | **Rule**         | **Logic**                                                                                                                                         | **Action**                        |
 |:-----------------|:--------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------|
@@ -169,7 +169,7 @@ Applied immediately after crawl, before NLP processing. Only deterministic rules
 
 ### 5.2 Event-Level Aggregation
 
-After NLP processing, news records are grouped into Entity-Event Pairs. Each pair is the atomic unit for scoring and Morning Brief display.
+After Entity Analysis processing, news records are grouped into Entity-Event Pairs. Each pair is the atomic unit for scoring and Morning Brief display.
 
 *Key concept: An Entity-Event Pair is defined as: one stock entity (stock_code) + one primary event type (event_type_primary) + a time-bounded cluster of articles reporting on that combination. This is the natural grain for analyst consumption.*
 
@@ -210,22 +210,22 @@ Additionally, a hard cap prevents unbounded chain merging:
 | source_list          | Array of {source_name, url, published_at} — full traceability                                                            |
 | first_seen_at        | published_at of earliest constituent article (UTC)                                                                       |
 | last_seen_at         | published_at of most recent constituent article (UTC)                                                                    |
-| nlp_output           | JSONB: full EntityAnalysisSkill output for all constituent articles                                                      |
+| entity_analysis_output           | JSONB: full EntityAnalysisSkill output for all constituent articles                                                      |
 | summary_short        | BriefSummarySkill output: ≤30 Chinese chars or ≤20 English words                                                         |
 | summary_full         | BriefSummarySkill output: ≤150 words                                                                                     |
 | key_numbers          | BriefSummarySkill output: array of extracted numeric figures, max 3                                                      |
 | score_record         | JSONB: full EventScoringSkill + Rule Score output                                                                        |
 
-## 6 NLP Processing Layer
+## 6 Entity Analysis Processing Layer
 
 ### 6.1 Architecture: LLM-Primary + Function Calling + Skills
 
-The NLP layer is built on three complementary engineering patterns:
+The Entity Analysis layer is built on three complementary engineering patterns:
 
 | **Pattern**            | **Role in this system**                                                               | **Implementation**                                                                               |
 |:-----------------------|:--------------------------------------------------------------------------------------|:-------------------------------------------------------------------------------------------------|
 | Skills                 | Encapsulate NLP tasks as reusable, versioned prompt modules with stable I/O contracts | 3 Skills defined: EntityAnalysisSkill, BriefSummarySkill, EventScoringSkill                      |
-| Function Calling / MCP | Allow LLM to invoke external tools mid-generation for self-validation                 | lookup_stock() tool queries HKEx master list; defined per MCP spec for multi-model compatibility |
+| Function Calling / MCP | Allow LLM to invoke external tools mid-generation for self-validation                 | lookup_stock() tool queries HK Stock List; defined per MCP spec for multi-model compatibility |
 | Structured Output      | Force LLM output to conform to predefined JSON schema                                 | Gemini response_schema parameter; equivalent capability required for any Post-MVP model swap     |
 
 ### 6.2 Output Quality: Three-Layer Guarantee
@@ -233,10 +233,10 @@ The NLP layer is built on three complementary engineering patterns:
 | **Layer**                | **Mechanism**                                                                                                                                      | **Catches**                                                                                       |
 |:-------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------|
 | Layer 1 — Format         | response_schema enforces field presence, types, and Enum values                                                                                    | Missing fields, wrong types, out-of-enum values                                                   |
-| Layer 2 — Business Logic | System validation layer checks semantic correctness post-parse                                                                                     | score out of range, event_type_primary = event_type_secondary, stock_code not in HKEx master list |
-| Layer 3 — Fallback       | Parse failure or validation failure triggers one retry; if retry fails, record flagged nlp_failed=true and excluded from scoring and Morning Brief | Unrecoverable LLM output errors                                                                   |
+| Layer 2 — Business Logic | System validation layer checks semantic correctness post-parse                                                                                     | score out of range, event_type_primary = event_type_secondary, stock_code not in HK Stock List |
+| Layer 3 — Fallback       | Parse failure or validation failure triggers one retry; if retry fails, record flagged entity_analysis_failed=true and excluded from scoring and Morning Brief | Unrecoverable LLM output errors                                                                   |
 
-### 6.3 HKEx Master List — Data Source & Caching
+### 6.3 HK Stock List — Data Source & Caching
 
 - Source: HKEXnews's own bilingual stock-list JSON endpoints (`activestock_sehk_e.json` / `activestock_sehk_c.json` — free, no API key, no third-party dependency), cross-checked against HKEX's official daily "List of Securities" download to filter to equities only. See TAD §9.2.1 for the verified endpoints and filtering detail.
 
@@ -266,7 +266,7 @@ The NLP layer is built on three complementary engineering patterns:
 | entities                    | Array\<EntityRecord\> | Min 1 entity; all stock_codes validated via lookup_stock()                                                                                                                 |
 | entity.headline             | String (繁體中文)     | LLM-generated entity-level event headline; ≤20 Chinese characters; output in Traditional Chinese regardless of source language                                             |
 | entity.company_name         | String                | Non-empty                                                                                                                                                                  |
-| entity.stock_code           | String                | Must exist in HKEx master list (validated via Function Calling)                                                                                                            |
+| entity.stock_code           | String                | Must exist in HK Stock List (validated via Function Calling)                                                                                                            |
 | entity.exchange             | Enum                  | HKEX (MVP only)                                                                                                                                                            |
 | entity.event_type_primary   | Enum                  | EARNINGS \| BUYBACK \| MA \| REGULATORY \| MANAGEMENT_CHANGE \| ANALYST_RATING \| DIVIDEND \| GENERAL_ANNOUNCEMENT                                                         |
 | entity.event_type_secondary | Enum (nullable)       | Same allowed values as primary; must differ from primary if present; LLM outputs at most 1 value — most relevant secondary type only; enforced via Skill output constraint |
@@ -299,7 +299,7 @@ The NLP layer is built on three complementary engineering patterns:
 | Execution                          | Parallel with Rule Score calculation (Step 6a); both independent, merged in Score Fusion (Step 7)                                                                                                                                                                                                                                          |
 | Versioning                         | Skill version tracked; changes require score_version bump                                                                                                                                                                                                                                                                                  |
 
-### 6.5 NLP Output — Example JSON
+### 6.5 Entity Analysis Output — Example JSON
 
 ```json
 // EntityAnalysisSkill output (per article)
@@ -308,7 +308,7 @@ The NLP layer is built on three complementary engineering patterns:
     {
       "headline": "騰訊Q4廣告收入超預期",
       "company_name": "騰訊控股",
-      "stock_code": "00700.HK",
+      "stock_code": "00700",
       "exchange": "HKEX",
       "event_type_primary": "EARNINGS",
       "event_type_secondary": "BUYBACK",
@@ -318,7 +318,7 @@ The NLP layer is built on three complementary engineering patterns:
     {
       "headline": "監管機構就阿里電商業務展開調查",
       "company_name": "阿里巴巴",
-      "stock_code": "09988.HK",
+      "stock_code": "09988",
       "exchange": "HKEX",
       "event_type_primary": "REGULATORY",
       "event_type_secondary": null,
@@ -354,7 +354,7 @@ The following describes the complete journey from raw news source to Morning Bri
 |:---------|:--------------------|:-------------------------------------------------------------------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------------------------------------------------------|:-------------------------------------------------------------------------|
 | 1        | Crawl               | Source URLs / RSS feeds                                            | raw_news records (raw_id, title, body, published_at, raw_hash)                                                                                               | Scheduled trigger (morning-crawl or pre-open-crawl job) | Alert on source failure ≥3 consecutive runs; log crawl volume per source |
 | 2        | Clean & Dedup       | raw_news records                                                   | Deduplicated raw_news records (URL match + title hash match)                                                                                                 | Step 1                                                  | Log dedup rate; alert if \>80% dedup rate (possible crawler loop)        |
-| 3        | EntityAnalysisSkill | Deduplicated raw_news records (parallel processing)                | Per-article structured JSON: entities\[\] each with headline, stock_code, event_type_primary, event_type_secondary (max 1), sentiment_label, sentiment_score | Step 2; HKEx master list in Redis                       | Log nlp_failed rate; alert if \>10% failure rate                         |
+| 3        | EntityAnalysisSkill | Deduplicated raw_news records (parallel processing)                | Per-article structured JSON: entities\[\] each with headline, stock_code, event_type_primary, event_type_secondary (max 1), sentiment_label, sentiment_score | Step 2; HK Stock List in Redis                       | Log entity_analysis_failed rate; alert if \>10% failure rate                         |
 | 4        | Event Aggregation   | EntityAnalysisSkill outputs + published_at from raw_news           | Entity-Event Pair records with headline, source_list, source_count, first_seen_at, last_seen_at                                                              | Step 3                                                  | Log avg source_count per pair; alert on abnormal aggregation patterns    |
 | 5        | BriefSummarySkill   | Entity-Event Pair + representative article content                 | summary_short, summary_full, key_numbers per pair (all Traditional Chinese)                                                                                  | Step 4                                                  | Log generation failures; fallback: use entity.headline as summary_short  |
 | 6a       | Rule Score          | Entity-Event Pair metadata + 5 score dimensions (excl. pool_match) | base_rule_score (unsigned weighted sum); rule_score (signed: base_rule_score × direction_coefficient)                                                        | Step 4 (parallel with 6b)                               | —                                                                        |
@@ -371,7 +371,7 @@ flowchart TD
         A --> B["raw_news records"]
     end
 
-    subgraph NLP["NLP LAYER"]
+    subgraph EA["ENTITY ANALYSIS LAYER"]
         C["Step 3: EntityAnalysisSkill (parallel, per article)<br/>+ lookup_stock() via MCP Function Calling<br/>→ per-entity: stock_code, event_type, sentiment"]
     end
 
@@ -400,7 +400,7 @@ flowchart TD
     H --> I
 
     classDef layer fill:#f4f4f4,stroke:#999,stroke-width:1px;
-    class CRAWL,NLP,OUTPUT layer;
+    class CRAWL,EA,OUTPUT layer;
 ```
 
 ### 7.3 Inter-Step Data Contracts
@@ -409,8 +409,8 @@ Each step boundary is a defined data contract. Steps can be independently tested
 
 | **Boundary**         | **Contract**                                                                         | **Failure Mode**                                                                                            |
 |:---------------------|:-------------------------------------------------------------------------------------|:------------------------------------------------------------------------------------------------------------|
-| Step 2 → Step 3      | Deduplicated raw_news record with non-null title, body, published_at                 | NLP step skips records with null body; logs warning                                                         |
-| Step 3 → Step 4      | Valid EntityAnalysisSkill JSON with ≥1 entity; all stock_codes HKEx-validated        | Records with nlp_failed=true excluded from aggregation                                                      |
+| Step 2 → Step 3      | Deduplicated raw_news record with non-null title, body, published_at                 | Entity Analysis step skips records with null body; logs warning                                                         |
+| Step 3 → Step 4      | Valid EntityAnalysisSkill JSON with ≥1 entity; all stock_codes HKEx-validated        | Records with entity_analysis_failed=true excluded from aggregation                                                      |
 | Step 4 → Step 5/6    | Entity-Event Pair with ≥1 source article; non-null stock_code and event_type_primary | Pairs with missing required fields excluded from scoring                                                    |
 | Steps 6a+6b → Step 7 | rule_score (signed Float) and stock_impact_score (signed Float) both present         | If EventScoringSkill fails: stock_impact_score=0, llm_fallback=true; scoring continues with rule_score only |
 | Step 7 → Step 8      | abs_final_score (Float ≥ 0); complete score_record JSONB                             | Pairs with null abs_final_score excluded from cache                                                         |
@@ -443,6 +443,8 @@ Each step boundary is a defined data contract. Steps can be independently tested
 
 *Direction coefficient: derived from entity.sentiment_label → POSITIVE = +1, NEUTRAL = 0, NEGATIVE = −1. No separate direction field stored; direction always derivable from sentiment_label.*
 
+> **Superseded for the SAPI implementation.** Direction is instead derived from `sign(stock_impact_score)`, falling back to sentiment only when `stock_impact_score = 0` — more accurate in financial contexts, where news sentiment doesn't always align with price-impact direction. `direction` is persisted as its own column rather than left derivable from `sentiment_label`. See SAPI system-design.md §5.7/§5.8.
+
 *base_rule_score = Σ (dimension_score × weight) \[0, 10\]*
 
 *rule_score = base_rule_score × direction_coefficient \[−10, +10\]*
@@ -467,12 +469,14 @@ Each step boundary is a defined data contract. Steps can be independently tested
 
 *Direction reinforcement: when rule_score and stock_impact_score agree in direction, abs_final_score is higher (signals reinforce). When they conflict, abs_final_score is lower (signals attenuate) — correctly reducing confidence for ambiguous events. Direction for UI display is always derived from sentiment_label; raw_final_score need not be stored separately as it is fully derivable from abs_final_score + sentiment_label.*
 
+> **Superseded for the SAPI implementation** — see the note in §8.2 above. `raw_final_score`'s derivability claim here is likewise superseded: direction is no longer a pure function of `sentiment_label` alone, so reconstructing `raw_final_score` from `abs_final_score` + `sentiment_label` no longer holds. SAPI instead persists `direction` directly (`event_scores.direction`) rather than reconstructing it. See SAPI system-design.md §5.7.
+
 ### 8.5 Score Record Schema (Server-Persisted)
 
 | **Field**                | **Type**          | **Example**                                                                            |
 |:-------------------------|:------------------|:---------------------------------------------------------------------------------------|
 | event_id                 | UUID              | FK to events table                                                                     |
-| stock_code               | String            | 00700.HK                                                                               |
+| stock_code               | String            | 00700 (bare, no exchange suffix)                                                       |
 | event_type_primary       | Enum              | EARNINGS                                                                               |
 | sentiment_label          | Enum              | POSITIVE — used to derive direction (+1/0/−1) for display and raw score reconstruction |
 | event_type_score         | Float             | 9.0 (unsigned dimension score)                                                         |
@@ -500,7 +504,7 @@ Each step boundary is a defined data contract. Steps can be independently tested
 
 **Client request:**
 
-- Client sends: GET /morning-brief?stocks=00700.HK,09988.HK,03690.HK&k=20
+- Client sends: GET /morning-brief?stocks=00700,09988,03690&k=20
 
 - Server response: returns Top K pairs prioritising watchlist-matching stocks; appends highest abs_final_score non-matching pairs if fewer than K matches found
 
@@ -523,7 +527,7 @@ Each step boundary is a defined data contract. Steps can be independently tested
 | **Responsibility**              | **Server**   | **Client**                                                         |
 |:--------------------------------|:-------------|:-------------------------------------------------------------------|
 | News crawling & cleaning        | ✓            | —                                                                  |
-| EntityAnalysisSkill (NLP)       | ✓            | —                                                                  |
+| EntityAnalysisSkill             | ✓            | —                                                                  |
 | Event Aggregation               | ✓            | —                                                                  |
 | BriefSummarySkill               | ✓            | —                                                                  |
 | Rule Score (5 dimensions)       | ✓            | —                                                                  |
@@ -543,10 +547,10 @@ Each step boundary is a defined data contract. Steps can be independently tested
 **Morning Brief Request:**
 
 ```
-GET /morning-brief?stocks=00700.HK,09988.HK,03690.HK&k=20
+GET /morning-brief?stocks=00700,09988,03690&k=20
 
 Parameters:
-stocks — comma-separated HK stock codes from client watchlist, .HK-suffixed (same canonical form as stored pairs — no conversion needed either direction)
+stocks — comma-separated bare HK stock codes from client watchlist, no exchange suffix (same canonical form as stored pairs — no conversion needed either direction)
 k — number of pairs to return (client TOP_K_DEFAULT)
 ```
 
@@ -584,8 +588,8 @@ k — number of pairs to return (client TOP_K_DEFAULT)
 
 | **Requirement**               | **Purpose**                                                                                         | **Characteristics**                                                                                                |
 |:------------------------------|:----------------------------------------------------------------------------------------------------|:-------------------------------------------------------------------------------------------------------------------|
-| Persistent structured storage | Store raw news, Entity-Event Pairs, NLP outputs, score records, watchlist                           | Relational; ACID; supports JSONB for flexible NLP output schema; queryable by stock_code, event_type, published_at |
-| Low-latency cache             | Serve Morning Brief Top K to frontend without re-querying DB; store HKEx master list for NLP lookup | Sub-10ms read; key-value; TTL-based expiry; survives pipeline restarts                                             |
+| Persistent structured storage | Store raw news, Entity-Event Pairs, Entity Analysis outputs, score records, watchlist                           | Relational; ACID; supports JSONB for flexible Entity Analysis output schema; queryable by stock_code, event_type, published_at |
+| Low-latency cache             | Serve Morning Brief Top K to frontend without re-querying DB; store HK Stock List for Entity Analysis lookup | Sub-10ms read; key-value; TTL-based expiry; survives pipeline restarts                                             |
 | Local configuration           | Store watchlist, system config parameters, Skills prompt templates                                  | File-based in MVP; version-controlled                                                                              |
 
 ### 10.2 Data Retention Requirements
@@ -596,7 +600,7 @@ k — number of pairs to return (client TOP_K_DEFAULT)
 
 - Morning Brief cache: TTL = until next pipeline run completes; stale cache served with staleness timestamp on failure
 
-- HKEx master list cache: no expiry (persistent); replaced only on a successful SAPI startup fetch or a successful daily `watchlist-sync` job trigger (see §6.3)
+- HK Stock List cache: no expiry (persistent); replaced only on a successful SAPI startup fetch or a successful daily `watchlist-sync` job trigger (see §6.3)
 
 *Design Decision — No Object Storage: Raw HTML snapshots are not stored. News content has a short utility window; NLP model/Skills upgrades do not require reprocessing of historical articles. Cleaned article body in raw_news record is sufficient for all traceability needs.*
 
@@ -610,7 +614,7 @@ k — number of pairs to return (client TOP_K_DEFAULT)
 |:---------------|:----------------|:----------|:--------------------------------------------------------------|
 | morning-crawl  | 14:00 UTC       | 22:00 HKT | Full pipeline run; captures post-close announcement peak      |
 | pre-open-crawl | 00:30 UTC       | 08:30 HKT | Incremental run; final Morning Brief ready before market open |
-| watchlist-sync | 00:00 UTC       | 08:00 HKT | Reload watchlist + trigger SAPI's HKEx master list cache refresh (SAPI's own startup fetch is independent, but ongoing freshness after day one depends on this job; see §6.3) |
+| watchlist-sync | 00:00 UTC       | 08:00 HKT | Reload watchlist + trigger SAPI's HK Stock List cache refresh (SAPI's own startup fetch is independent, but ongoing freshness after day one depends on this job; see §6.3) |
 
 ### 11.2 Pipeline Step Sequence
 
@@ -618,24 +622,24 @@ k — number of pairs to return (client TOP_K_DEFAULT)
 |:---------|:------------------------------------------------------|:-----------------------------------------------------------------|
 | 1        | Crawl all configured sources                          | Crawl layer: alert on source failure ≥3 consecutive runs         |
 | 2        | Clean & deduplicate (news level)                      | —                                                                |
-| 3        | EntityAnalysisSkill — parallel processing per article | NLP layer: alert if nlp_failed rate \>10%                        |
+| 3        | EntityAnalysisSkill — parallel processing per article | Entity Analysis layer: alert if entity_analysis_failed rate \>10%                        |
 | 4        | Event Aggregation — sliding window merge              | —                                                                |
 | 5        | BriefSummarySkill — per Entity-Event Pair             | —                                                                |
 | 6        | Rule Score + EventScoringSkill — parallel             | Scoring layer: alert if llm_fallback rate \>20%                  |
 | 7        | Score Fusion — merge rule_score and model_adjustment  | —                                                                |
 | 8        | Filter → Top K → Redis cache refresh                  | Alert if cache write fails; serve stale with staleness timestamp |
 
-*Health Check Design: Health checks are cross-cutting concerns, defined per layer (Crawl / NLP / Scoring), not as a single terminal pipeline step. Specific metrics, alert thresholds, and monitoring tooling are TAD concerns.*
+*Health Check Design: Health checks are cross-cutting concerns, defined per layer (Crawl / Entity Analysis / Scoring), not as a single terminal pipeline step. Specific metrics, alert thresholds, and monitoring tooling are TAD concerns.*
 
 ### 11.3 Failure & Degradation Strategy
 
 | **Failure**                                  | **Behaviour**                                                                                                                   |
 |:---------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------|
 | Single source unavailable                    | Skip source; continue pipeline; log warning; alert on 3 consecutive failures                                                    |
-| EntityAnalysisSkill failure (single article) | Mark nlp_failed=true; exclude from aggregation; pipeline continues                                                              |
+| EntityAnalysisSkill failure (single article) | Mark entity_analysis_failed=true; exclude from aggregation; pipeline continues                                                              |
 | EventScoringSkill failure (single pair)      | Set model_adjustment=0, llm_fallback=true; rule score used as final score                                                       |
 | Full pipeline failure                        | Serve previous Morning Brief from Redis cache; display staleness timestamp to user                                              |
-| HKEx master list sync failure                | Use stale Redis cache; pipeline continues with stale_hkex_data=true flag in health log; Post-MVP: alert on consecutive failures |
+| HK Stock List sync failure                | Use stale Redis cache; pipeline continues with stale_hkex_data=true flag in health log; Post-MVP: alert on consecutive failures |
 | Score version change                         | Re-score only pairs created after version change; historical scores preserved with version tag                                  |
 
 ## 12 System Configuration Parameters
@@ -650,15 +654,21 @@ k — number of pairs to return (client TOP_K_DEFAULT)
 | EVENT_MAX_TIMESPAN_HOURS     | 24          | 12–72 hrs | Yes            | Hard cap on total time span of a single Entity-Event Pair                                                                    |
 | NOISE_FILTER_THRESHOLD (T)   | 3.0         | 0–10      | Yes            | Pairs with base_final_score below T excluded from cache                                                                      |
 | RECENCY_DECAY_LAMBDA (λ)     | 0.1         | 0.05–0.5  | Yes            | Controls speed of recency score decay. Higher = faster decay.                                                                |
-| SOURCE_AUTHORITY_P1          | 9.0         | 0–10      | Yes            | Authority score for P1 sources (Bloomberg, Reuters, SCMP)                                                                    |
-| SOURCE_AUTHORITY_P2          | 6.0         | 0–10      | Yes            | Authority score for P2 sources (AAStocks, HKEx NEWSLINE)                                                                     |
-| SOURCE_AUTHORITY_P3          | 4.0         | 0–10      | Yes            | Authority score for P3 sources (Yahoo Finance HK)                                                                            |
+| SOURCE_AUTHORITY_P1          | 9.0         | 0–10      | Yes            | Authority score for P1 sources (HKEX NEWSLINE)                                                                               |
+| SOURCE_AUTHORITY_P2          | 6.0         | 0–10      | Yes            | Authority score for P2 sources (Ming Pao, AAStocks, Yahoo Finance HK)                                                        |
+| SOURCE_AUTHORITY_P3          | 4.0         | 0–10      | Yes            | Authority score for P3 sources — no source currently seeded at this tier (§4.1)                                              |
 | EVENT_TYPE_WEIGHT_EARNINGS   | 9.0         | 0–10      | Yes            | event_type_score for EARNINGS events                                                                                         |
 | EVENT_TYPE_WEIGHT_MA         | 8.5         | 0–10      | Yes            | event_type_score for M&A events                                                                                              |
 | EVENT_TYPE_WEIGHT_REGULATORY | 8.0         | 0–10      | Yes            | event_type_score for REGULATORY events                                                                                       |
+| EVENT_TYPE_WEIGHT_BUYBACK           | 7.0  | 0–10      | Yes            | event_type_score for BUYBACK events *(added post-v0.5 — see note below)*                                                     |
+| EVENT_TYPE_WEIGHT_MANAGEMENT_CHANGE | 7.0  | 0–10      | Yes            | event_type_score for MANAGEMENT_CHANGE events *(added post-v0.5 — see note below)*                                           |
+| EVENT_TYPE_WEIGHT_DIVIDEND          | 6.0  | 0–10      | Yes            | event_type_score for DIVIDEND events *(added post-v0.5 — see note below)*                                                    |
+| EVENT_TYPE_WEIGHT_ANALYST_RATING    | 5.0  | 0–10      | Yes            | event_type_score for ANALYST_RATING events *(added post-v0.5 — see note below)*                                              |
 | EVENT_TYPE_WEIGHT_GENERAL    | 4.0         | 0–10      | Yes            | event_type_score for GENERAL_ANNOUNCEMENT events                                                                             |
 | MAX_RETRY_ATTEMPTS           | 3           | 1–5       | No             | Max retries for crawl and LLM calls (exponential backoff with jitter)                                                        |
 | SCORE_VERSION                | v1.0.0      | semver    | No             | Defined in Skill; bumped automatically on Skill prompt or weight changes; historical scores preserved with their version tag |
+
+*`EVENT_TYPE_WEIGHT_BUYBACK`/`_MANAGEMENT_CHANGE`/`_DIVIDEND`/`_ANALYST_RATING`: this table originally specified only the four event types above (EARNINGS/MA/REGULATORY/GENERAL) — these four were added during SAPI design review to cover the full 8-value `event_type_primary` enum (§6.4.1), anchored to the original four by typical HK-market price-impact materiality. See SAPI system-design.md §5.6 for the full rationale.*
 
 ### 12.2 Client-Side Parameters
 
@@ -695,7 +705,7 @@ Each Entity-Event Pair is displayed as a card. Card content (MVP):
 
 - Full source list with links and publication timestamps
 
-- Raw NLP output JSON (collapsible — developer/demo mode)
+- Raw Entity Analysis output JSON (collapsible — developer/demo mode)
 
 ### 13.3 Morning Brief Refresh
 
@@ -732,21 +742,21 @@ Every output the system produces must be traceable back to its inputs. Explainab
 | **Level**       | **Audience**          | **Content**                                                                                                                                                               | **Access**                               |
 |:----------------|:----------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------------------------------|
 | Analyst-facing  | Equity analyst        | Score breakdown (5 rule dimensions + stock_impact_score + abs_final_score), adjustment_reason, direction label (利好/利空/中性), source list, source_count, first_seen_at | Detail View in frontend                  |
-| System-internal | Engineers / operators | LLM call logs (prompt + response, truncated), Skills version, score_version, nlp_failed flags, llm_fallback flags                                                         | System logs + DB only; not exposed in UI |
+| System-internal | Engineers / operators | LLM call logs (prompt + response, truncated), Skills version, score_version, entity_analysis_failed flags, llm_fallback flags                                                         | System logs + DB only; not exposed in UI |
 
 ### 14.3 Traceability Chain
 
 | **Layer**   | **What is stored**                                                    | **Enables**                                                                          |
 |:------------|:----------------------------------------------------------------------|:-------------------------------------------------------------------------------------|
 | Crawl       | raw_news record: source, URL, title, body, published_at, raw_hash     | Re-identify original article; verify crawl timestamp                                 |
-| NLP         | EntityAnalysisSkill JSON output stored in events.nlp_output (JSONB)   | Audit entity recognition, event classification, per-entity sentiment for any article |
+| Entity Analysis | EntityAnalysisSkill JSON output stored in events.entity_analysis_output (JSONB)   | Audit entity recognition, event classification, per-entity sentiment for any article |
 | Aggregation | event_news_map linking all source articles to their Entity-Event Pair | Show analyst all original sources; verify aggregation correctness                    |
 | Scoring     | Complete score_record with all sub-scores + score_version             | Explain why pair A ranked above pair B; reproduce scoring with same inputs           |
 | LLM Calls   | Prompt + response logged per Skill invocation (system-internal only)  | Debug model adjustment; detect prompt regression after Skills version change         |
 
 ### 14.4 'Why is this \#1?' — Analyst-Facing Explanation
 
-*Example explanation rendered in Detail View for a top-ranked Entity-Event Pair: "This event ranked \#1 because: EARNINGS event type (weight 0.30, score 9.0), reported by Bloomberg and Reuters (source authority weight 0.25, score 8.5), published 45 minutes ago (recency score 9.2), strongly positive sentiment (sentiment strength 8.5). base_rule_score = 8.65; direction = POSITIVE (+1); rule_score = +8.65. AI impact score: +3.8 — 業績顯著超預期，回購規模反映管理層對前景高度信心. abs_final_score = \|8.65×0.67 + 3.8×0.33×2\| = 7.13. 00700.HK is in your watchlist — pool_match boost ×1.2 applied: final_score = 8.56."*
+*Example explanation rendered in Detail View for a top-ranked Entity-Event Pair: "This event ranked \#1 because: EARNINGS event type (weight 0.30, score 9.0), reported by Bloomberg and Reuters (source authority weight 0.25, score 8.5), published 45 minutes ago (recency score 9.2), strongly positive sentiment (sentiment strength 8.5). base_rule_score = 8.65; direction = POSITIVE (+1); rule_score = +8.65. AI impact score: +3.8 — 業績顯著超預期，回購規模反映管理層對前景高度信心. abs_final_score = \|8.65×0.67 + 3.8×0.33×2\| = 7.13. 00700 is in your watchlist — pool_match boost ×1.2 applied: final_score = 8.56."*
 
 ## 15 Core Design Decisions & Rationale
 
@@ -754,7 +764,7 @@ This section documents key architectural decisions made during requirements anal
 
 | **\#** | **Decision**                                  | **Chosen**                                                                                   | **Alternatives**                                         | **Rationale**                                                                                                                                                                           |
 |:-------|:----------------------------------------------|:---------------------------------------------------------------------------------------------|:---------------------------------------------------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| D-1    | NLP Implementation                            | LLM-primary + Function Calling validation (Method C)                                         | A: Pure LLM; B: lightweight specialist models            | Balances simplicity with engineering correctness. Validation prevents hallucination propagation. Maps to clear service boundary.                                                        |
+| D-1    | Entity Analysis Implementation                | LLM-primary + Function Calling validation (Method C)                                         | A: Pure LLM; B: lightweight specialist models            | Balances simplicity with engineering correctness. Validation prevents hallucination propagation. Maps to clear service boundary.                                                        |
 | D-2    | Scoring Architecture                          | Rule score dominant (0.67) + LLM model adjustment (0.33)                                     | Pure ML scoring; equal weighting                         | Rules provide stability, auditability, financial domain logic. LLM provides semantic nuance. Each layer independently testable.                                                         |
 | D-3    | Scoring grain                                 | Entity-Event Pair (post-aggregation)                                                         | Score individual articles                                | Prevents same event occupying multiple Top K slots. source_count becomes meaningful heat signal. Matches analyst mental model.                                                          |
 | D-4    | Score sub-field storage                       | Every dimension score stored independently                                                   | Store only final_score                                   | Explainability requirement is non-negotiable for professional users. Enables future weight tuning without re-running pipeline.                                                          |
@@ -763,7 +773,7 @@ This section documents key architectural decisions made during requirements anal
 | D-7    | UTC timestamps only                           | All internal timestamps UTC                                                                  | Store HKT; handle timezone at DB level                   | Eliminates DST edge cases. HKT conversion is display-layer concern only.                                                                                                                |
 | D-8    | LLM Provider                                  | Google Gemini (MVP); pluggable adapter pattern                                               | OpenAI only; hardcoded                                   | Adapter interface abstracts provider. Switching to Claude, GPT-4, or local models requires only new adapter implementation.                                                             |
 | D-9    | Entity-Event Pair as scoring unit             | event_id maps 1:1 to Entity-Event Pair                                                       | Separate pair concept from event                         | Event aggregation rules (same stock_code + same event_type_primary + time window) naturally produce Entity-Event Pairs. No separate abstraction needed.                                 |
-| D-10   | NLP layer architecture                        | Two-stage serial: EntityAnalysisSkill → BriefSummarySkill                                    | Original: 4 parallel tasks + 1 serial                    | Entity recognition is prerequisite for per-entity sentiment and classification. Combining into one Skill eliminates artificial task boundaries and reduces LLM call overhead.           |
+| D-10   | Entity Analysis layer architecture                        | Two-stage serial: EntityAnalysisSkill → BriefSummarySkill                                    | Original: 4 parallel tasks + 1 serial                    | Entity recognition is prerequisite for per-entity sentiment and classification. Combining into one Skill eliminates artificial task boundaries and reduces LLM call overhead.           |
 | D-11   | Per-entity sentiment; no Keyword Override     | Entity-level sentiment from EntityAnalysisSkill; strong-signal keywords in few-shot examples | Article-level sentiment + separate keyword override list | Keyword override cannot resolve entity attribution ambiguity (which entity does 'profit warning' belong to?). Few-shot embedding achieves same reliability without attribution problem. |
 | D-12   | Skills + MCP as NLP engineering pattern       | Skills for task encapsulation; MCP for external tool access                                  | Ad-hoc prompts; hardcoded validation                     | Skills provide versioned, testable, reusable prompt modules. MCP provides model-agnostic tool interface. Together they form a maintainable NLP engineering layer.                       |
 | D-13   | Rule Score and EventScoringSkill parallel     | Steps 6a and 6b execute in parallel after BriefSummarySkill                                  | Serial execution                                         | Both steps depend on Step 4 output but not on each other. Parallel execution reduces pipeline latency.                                                                                  |
@@ -787,7 +797,7 @@ This section documents key architectural decisions made during requirements anal
 | Rule Score (5 dimensions, signed via direction coefficient) | ✓       | Weights v1.0.0; direction from sentiment_label; system configurable |
 | Score Fusion & Top K Morning Brief                          | ✓       | Full replacement per pipeline run                                   |
 | Score breakdown display (Detail View)                       | ✓       | All sub-scores + adjustment_reason                                  |
-| HKEx master list via HKEXnews JSON endpoints + Redis cache   | ✓       | SAPI startup fetch (independent) + `watchlist-sync`-triggered refresh|
+| HK Stock List via HKEXnews JSON endpoints + Redis cache   | ✓       | SAPI startup fetch (independent) + `watchlist-sync`-triggered refresh|
 | System configuration parameters                             | ✓       | All params externalised; operator-managed                           |
 | Docker local deployment                                     | ✓       | docker-compose for all services                                     |
 | US market content                                           | ✗       | Post-MVP                                                            |
@@ -817,12 +827,12 @@ This section documents key architectural decisions made during requirements anal
 
 | **\#** | **Question**                                                                                                                      | **Impact**                                          | **Status**                                                                                                                                                                              |
 |:-------|:----------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| OQ-1   | Exact event_type enum list: are the 8 types in Section 6.4.1 complete for HK equity coverage?                                     | NLP classification accuracy; Skills few-shot design | Open — validate in Week 3-4                                                                                                                                                             |
+| OQ-1   | Exact event_type enum list: are the 8 types in Section 6.4.1 complete for HK equity coverage?                                     | Entity Analysis classification accuracy; Skills few-shot design | Open — validate in Week 3-4                                                                                                                                                             |
 | OQ-2   | Source authority exact scores: what numeric values for P1/P2/P3 tiers? (current defaults: 9/6/4 — need validation with real data) | Rule score calibration                              | Open — defaults set; validate in Week 3-4                                                                                                                                               |
 | OQ-6   | LLM Prompt versioning                                                                                                             | Score consistency                                   | Closed — score_version defined in Skill; Skill upgrade automatically triggers score_version bump; historical records preserved with version tag                                         |
 | OQ-7   | EventScoringSkill few-shot examples: who defines and maintains them? Financial domain expert required?                            | Model adjustment accuracy                           | Open                                                                                                                                                                                    |
 | OQ-8   | Secondary event_type tie-breaking when multiple types have equal frequency                                                        | Data consistency                                    | Closed — LLM outputs at most 1 secondary type per entity (enforced via Skill output constraint); no tie-breaking needed at article level; Event-level distinct aggregation max 2 values |
-| OQ-9   | HKEx master list sync failure degradation policy                                                                                  | Data quality vs. pipeline availability              | Closed — cache has no expiry (§6.3); a failed refresh (startup or `watchlist-sync`-triggered) leaves the existing cached version untouched rather than serving a partial or empty result. A genuinely empty cache (cold start, no prior successful fetch) is treated as not-ready — SAPI reports `unhealthy` and does not serve `lookup_stock` traffic rather than silently dropping every entity. Post-MVP: alert mechanism on consecutive sync failures                                       |
+| OQ-9   | HK Stock List sync failure degradation policy                                                                                  | Data quality vs. pipeline availability              | Closed — cache has no expiry (§6.3); a failed refresh (startup or `watchlist-sync`-triggered) leaves the existing cached version untouched rather than serving a partial or empty result. A genuinely empty cache (cold start, no prior successful fetch) is treated as not-ready — SAPI reports `unhealthy` and does not serve `lookup_stock` traffic rather than silently dropping every entity. Post-MVP: alert mechanism on consecutive sync failures                                       |
 | OQ-10  | Skills version and score_version coupling                                                                                         | Historical score comparability                      | Closed — resolved with OQ-6; score_version is defined and managed within each Skill definition                                                                                          |
 
 ---

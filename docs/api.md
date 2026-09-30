@@ -192,7 +192,7 @@ Triggers a crawl execution for a single source asynchronously. SADI begins crawl
 
 ### 2.4 `GET /v1/cleaned_news/{cleaned_id}`
 
-Fetches a single cleaned article record by `cleaned_id`. Called by SAPI NLP Layer when processing individual articles.
+Fetches a single cleaned article record by `cleaned_id`. Called by SAPI Entity Analysis Layer when processing individual articles.
 
 **Path parameter:**
 
@@ -237,7 +237,7 @@ Fetches a single cleaned article record by `cleaned_id`. Called by SAPI NLP Laye
 
 ### 2.5 `POST /v1/cleaned_news/batch`
 
-Fetches multiple cleaned article records by ID list. Called by SAPI NLP Layer for batch article content retrieval.
+Fetches multiple cleaned article records by ID list. Called by SAPI Entity Analysis Layer for batch article content retrieval.
 
 **Request body:**
 
@@ -297,7 +297,7 @@ Base URL: `http://sapi/v1`
 |---|---|---|
 | `GET` | `/health` | Service health check |
 | `GET` | `/morning-brief` | Fetch scored Morning Brief events |
-| `POST` | `/hkex-master-list-sync` | Trigger a refresh of the HKEx master list cache; called by Admin on a schedule |
+| `POST` | `/hk-stock-list-sync` | Trigger a refresh of the HK Stock List cache; called by Admin on a schedule |
 
 ---
 
@@ -313,9 +313,9 @@ Returns service health status.
     "database": "ok",
     "redis_stream": "ok",
     "redis_state": "ok",
-    "hkex_master_list": "ok",
+    "hk_stock_list": "ok",
     "layers": {
-        "nlp": "ok",
+        "entity_analysis": "ok",
         "aggregation": "ok",
         "scoring": "ok",
         "cache": "ok"
@@ -329,16 +329,16 @@ Returns service health status.
 | `database` | `ok` / `error` | PostgreSQL connectivity |
 | `redis_stream` | `ok` / `error` | `RedisStreamClient` connectivity |
 | `redis_state` | `ok` / `error` | `RedisStateClient` connectivity |
-| `hkex_master_list` | `ok` / `not_ready` | `ok` once loaded (entries > 0); `not_ready` at 0 entries — covers both "still loading" and "fetch failed," which aren't distinguished from cache state alone |
-| `layers.nlp` | `ok` / `error` | NLP Layer consumer coroutine status |
+| `hk_stock_list` | `ok` / `not_ready` | `ok` once loaded (entries > 0); `not_ready` at 0 entries — covers both "still loading" and "fetch failed," which aren't distinguished from cache state alone |
+| `layers.entity_analysis` | `ok` / `error` | Entity Analysis Layer consumer coroutine status |
 | `layers.aggregation` | `ok` / `error` | Aggregation Layer consumer coroutine status |
 | `layers.scoring` | `ok` / `error` | Scoring Layer consumer coroutine status |
 | `layers.cache` | `ok` / `error` | Cache Layer consumer coroutine status |
 
 **HTTP status codes:**
 - All components healthy → `200` with `status: healthy`
-- Any layer degraded → `200` with `status: degraded`
-- Database or Redis unreachable, or `hkex_master_list` is `not_ready` → `503` with `status: unhealthy`
+- `database`/`redis_stream`/`redis_state`/`hk_stock_list` all healthy, but any `layers.*` is `error` → `200` with `status: degraded` (a layer's consumer coroutine crashed but hasn't yet been auto-restarted; self-healing and transient — SAPI TAD §12.1)
+- Database or Redis unreachable, or `hk_stock_list` is `not_ready` → `503` with `status: unhealthy`
 
 ---
 
@@ -350,7 +350,7 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 
 | Parameter | Type | Required | Constraints | Description |
 |---|---|---|---|---|
-| `stocks` | String | Yes | Comma-separated HK stock codes; min 1 | Client watchlist stock codes, `.HK`-suffixed e.g. `00700.HK,09988.HK,03690.HK` — same canonical form as `events[].stock_code`, no conversion needed either direction |
+| `stocks` | String | Yes | Comma-separated HK stock codes; min 1 | Client watchlist stock codes, bare (no exchange suffix) e.g. `00700,09988,03690` — same canonical form as `events[].stock_code`, no conversion needed either direction |
 | `k` | Integer | No | 1–50; default 20 | Number of events to return |
 
 **Response `HTTP 200` — normal:**
@@ -363,7 +363,7 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
         {
             "event_id": "550e8400-e29b-41d4-a716-446655440000",
             "exchange": "HKEX",
-            "stock_code": "00700.HK",
+            "stock_code": "00700",
             "event_type_primary": "EARNINGS",
             "abs_final_score": 7.43,
             "base_rule_score": 8.95,
@@ -414,7 +414,7 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 | `events` | Array | Ordered list of scored events; sorted by `abs_final_score` DESC server-side |
 | `events[].event_id` | UUID | Primary key |
 | `events[].exchange` | String | Exchange identifier, e.g. `HKEX` |
-| `events[].stock_code` | String | HK stock code, e.g. `00700.HK` |
+| `events[].stock_code` | String | Bare HK stock code, e.g. `00700` — no exchange suffix; `events[].exchange` already carries that |
 | `events[].event_type_primary` | String | Primary event classification |
 | `events[].abs_final_score` | Float | Final score including real-time recency; primary sort key |
 | `events[].base_rule_score` | Float | Signed rule score including real-time recency; magnitude (`\|base_rule_score\|`) is the secondary sort key; sign indicates direction — positive (利好) / negative (利空) — for client display |
@@ -433,29 +433,31 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 | `events[].score.llm_score_detail.score_version` | String | Skill version that produced this score |
 | `events[].score.llm_score_detail.scored_at` | ISO 8601 datetime (UTC) | Score computation time |
 
-**Response `HTTP 200` — empty cache (pipeline not yet run):**
+**Response `HTTP 200` — cache built, no events match the filter:** once a cache version has ever been built, `cache_version`/`last_updated` are always non-null — a query matching nothing just returns an empty `events` array against the current version.
 
 ```json
 {
-    "cache_version": null,
-    "last_updated": null,
+    "cache_version": 43,
+    "last_updated": "2025-01-15T00:28:00Z",
     "events": []
 }
 ```
+
+"Pipeline not yet run" (no successful cache build has ever completed) is a `SAPI-5001` `503`, not a `200` — `cache_version`/`last_updated` are never null on a `200` response.
 
 **Error codes:**
 
 | Error Code | HTTP Status | Trigger |
 |---|---|---|
 | `COMMON-4001` | 400 | Validation failed: `stocks` missing or empty, `k` out of range |
-| `SAPI-5001` | 503 | Morning Brief cache unavailable |
+| `SAPI-5001` | 503 | Morning Brief cache unavailable — no successful cache build has ever completed |
 | `COMMON-5001` | 503 | Redis unavailable |
 
 ---
 
-### 3.4 `POST /v1/hkex-master-list-sync`
+### 3.4 `POST /v1/hk-stock-list-sync`
 
-Triggers a synchronous refresh of the HKEx master list cache used by `lookup_stock` (SAPI TAD §9.2.1). Fetches HKEXnews's bilingual stock-list JSON endpoints, cross-checks against the official "List of Securities" for equity filtering, and replaces the cache on success. Called by Admin's `MASTER_LIST_SYNC` job on a daily schedule (`admin-tad.md`); not required for SAPI's own startup, which performs this same fetch eagerly and independently.
+Triggers a synchronous refresh of the HK Stock List cache used by `lookup_stock` (SAPI TAD §9.2.1). Fetches HKEXnews's bilingual stock-list JSON endpoints, cross-checks against the official "List of Securities" for equity filtering, and replaces the cache on success. Called by Admin's `HK_STOCK_LIST_SYNC` job on a daily schedule (`admin-tad.md`); not required for SAPI's own startup, which performs this same fetch eagerly and independently.
 
 **Request:** no body.
 
@@ -477,8 +479,8 @@ Triggers a synchronous refresh of the HKEx master list cache used by `lookup_sto
 
 | Error Code | HTTP Status | Trigger |
 |---|---|---|
-| `COMMON-5002` | 503 | HKEXnews JSON endpoints or the official "List of Securities" download unreachable/failed; existing cache left untouched |
-| `COMMON-5001` | 503 | Redis write failed; existing cache left untouched |
+| `COMMON-5002` | 503 | HKEXnews JSON endpoints or the official "List of Securities" download unreachable/timed out/erroring — a resource/availability issue; existing cache left untouched |
+| `SAPI-5002` | 500 | Fetch succeeded, but the response could not be parsed into the expected shape (HKEXnews changed its schema, or a SAPI-side parsing bug) — a code issue, not an availability one; existing cache left untouched |
 
 ---
 
@@ -571,6 +573,7 @@ No service-specific error codes defined in MVP.
 | Error Code | HTTP Status | Description |
 |---|---|---|
 | `SAPI-5001` | 503 | Morning Brief cache unavailable — pipeline has not completed a successful run |
+| `SAPI-5002` | 500 | HK Stock List response fetched but could not be parsed into the expected shape — a code/schema issue, not an availability one (see `COMMON-5002` for the resource-issue case) |
 
 ### ADMIN Error Codes
 
