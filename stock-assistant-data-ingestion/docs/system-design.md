@@ -469,7 +469,7 @@ Redis Streams are used as the inter-service messaging mechanism. Each stream mes
 | Stream | Producer | Consumer Group | Message Fields | Role |
 |---|---|---|---|---|
 | `stream:raw_news_inserted` | Crawler layer | `sadi-cleaner` | `raw_id` | Cleaning layer input trigger |
-| `stream:raw_news_cleaned` | Cleaning layer | `sapi-nlp` | `cleaned_id` | Downstream parsing service input trigger |
+| `stream:raw_news_cleaned` | Cleaning layer | `sapi-nlp` | `cleaned_id`, `v` (message schema version, currently `"1"` — required by SAPI, its §2.3) | Downstream parsing service input trigger |
 | `stream:crawl_completed` | Crawler layer | `admin-scheduler` | `execution_id`, `status` (SUCCESS / FAILED), `error_detail` | Admin Service CrawlHandler completion signal |
 
 > `stream:crawl_completed` is written by the Crawler layer immediately after all `raw_news` records for the execution have been written — before the Cleaning layer processes them. `execution_id` is echoed from the `POST /crawl` request body. `error_detail` is null on SUCCESS.

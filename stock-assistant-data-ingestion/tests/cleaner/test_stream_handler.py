@@ -120,5 +120,5 @@ class TestPublishCleaned:
         cid = uuid4()
         await handler.publish_cleaned(cid)
         mock_stream_client.publish.assert_called_once_with(
-            STREAM_RAW_NEWS_CLEANED, {"cleaned_id": str(cid)}
+            STREAM_RAW_NEWS_CLEANED, {"cleaned_id": str(cid), "v": "1"}
         )

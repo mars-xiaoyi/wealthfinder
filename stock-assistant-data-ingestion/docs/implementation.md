@@ -1736,6 +1736,9 @@ Purpose : Acknowledge a successfully processed message.
 ```
 Purpose : Publish to stream:raw_news_cleaned after a record is successfully cleaned.
           SAPI NLP layer consumes this stream.
+Fields  : {"cleaned_id": str(cleaned_id), "v": "1"} — v is the message schema
+          version SAPI checks on every message it consumes
+          (stock-assistant-pipeline-intelligence/docs/system-design.md §2.3).
 ```
 
 ### 9.3 `app/cleaner/cleaning_service.py` — Main Cleaning Loop

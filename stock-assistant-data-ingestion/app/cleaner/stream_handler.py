@@ -90,7 +90,7 @@ class StreamHandler:
         Publish to stream:raw_news_cleaned after a record is successfully cleaned.
         SAPI NLP layer consumes this stream.
         """
-        await self._client.publish(self.STREAM_OUT, {"cleaned_id": str(cleaned_id)})
+        await self._client.publish(self.STREAM_OUT, {"cleaned_id": str(cleaned_id), "v": "1"})
         logger.debug(
             "[stream_handler] published cleaned_id=%s to %s",
             cleaned_id,
