@@ -63,10 +63,16 @@ gcloud auth application-default login
 #    in docker-compose for local dev — see Section 13.1 of the system-design doc)
 docker compose up -d postgres redis
 
-# 6. Run database migrations
+# 6. Create SAPI's own database — compose's POSTGRES_DB only creates SADI's `sadi`.
+#    SAPI uses a separate `sapi` database on the same instance, so the two services'
+#    alembic_version tables never collide (§17). Set DATABASE_URL to match (§4.1):
+#    postgresql://postgres:password@localhost:5432/sapi
+docker compose exec postgres createdb -U postgres sapi
+
+# 7. Run database migrations
 alembic upgrade head
 
-# 7. Start the service
+# 8. Start the service
 uvicorn app.main:app --reload --port 8001
 ```
 
@@ -161,7 +167,9 @@ sapi/
 │   └── main.py                          # Service entry point (lifespan): eager HK Stock List load; 4 layer Tasks + done_callback monitoring
 ├── alembic/
 │   └── versions/
-│       └── 001_create_tables.py         # entity_events + events + event_entity_map + event_scores schema
+│       ├── 001_create_entity_events.py  # entity_events
+│       ├── 002_create_events.py         # events + event_entity_map
+│       └── 003_create_event_scores.py   # event_scores
 ├── Dockerfile
 ├── requirements.txt
 └── docker-compose.yml
@@ -172,6 +180,8 @@ sapi/
 ## 3. Data Models
 
 > **On UUID collision:** as in SADI, all primary keys use `uuid.uuid4()`. No collision-handling code is needed.
+
+> **Timestamps are timezone-aware UTC everywhere:** `datetime.now(timezone.utc)`, never `datetime.utcnow()` (naive, and deprecated since Python 3.12) — same as SADI. Every `TIMESTAMPTZ` column comes back from asyncpg timezone-aware, and Python raises `TypeError` when comparing or subtracting naive and aware values.
 
 Data models are plain Python dataclasses used internally, one per DB table (system-design.md §10). Pydantic schemas for API request/response validation are kept separately in `app/api/schemas.py`. Pydantic schemas for LLM Skill inputs and Result wrappers are kept inside each Skill's own module (`entity_analysis_skill.py`, `brief_summary_skill.py`, `event_scoring_skill.py`) — see Section 8. Three Skills' own *output* schemas (`AnalysisOutcome`, `BriefSummary`, `LLMScore`) are the exception: each is also the type its Skill's DB-model field wraps directly, so it's defined in `app/models/` instead (§11.1, §3.3, §13.1) and imported back into the Skill's module.
 
@@ -204,7 +214,7 @@ class SentimentEnum(str, Enum):
 
 **All four columns wrap the type their originating computation already returns, directly — no separate persisted-shape type anywhere in this doc's models.** `entity_events.additional_outcome` wraps `AnalysisOutcome` (§8.2/§11.1 — Instructor validates `EntityAnalysisSkill`'s structured-output call against it, but it's defined in `app/models/`, alongside `EntityEvent`, the one type that wraps it); `events.brief_summary` wraps `BriefSummary`, and `event_scores.rule_score_detail`/`llm_score_detail` wrap `RuleScore`/`LLMScore` (§3.3, §13.1) — all three moved *into* `app/models/` the same way, with their originating module (`entity_analysis_skill.py`, `brief_summary_skill.py`, `rule_score.py`, `event_scoring_skill.py`) importing the type back instead of defining its own duplicate. `rule_score.py` is the one of these that lives in a restricted package (`app/scoring/`) — but that only constrains which direction the *import* can go (never `app/models/` → `app/scoring/`); it doesn't stop `RuleScore`'s own definition from living in `app/models/` and being imported the other way.
 
-**No shared serialization method, and no generic `dataclasses.asdict()`/`.model_dump()` call anywhere either.** Each write site hand-builds its own `{"version": ..., "output": {...}}` dict, naming every field explicitly, the same way `entity_events.additional_outcome` always had to (§11.1) — it's a narrower, hand-picked projection (`{company_name, event_type_secondary, headline, entity_summary}`, not all seven of `AnalysisOutcome`'s fields, plus `company_name`, which isn't on `AnalysisOutcome` at all since the LLM never produces it, §8.2), so a generic full-object dump was never going to work for it regardless. The other three columns' `output` *does* happen to include every field of its type today, but they're still built the same explicit, named-field way (§10.2, §10.3) rather than via `.model_dump()`/`dataclasses.asdict()` — so a field silently added to `BriefSummary`/`RuleScore`/`LLMScore` later doesn't silently start appearing in the DB (or vice versa) just because a generic dump happened to pick it up; every key persisted is named at the call site that persists it, matching what `_row_to_entity_event()`'s equally explicit, field-by-field reconstruction already does on the read side.
+**No shared serialization method, and no generic `dataclasses.asdict()`/`.model_dump()` call anywhere either.** Each write site hand-builds its own `{"version": ..., "output": {...}}` dict, naming every field explicitly, the same way `entity_events.additional_outcome` always had to (§11.1) — it's a narrower, hand-picked projection (`{company_name_zh, company_name_en, event_type_secondary, headline, entity_summary}`, not all seven of `AnalysisOutcome`'s fields, plus `company_name_zh`/`company_name_en`, which aren't on `AnalysisOutcome` at all since the LLM never produces them, §8.2), so a generic full-object dump was never going to work for it regardless. The other three columns' `output` *does* happen to include every field of its type today, but they're still built the same explicit, named-field way (§10.2, §10.3) rather than via `.model_dump()`/`dataclasses.asdict()` — so a field silently added to `BriefSummary`/`RuleScore`/`LLMScore` later doesn't silently start appearing in the DB (or vice versa) just because a generic dump happened to pick it up; every key persisted is named at the call site that persists it, matching what `_row_to_entity_event()`'s equally explicit, field-by-field reconstruction already does on the read side.
 
 ```python
 from dataclasses import dataclass
@@ -303,7 +313,9 @@ from uuid import UUID
 class EventEntityMap:
     event_id: UUID           # FK -> events.event_id
     entity_event_id: UUID    # FK -> entity_events.entity_event_id; unique constraint
-    created_at: datetime     # UTC; time this EntityEvent was aggregated into the Event
+    created_at: datetime     # UTC; time this EntityEvent was aggregated into the Event — the flush that first
+                             # persisted the mapping (EventRepository.persist_events(), §10.2); a re-flush's
+                             # ON CONFLICT DO NOTHING keeps the original value
 ```
 
 ### 3.5 `app/api/schemas.py` — Pydantic Schemas
@@ -437,6 +449,24 @@ class DatabaseConfig:
     retry_base_wait_ms: int  # env: DB_RETRY_BASE_WAIT_MS
 ```
 
+#### Class: `HttpConfig`
+
+```python
+@dataclass
+class HttpConfig:
+    """One common timeout for every outbound REST call made through the
+    shared httpx.AsyncClient (app/common/http_client.py, §4.2) — HKEXnews
+    today, SADI (NewsClient, §9.1) and Admin (AdminClient, §9.2) as well.
+    Deliberately NOT shared with LLMConfig.api_timeout_s below: the LLM
+    adapter talks to Vertex AI through the google-genai SDK directly, never
+    through get_http_client()/httpx, specifically because LLM round-trip
+    latency is a different animal needing its own independently-tunable
+    value (confirmed against real latency per §18's Q-11) — the two
+    timeouts are decoupled by construction, not by a convention that could
+    get conflated later."""
+    timeout_s: int   # env: HTTP_TIMEOUT_S (default 120)
+```
+
 #### Class: `RedisConfig`
 
 ```python
@@ -475,7 +505,6 @@ class EntityAnalysisConfig:
     sadi_api_url: str                     # env: SADI_API_URL — local dev default: http://localhost:8000
                                            # (SADI's own quickstart port, stock-assistant-data-ingestion/docs/implementation.md §1);
                                            # excludes "/v1" — NewsClient appends it per-call (§9.1)
-    sadi_api_timeout_s: int               # env: SADI_API_TIMEOUT_S
     consumer_name: str                    # env: HOSTNAME, fallback "sapi-entity-analysis-1" — see §6.1's Reclaim pattern
 ```
 
@@ -558,7 +587,7 @@ class CacheConfig:
     consumer_name: str                       # env: HOSTNAME, fallback "sapi-cache-1" — see §6.1's Reclaim pattern
 ```
 
-> **`consumer_name` sourcing (all four configs).** `load_config()` (below) sets each of these to `os.environ.get("HOSTNAME", "<layer-specific fallback>")` — Kubernetes sets `HOSTNAME` to the pod's own unique name automatically, and consumer-name uniqueness only needs to hold *within* a consumer group (§6.1), which each layer already has its own of. The per-layer fallback string just keeps local/docker-compose `XPENDING` output readable, where `HOSTNAME` isn't meaningfully unique. Not a dedicated env var like `ENTITY_ANALYSIS_CONSUMER_NAME`, since that would require an operator to manually vary it per replica; `HOSTNAME` is unique with no action required. A changing identity across restarts is fine — `_reclaim_loop()` (§6.1) recovers a previous identity's abandoned entries after `STREAM_CLAIM_TIMEOUT_MS`.
+> **`consumer_name` sourcing (all four configs).** `load_config()` (below) sets each of these to `os.environ.get("HOSTNAME", "<layer-specific fallback>")` — Kubernetes sets `HOSTNAME` to the pod's own unique name automatically, and consumer-name uniqueness only needs to hold *within* a consumer group (§6.1), which each layer already has its own of. The per-layer fallback string just keeps local/docker-compose `XPENDING` output readable, where `HOSTNAME` isn't meaningfully unique. Not a dedicated env var like `ENTITY_ANALYSIS_CONSUMER_NAME`, since that would require an operator to manually vary it per replica; `HOSTNAME` is unique with no action required. SAPI runs as a single replica for now (system-design.md §13.2) — this only keeps consumer names correct if that ever changes, it doesn't make multiple replicas safe. A changing identity across restarts is fine — `_reclaim_loop()` (§6.1) recovers a previous identity's abandoned entries after `STREAM_CLAIM_TIMEOUT_MS`.
 
 #### Class: `AppConfig`
 
@@ -566,6 +595,7 @@ class CacheConfig:
 @dataclass
 class AppConfig:
     db: DatabaseConfig
+    http: HttpConfig
     redis: RedisConfig
     llm: LLMConfig
     entity_analysis: EntityAnalysisConfig
@@ -642,11 +672,13 @@ def get_http_client() -> httpx.AsyncClient:
         raise ServiceUnavailableException("get_http_client() called before create_http_client() initialized it")
     return _http_client
 
-def create_http_client(**kwargs) -> httpx.AsyncClient:
+def create_http_client(timeout_s: int) -> httpx.AsyncClient:
     global _http_client
-    _http_client = httpx.AsyncClient(**kwargs)
+    _http_client = httpx.AsyncClient(timeout=timeout_s)
     return _http_client
 ```
+
+An explicit, typed parameter rather than `**kwargs` — the only thing this ever needs to configure is the shared timeout (`HttpConfig.timeout_s`, §4.1), so a generic pass-through would just hide that one real parameter behind an untyped signature for no benefit, the same boundary-typing rule (root `CLAUDE.md` rule 8) every other `create_X()` in this doc already follows.
 
 #### Class: `HKStockListCache`
 
@@ -1057,6 +1089,9 @@ Used by : EventRepository's persist_events() (§10.2) — Upserting every active
           Redis Event to `events` and writing all of its entity_event_map
           rows must commit together as one unit, so a mid-flush failure
           never leaves a partially-persisted Event.
+          EntityEventRepository's persist_entities() (§10.1) — all of one
+          article's entity_events rows commit together, so an article is
+          either fully persisted or not at all (system-design.md §3.4).
 ```
 
 ```python
@@ -1198,7 +1233,7 @@ CONSUMER_GROUP_CACHE        = "sapi-cache"
 | `STREAM_EVENT_AGGREGATED` | Aggregation Layer | `sapi-scoring` |
 | `STREAM_EVENT_SCORED` | Scoring Layer | `sapi-cache` |
 
-> **`v` field — message schema versioning (system-design.md §2.3).** Every published message includes `v` (current value: `"1"`). Each layer's consumer checks `fields["v"]` immediately after `read_from()`/`autoclaim()` returns and before touching any other field; an unrecognised value routes the message straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) without a processing attempt, rather than raising deep inside business logic on a shape it doesn't understand.
+> **`v` field — message schema versioning (system-design.md §2.3).** Every published message includes `v` (current value: `"1"`). Each layer's consumer checks `fields["v"]` immediately after `read_from()`/`autoclaim()` returns and before touching any other field; an unrecognised value routes the message straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) without a processing attempt, rather than raising deep inside business logic on a shape it doesn't understand. It uses the same dead-letter payload as the Reclaim and Dead Letter pattern below; on the `read_from()` path, `delivery_count` is `"1"` — a first delivery.
 
 **Module-level singleton, same pattern as `DatabaseClient`** (§5.1). `create_stream_client()` constructs and registers it; every consumer calls `get_redis_stream_client()` directly rather than taking `redis_stream` as a constructor parameter.
 
@@ -1294,6 +1329,25 @@ Called  : Once per stream/group pair, at each layer service's startup.
 Purpose : Close the Redis connection. Called in the service shutdown handler.
 ```
 
+#### Method: `ping() -> None`
+
+```
+Purpose : Re-verify connectivity on demand — the same PING check
+          create_stream_client() already runs once at construction (above),
+          exposed as a public method so a caller can re-check liveness
+          later, not just at startup. Used by GET /v1/health (§15.2), whose
+          own spec calls for a live PING per request.
+Raises  : Whatever the underlying redis.asyncio.Redis.ping() raises
+          (redis.ConnectionError / redis.TimeoutError) — untranslated, since
+          the caller (§15.2) wants the raw signal to classify itself rather
+          than a pre-classified SAPI exception.
+```
+
+```python
+async def ping(self) -> None:
+    await self._client.ping()
+```
+
 #### Reconnect behaviour
 
 Per system-design.md §12.1 "RedisStreamClient Reconnect": when the underlying connection is unreachable, `read_from()`/`autoclaim()`/`publish()` catch `redis.ConnectionError`, log a warning, sleep `REDIS_RECONNECT_INTERVAL_S`, and retry — indefinitely, at the call site's loop level (each layer's consumer loop already retries its own `read_from()` call every iteration, so no separate reconnect loop is needed inside `RedisStreamClient` itself). Consumer Group position is preserved server-side across the outage; processing resumes from the last ACKed message once the connection returns.
@@ -1309,7 +1363,7 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": when the underlying c
   if reclaimed.delivery_count >= config.max_retry:   # ENTITY_ANALYSIS_MAX_RETRY / AGG_MAX_RETRY / SCORING_MAX_RETRY / CACHE_MAX_RETRY
       await redis_stream.publish(STREAM_<LAYER>_DEAD_LETTER, {
           "message_id": reclaimed.id, "fields": json.dumps(reclaimed.fields),
-          "delivery_count": str(reclaimed.delivery_count), "failed_at": datetime.utcnow().isoformat(),
+          "delivery_count": str(reclaimed.delivery_count), "failed_at": datetime.now(timezone.utc).isoformat(),
           "v": "1",
       })
       await redis_stream.ack(stream, group, reclaimed.id)
@@ -1376,6 +1430,7 @@ class RedisStateClient:
     async def hlen(self, key: str) -> int: ...
     async def scan(self, pattern: str) -> list[str]: ...
     async def multi_exec(self, build: Callable[[redis.asyncio.client.Pipeline], None]) -> None: ...
+    async def ping(self) -> None: ...
     async def close(self) -> None: ...
 ```
 
@@ -1387,6 +1442,7 @@ class RedisStateClient:
 | `hget`/`hgetall`/`hmget`/`hset`/`hlen` | `HGET`/`HGETALL`/`HMGET`/`HSET`/`HLEN` | `hgetall` returns `None` if the key doesn't exist (vs. redis-py's empty-dict default) so callers can distinguish "no such key" from "empty hash" |
 | `scan(pattern)` | `SCAN` (cursor loop, collected) | Returns the full matching key list — every current caller (§12.5, §10.4) consumes the whole result anyway, so there's no streaming/cursor-exposing variant |
 | `multi_exec(build)` | `MULTI`/`EXEC` | `build` receives a `redis.asyncio.client.Pipeline` and queues commands on it (`pipe.set(...)`, `pipe.delete(...)`, `pipe.rename(...)`, ...) — nothing is sent to Redis until `EXEC`, so every queued command commits atomically together. This is the primitive `CacheStore.write_cache_version()` (§10.4) builds its atomic swap on |
+| `ping()` | `PING` | Re-verifies connectivity on demand — the same PING `create_state_client()` runs once at construction, exposed as a public method for a live per-request re-check. Used by `GET /v1/health` (§15.2), whose own spec calls for a live PING per request; raises whatever `redis.asyncio.Redis.ping()` raises, untranslated |
 
 There is deliberately no `hset_and_expire` combination method — `HSET` then `EXPIRE` as two separate awaited calls is what every current caller needs (EventAggregationStore's TTL refresh, source-config's cache-miss write), and neither needs true multi-command atomicity for it (a crash between the two just means the key briefly has no TTL, not a corrupted read) — unlike `multi_exec`'s callers, which do need atomicity (a visible half-swapped cache is the failure mode being avoided).
 
@@ -2048,7 +2104,7 @@ def _skill_log(self) -> EntityAnalysisSkillLog:
         total_output_tokens=sum(c.output_tokens for c in self._llm_calls),
         total_latency_ms=sum(c.latency_ms for c in self._llm_calls),
         llm_errors=self._llm_errors,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
     )
 
 def build_fail_result(self, err: Exception) -> EntityAnalysisResult:
@@ -2177,7 +2233,7 @@ def _skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> BriefSum
         total_output_tokens=sum(c.output_tokens for c in self._llm_calls),
         total_latency_ms=sum(c.latency_ms for c in self._llm_calls),
         llm_errors=self._llm_errors,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
     )
 
 def build_fail_result(self, err: Exception) -> BriefSummaryResult:
@@ -2209,7 +2265,7 @@ class BriefSummarySkillLog:
     timestamp: datetime
 ```
 
-**Input construction** — `build_prompt()`, called from `llm_process()` above (design rationale: system-design.md §9.5):
+**Input construction** — `build_prompt()`, called from `__init__()` above (design rationale: system-design.md §9.5). 【實體信息】: `stock_code`, `event_type_primary`, `event_type_secondary` from `input.event`; `company_name` from `input.constituent_entity_events[0].stock.company_name` (every constituent shares the Event's `stock_code`, §12.3). 【各文章實體摘要】 selection:
 
 ```
 1. Per-source cap: retain at most 3 articles per source_name;
@@ -2264,6 +2320,7 @@ Processing continues — `llm_process()` returns normally with `skill_log.fallba
 @dataclass
 class EventLLMScoringInput(SkillInput):   # base: app/skills/skill_base.py, §8.1
     event: Event
+    stock: Stock                     # §4.2 — constituent_entity_events[0].stock (§13.1 step 7); Event has no company name of its own
     brief_output: VersionedMetadata[BriefSummary]
     input_from_fallback: bool
 ```
@@ -2375,7 +2432,7 @@ def _skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> EventLLM
         total_output_tokens=sum(c.output_tokens for c in self._llm_calls),
         total_latency_ms=sum(c.latency_ms for c in self._llm_calls),
         llm_errors=self._llm_errors,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
     )
 
 def build_fail_result(self, err: Exception) -> EventLLMScoringResult:
@@ -2404,7 +2461,7 @@ class EventLLMScoringSkillLog:
     timestamp: datetime
 ```
 
-**Input construction** — `build_prompt()`, called from `llm_process()` above (system-design.md §9.6): `stock_code`, `company_name`, `event_type_primary`, `event_type_secondary` from `input.event`; `summary_full` and `key_numbers` from `input.brief_output.output`. `input.input_from_fallback` is recorded (not used in the prompt) purely for the `event_scoring_completed` log event, flagging a potentially-degraded input for monitoring.
+**Input construction** — `build_prompt()`, called from `__init__()` above (system-design.md §9.6): `stock_code`, `event_type_primary`, `event_type_secondary` from `input.event`; `company_name` from `input.stock.company_name`; `summary_full` and `key_numbers` from `input.brief_output.output`. `input.input_from_fallback` is recorded (not used in the prompt) purely for the `event_scoring_completed` log event, flagging a potentially-degraded input for monitoring.
 
 #### Business Constraint Validation
 
@@ -2477,7 +2534,7 @@ Neither `NewsClient` nor `AdminClient` lets a raw `httpx` exception escape to it
 
 ```python
 class NewsClient:
-    def __init__(self, http_client: httpx.AsyncClient, base_url: str, timeout_s: int): ...
+    def __init__(self, http_client: httpx.AsyncClient, base_url: str): ...
 
     async def fetch_cleaned_news(self, cleaned_id: UUID) -> Optional[CleanedNews]:
         """
@@ -2514,13 +2571,13 @@ def get_news_client() -> NewsClient:
         raise ServiceUnavailableException("get_news_client() called before create_news_client() initialized it")
     return _news_client
 
-def create_news_client(http_client: httpx.AsyncClient, base_url: str, timeout_s: int) -> NewsClient:
+def create_news_client(http_client: httpx.AsyncClient, base_url: str) -> NewsClient:
     global _news_client
-    _news_client = NewsClient(http_client, base_url, timeout_s)
+    _news_client = NewsClient(http_client, base_url)
     return _news_client
 ```
 
-`create_news_client()` is still called explicitly from `main.py` (§16) with the shared `http_client` (§4.2) and `config.entity_analysis.sadi_api_url`/`config.entity_analysis.sadi_api_timeout_s` — construction stays where it is; only the *consumption* side changes, from a constructor parameter to `get_news_client()`.
+`create_news_client()` is still called explicitly from `main.py` (§16) with the shared `http_client` (§4.2) and `config.entity_analysis.sadi_api_url` — construction stays where it is; only the *consumption* side changes, from a constructor parameter to `get_news_client()`. No per-client timeout here — `NewsClient` relies on `http_client`'s own configured timeout (`HttpConfig.timeout_s`, §4.1), the same way `AdminClient` (§9.2) already does.
 
 ### 9.2 `app/clients/admin_client.py` — `AdminClient`
 
@@ -2591,9 +2648,10 @@ Takes the `EntityEvent` list above, not `EntityAnalysisResult` — `EntityAnalys
 
 ```
 Purpose :
-for entity in entities:
-    entity.entity_event_id, entity.created_at = uuid.uuid4(), datetime.utcnow()
-    inserted = await db.execute_returning(_INSERT_ENTITY_EVENT_SQL, ...)
+async with db.transaction() as tx:   # one article's rows commit together (§5.1, system-design.md §3.4)
+  for entity in entities:
+    entity.entity_event_id, entity.created_at = uuid.uuid4(), datetime.now(timezone.utc)
+    inserted = await tx.execute_returning(_INSERT_ENTITY_EVENT_SQL, ...)
         # INSERT ... ON CONFLICT (source_url, stock_code) DO NOTHING RETURNING entity_event_id (§5.1)
         # no intermediate row object, values passed straight through
         # (same convention as EventRepository.persist_events()'s _UPSERT_EVENT_SQL call, §10.2)
@@ -2610,15 +2668,16 @@ For each `EntityEvent` in `entities`, the row is inserted as:
 
 ```python
 new_id = uuid.uuid4()
-now = datetime.utcnow()
+now = datetime.now(timezone.utc)
 llm = entity.analysis_outcome.output   # AnalysisOutcome — stock_code/event_type_primary/sentiment_label/sentiment_score/headline/entity_summary all live here, not on EntityEvent itself
 additional_outcome_payload = {
     "version": entity.analysis_outcome.version,
     "output": {
-        # these four keys only — llm's other four fields
+        # these five keys only — llm's other four fields
         # (stock_code, event_type_primary, sentiment_label, sentiment_score)
         # already has its own flat column below, so it isn't repeated here
-        "company_name": entity.stock.company_name,   # §4.2 — never from the LLM (system-design.md §9.4/§9.6)
+        "company_name_zh": entity.stock.company_name_zh,   # §4.2 — never from the LLM (system-design.md §9.4/§9.6);
+        "company_name_en": entity.stock.company_name_en,   # read back by _row_to_entity_event() (below) to rebuild Stock
         "event_type_secondary": llm.event_type_secondary,
         "headline": llm.headline,
         "entity_summary": llm.entity_summary,
@@ -2641,18 +2700,30 @@ values = {
     "created_at": now,
     "updated_at": now,
 }
-inserted = await self._db.execute_returning(_INSERT_ENTITY_EVENT_SQL, *values.values())
+inserted = await tx.execute_returning(_INSERT_ENTITY_EVENT_SQL, *values.values())   # tx — the transaction opened above
 ```
 
 `values`' key order must match `_INSERT_ENTITY_EVENT_SQL`'s `$1...$15` column order exactly — `asyncpg` binds positionally, with no named-parameter support, so this dict doesn't remove that coupling, only makes it legible: every value sits next to the column name it fills, instead of a bare positional list a reviewer has to cross-reference against the SQL by counting.
 
-`entity.analysis_outcome` is a `VersionedMetadata[AnalysisOutcome]` (§11.1) in Python, persisted under the `additional_outcome` column (renamed from an earlier `llm_output` — system-design.md §10.1 updated to match) — `llm` above is just its `.output`, read once and reused for all five of `AnalysisOutcome`'s fields this method needs (`values`' own `stock_code`/`event_type_primary`/`sentiment_label`/`sentiment_score`/`headline`/`entity_summary` columns, plus `event_type_secondary` inside the JSONB). `additional_outcome_payload` itself is built by hand, naming every persisted key explicitly (§3.2's intro — no `VersionedMetadata` serialization method exists for any of the four JSONB columns), since `output` here is a narrower projection than `AnalysisOutcome`'s own seven fields, plus `company_name`, which isn't one of them at all. `event_type_secondary` (an `EventTypeEnum | None`, §3.1, itself a `str` subclass so it needs no extra serialization) is the only field that has no flat column and so must come from `llm` inside the JSONB; `exchange`/`stock_code` come from `entity.stock` instead (§4.2 — `AnalysisOutcome` has no `exchange` field at all). No `ENTITY_SKILL_VERSION` import needed here either — `entity.analysis_outcome.version` already carries it, set once by `find_entity_events()` (above) from `result.skill_log.skill_version`.
+`entity.analysis_outcome` is a `VersionedMetadata[AnalysisOutcome]` (§11.1) in Python, persisted under the `additional_outcome` column (renamed from an earlier `llm_output` — system-design.md §10.1 updated to match) — `llm` above is just its `.output`, read once and reused for all five of `AnalysisOutcome`'s fields this method needs (`values`' own `stock_code`/`event_type_primary`/`sentiment_label`/`sentiment_score`/`headline`/`entity_summary` columns, plus `event_type_secondary` inside the JSONB). `additional_outcome_payload` itself is built by hand, naming every persisted key explicitly (§3.2's intro — no `VersionedMetadata` serialization method exists for any of the four JSONB columns), since `output` here is a narrower projection than `AnalysisOutcome`'s own seven fields, plus `company_name_zh`/`company_name_en`, which aren't among them at all. `event_type_secondary` (an `EventTypeEnum | None`, §3.1, itself a `str` subclass so it needs no extra serialization) is the only field that has no flat column and so must come from `llm` inside the JSONB; `exchange`/`stock_code` come from `entity.stock` instead (§4.2 — `AnalysisOutcome` has no `exchange` field at all). No `ENTITY_SKILL_VERSION` import needed here either — `entity.analysis_outcome.version` already carries it, set once by `find_entity_events()` (above) from `result.skill_log.skill_version`.
 
-On success (`inserted` is not `None`): `entity.entity_event_id = new_id` and `entity.created_at = now`, and `entity` is kept in the returned list; on conflict (`inserted is None`), `entity` is dropped from the returned list and its `entity_event_id`/`created_at` stay unset.
+On success (`inserted` is not `None`): `entity.entity_event_id = new_id` and `entity.created_at = now`, and `entity` is kept in the returned list; on conflict (`inserted is None`), `entity` is dropped from the returned list and its `entity_event_id`/`created_at` stay unset. The conflict clause stays as a backstop only — a redelivered article never reaches this method once its rows exist (`find_entity_events()`'s step 3, §11.1).
+
+#### Method: `fetch_entity_event_ids_by_source_url(source_url: str) -> list[UUID]`
+
+`EntityAnalysisService.find_entity_events()`'s (§11.1) redelivery check — the `entity_event_id` of every row already persisted for one article. Returns ids only, not `EntityEvent`s: republishing needs nothing else. Served by `uq_entity_events_source_url_stock_code`'s leading column (§17), so no extra index.
+
+```python
+_SELECT_ENTITY_EVENT_IDS_BY_SOURCE_URL_SQL = "SELECT entity_event_id FROM entity_events WHERE source_url = $1"
+
+async def fetch_entity_event_ids_by_source_url(self, source_url: str) -> list[UUID]:
+    rows = await self._db.fetch_all(_SELECT_ENTITY_EVENT_IDS_BY_SOURCE_URL_SQL, source_url)
+    return [row["entity_event_id"] for row in rows]
+```
 
 #### Method: `fetch_entity_event(entity_event_id: UUID) -> Optional[EntityEvent]`
 
-The one read path back into `entity_events` — `AggregationService.process_entity_event()` (§12.1) is its only caller, reading back the same row `persist_entities()` (above) wrote. Lives here rather than on a separate repository because it's the same table and row shape `EntityEventRepository` already owns.
+The per-id read path back into `entity_events` — `AggregationService.process_entity_event()` (§12.1) is its only caller, reading back the same row `persist_entities()` (above) wrote. Lives here rather than on a separate repository because it's the same table and row shape `EntityEventRepository` already owns.
 
 ```python
 _SELECT_ENTITY_EVENT_SQL = "SELECT * FROM entity_events WHERE entity_event_id = $1"
@@ -2664,13 +2735,13 @@ def _row_to_entity_event(row: asyncpg.Record) -> EntityEvent:
         source_name=row["source_name"],
         published_at=row["published_at"],
         # AnalysisOutcome(**row["additional_outcome"]["output"]) would fail here — that dict only
-        # holds the four keys above (company_name/event_type_secondary/headline/
-        # entity_summary), not AnalysisOutcome's other three required fields.
+        # holds the five keys above (company_name_zh/company_name_en/event_type_secondary/
+        # headline/entity_summary), not AnalysisOutcome's other required fields.
         # Rebuild it field-by-field instead: stock_code/event_type_primary/sentiment_label/
         # sentiment_score come from their own flat columns (already read above); only
         # event_type_secondary is genuinely JSONB-only, with no column of its own.
-        # company_name has no field on AnalysisOutcome at all — stock (below) is where a
-        # fresh, current company name comes from instead, never from this snapshot.
+        # company_name_zh/company_name_en have no field on AnalysisOutcome at all — they
+        # feed stock (below) instead.
         analysis_outcome=VersionedMetadata(
             version=row["additional_outcome"]["version"],
             output=AnalysisOutcome(
@@ -2683,7 +2754,12 @@ def _row_to_entity_event(row: asyncpg.Record) -> EntityEvent:
                 entity_summary=row["entity_summary"],
             ),
         ),
-        stock=get_hk_stock_list_cache().entries[row["stock_code"]],   # §4.2 — same O(1) lookup as the write path, never itself persisted
+        stock=Stock(   # §4.2 — rebuilt from the row alone, never from the live HKStockListCache (§11.1's EntityEvent notes)
+            stock_code=row["stock_code"],
+            exchange=row["exchange"],
+            company_name_zh=row["additional_outcome"]["output"]["company_name_zh"],
+            company_name_en=row["additional_outcome"]["output"]["company_name_en"],
+        ),
         entity_event_id=row["entity_event_id"],
         created_at=row["created_at"],
     )
@@ -2746,17 +2822,19 @@ def create_event_repository() -> EventRepository:
 Takes exactly what `EventAggregationStore.scan_all()` (§12.5) returns — `Event`, in its Redis-active stage (§3.3), in; a fully-populated `Event` out — same pattern as `EntityEventRepository.persist_entities()` (§10.1): one type in both directions, the caller gets back the same rich shape it would read on any other fetch, not a bare id. Each field the input `Event` doesn't fully own gets one of four treatments, not one blanket rule:
 - `created_at` — never written by this UPSERT at all; the row's original `INSERT` is the only thing that ever sets it.
 - `aggregation_updated_at` — taken directly from the input `Event` and written as-is; `merge_or_create()` (§12.4) is what actually sets it, the moment a merge/create happens, so by the time an `Event` reaches this method it's always populated. This UPSERT never computes its own value for it — doing so would stamp `now()` on every flush, including flushes of groups nothing changed in since the last cycle.
-- `updated_at` — always self-calculated as `now()`, unconditionally, on every call — a generic "last touched by any write" audit column, unrelated to `aggregation_updated_at`'s specific staleness-detection meaning.
+- `updated_at` — always self-calculated as `now()` on every write that actually happens (an unchanged row isn't written at all — below) — a generic "last touched by any write" audit column, unrelated to `aggregation_updated_at`'s specific staleness-detection meaning.
 - `event_type_secondary`/`source_list` — `COALESCE`d: the input's value is used if it's not `NULL`, and only computed via a subquery against `entity_events` (below — not a join through `event_entity_map`) when it is. Today's one caller (`AggregationService.flush()`) always passes `None` here, so in practice these are always computed this way — but that's this caller's behavior, not a constraint the method itself imposes. There is no `source_count` column to independently maintain — `events` has none (§17); `Event.source_count` (§3.3) is a pure `len(source_list)` computed property, so this UPSERT never needs a fourth treatment for it.
 
 ```
-Purpose : One DB transaction per call: UPSERT every currently-active Event
-          into `events` (field treatments above), INSERT its
-          entity_event_ids into `event_entity_map`, and return the
-          fully-populated Event rows actually flushed. AggregationService.
-          flush() (§12.1) decides *when* to call this and publishes
-          stream:event_aggregated afterward — this method has no opinion
-          on timing or on what happens after commit.
+Purpose : One DB transaction per call: UPSERT every given Event into
+          `events` (field treatments above), INSERT its entity_event_ids
+          into `event_entity_map`, and return the fully-populated Event
+          rows actually written — a new row, or an existing one whose
+          stored aggregation_updated_at is older than the input's. An Event
+          whose aggregation_updated_at is unchanged — or older than what's
+          stored — is a no-op and is not returned. AggregationService (§12.1) decides *when* to call this
+          and what to publish afterward — this method has no opinion on
+          timing or on what happens after commit.
 ```
 
 ```python
@@ -2782,6 +2860,7 @@ def _row_to_event(row: asyncpg.Record) -> Event:
 
 async def persist_events(self, active: list[Event]) -> list[Event]:
     flushed_events = []
+    now = datetime.now(timezone.utc)
     async with self._db.transaction() as tx:
         for e in active:
             values = {
@@ -2796,14 +2875,16 @@ async def persist_events(self, active: list[Event]) -> list[Event]:
                 "source_list": [dataclasses.asdict(item) for item in e.source_list] if e.source_list is not None else None,
                 "entity_event_ids": e.entity_event_ids,
             }
-            row = await tx.execute_returning(_UPSERT_EVENT_SQL, *values.values())
+            row = await tx.execute_returning(_UPSERT_EVENT_SQL, *values.values())   # None: input not newer than the stored row, no write
             for entity_event_id in e.entity_event_ids:
-                await tx.execute(_UPSERT_EVENT_ENTITY_MAP_SQL, e.event_id, entity_event_id)
-            flushed_events.append(_row_to_event(row))
+                mapping = EventEntityMap(event_id=e.event_id, entity_event_id=entity_event_id, created_at=now)   # §3.4
+                await tx.execute(_UPSERT_EVENT_ENTITY_MAP_SQL, mapping.event_id, mapping.entity_event_id, mapping.created_at)
+            if row is not None:
+                flushed_events.append(_row_to_event(row))
     return flushed_events
 ```
 
-`values`' key order must match `_UPSERT_EVENT_SQL`'s `$1...$10` column order exactly — `asyncpg` binds positionally, with no named-parameter support, so this dict doesn't remove that coupling, only makes it legible, same convention as `EntityEventRepository.persist_entities()` (§10.1). `_UPSERT_EVENT_SQL` and `_UPSERT_EVENT_ENTITY_MAP_SQL` are module-level SQL constants at the top of `event_repository.py`. `_UPSERT_EVENT_SQL` is an `INSERT ... ON CONFLICT (event_id) DO UPDATE SET ... RETURNING *`. Its `SET` clause: `aggregation_updated_at = $n` (bound to `values["aggregation_updated_at"]`, from `merge_or_create()`, §12.4 — not computed here); `updated_at = now()` unconditionally (system-design.md §4.5's generic audit-column convention, distinct from `aggregation_updated_at`); `event_type_secondary = COALESCE($n, <computed>)` and `source_list = COALESCE($n, <computed>)`, where both `<computed>` subqueries filter on `entity_events WHERE entity_event_id = ANY($n)` — `$n` bound to `values["entity_event_ids"]` directly, **not** a join through `event_entity_map`. No `source_count` field appears anywhere in this statement — `events` has no such column (§17); a caller wanting one reads `jsonb_array_length(source_list)` directly rather than a second, independently-maintained value. That distinction matters within this one transaction: this `events` UPSERT runs *before* the `event_entity_map` INSERT loop below it, so on a brand-new `event_id`'s first-ever flush, no `event_entity_map` rows for it exist yet — a join through that table would see zero rows and compute an empty `source_list`. Going through `entity_event_ids` directly (already fully known in Python — the same list the loop below inserts) sidesteps that ordering dependency entirely; the reverse order (`event_entity_map` first) isn't an option either, since `event_entity_map.event_id` is a foreign key into `events` (§17) and can't reference a row that doesn't exist yet. `created_at` is absent from the `SET` clause entirely — only the row's original `INSERT` ever sets it, so a later re-flush of the same `event_id` preserves it untouched. The `RETURNING *` is what lets `_row_to_event()` build a complete `Event` from the same round-trip, no follow-up `SELECT` needed.
+`values`' key order must match `_UPSERT_EVENT_SQL`'s `$1...$10` column order exactly — `asyncpg` binds positionally, with no named-parameter support, so this dict doesn't remove that coupling, only makes it legible, same convention as `EntityEventRepository.persist_entities()` (§10.1). `_UPSERT_EVENT_SQL` and `_UPSERT_EVENT_ENTITY_MAP_SQL` are module-level SQL constants at the top of `event_repository.py`. `_UPSERT_EVENT_SQL` is an `INSERT ... ON CONFLICT (event_id) DO UPDATE SET ... WHERE events.aggregation_updated_at < EXCLUDED.aggregation_updated_at RETURNING *` — the `WHERE` lets only newer state win: an unchanged Event is a no-op that returns no row, and so is an older snapshot arriving after a newer write (system-design.md §4.5). Its `SET` clause: `aggregation_updated_at = $n` (bound to `values["aggregation_updated_at"]`, from `merge_or_create()`, §12.4 — not computed here); `updated_at = now()` unconditionally (system-design.md §4.5's generic audit-column convention, distinct from `aggregation_updated_at`); `event_type_secondary = COALESCE($n, <computed>)` and `source_list = COALESCE($n, <computed>)`, where both `<computed>` subqueries filter on `entity_events WHERE entity_event_id = ANY($n)` — `$n` bound to `values["entity_event_ids"]` directly, **not** a join through `event_entity_map`. No `source_count` field appears anywhere in this statement — `events` has no such column (§17); a caller wanting one reads `jsonb_array_length(source_list)` directly rather than a second, independently-maintained value. That distinction matters within this one transaction: this `events` UPSERT runs *before* the `event_entity_map` INSERT loop below it, so on a brand-new `event_id`'s first-ever flush, no `event_entity_map` rows for it exist yet — a join through that table would see zero rows and compute an empty `source_list`. Going through `entity_event_ids` directly (already fully known in Python — the same list the loop below inserts) sidesteps that ordering dependency entirely; the reverse order (`event_entity_map` first) isn't an option either, since `event_entity_map.event_id` is a foreign key into `events` (§17) and can't reference a row that doesn't exist yet. `created_at` is absent from the `SET` clause entirely — only the row's original `INSERT` ever sets it, so a later re-flush of the same `event_id` preserves it untouched. The `RETURNING *` is what lets `_row_to_event()` build a complete `Event` from the same round-trip, no follow-up `SELECT` needed.
 
 `event_type_secondary`'s `<computed>` aggregation (PRD §OQ-8, Closed): every entity in the group shares the same `event_type_primary` — that's the merge key (`GroupCoroutine`'s `group_key`, §12.3) — so `entity.event_type_primary` is never a secondary-type candidate; only each constituent `entity_events.additional_outcome.output.event_type_secondary` (nullable, at most one per entity, system-design.md §9.4/OQ-8) is. Count frequency of each distinct non-`NULL` value among the matched rows, take the top 2. OQ-8 covers per-article ties (none possible — one value per entity) but not an Event-level frequency tie between two distinct types with only one slot left; that residual case is resolved here as most-recent `published_at` wins.
 
@@ -2843,6 +2924,50 @@ _SELECT_AGGREGATION_UPDATED_AT_SQL = "SELECT aggregation_updated_at FROM events 
 async def fetch_aggregation_updated_at(self, event_id: UUID) -> Optional[datetime]:
     row = await self._db.fetch_one(_SELECT_AGGREGATION_UPDATED_AT_SQL, event_id)
     return row["aggregation_updated_at"] if row is not None else None
+```
+
+#### Method: `fetch_unpublished_events(event_ids: list[UUID]) -> list[Event]`
+
+`AggregationService._persist_and_publish()`'s (§12.1) outbox read — among the given `event_ids` only, the rows whose `aggregation_updated_at` hasn't been published yet. Never a table-wide read: the caller always passes the Events it just persisted. Faithful filter on two columns; deciding to publish them is the caller's. Served by the primary key.
+
+```python
+_SELECT_UNPUBLISHED_EVENTS_SQL = """
+    SELECT * FROM events
+    WHERE event_id = ANY($1)
+      AND (published_aggregation_updated_at IS NULL
+           OR published_aggregation_updated_at < aggregation_updated_at)
+"""
+
+async def fetch_unpublished_events(self, event_ids: list[UUID]) -> list[Event]:
+    rows = await self._db.fetch_all(_SELECT_UNPUBLISHED_EVENTS_SQL, event_ids)
+    return [_row_to_event(row) for row in rows]
+```
+
+#### Method: `mark_published(event_id: UUID, aggregation_updated_at: datetime) -> None`
+
+Records that `aggregation_updated_at`'s version of `event_id` was published. Only moves forward, so marking an older version never un-marks a newer one, and a newer write that landed after the caller's read stays pending.
+
+```python
+_MARK_PUBLISHED_SQL = """
+    UPDATE events SET published_aggregation_updated_at = $2
+    WHERE event_id = $1
+      AND (published_aggregation_updated_at IS NULL OR published_aggregation_updated_at < $2)
+"""
+
+async def mark_published(self, event_id: UUID, aggregation_updated_at: datetime) -> None:
+    await self._db.execute(_MARK_PUBLISHED_SQL, event_id, aggregation_updated_at)
+```
+
+#### Method: `fetch_mapped_event_id(entity_event_id: UUID) -> Optional[UUID]`
+
+The `event_id` an EntityEvent has already been flushed into, or `None` — `AggregationService.process_entity_event()`'s duplicate check (§12.1) reads it; deciding what a non-`None` result means is that caller's business, not this method's (rule 9). Served by `uq_event_entity_map_entity_event_id` (§17).
+
+```python
+_SELECT_MAPPED_EVENT_ID_SQL = "SELECT event_id FROM event_entity_map WHERE entity_event_id = $1"
+
+async def fetch_mapped_event_id(self, entity_event_id: UUID) -> Optional[UUID]:
+    row = await self._db.fetch_one(_SELECT_MAPPED_EVENT_ID_SQL, entity_event_id)
+    return row["event_id"] if row is not None else None
 ```
 
 #### Method: `update_brief_summary(event_id: UUID, brief_summary: VersionedMetadata[BriefSummary]) -> None`
@@ -3143,14 +3268,15 @@ Purpose :
 
 2. article is None: SADI 404 (silently omitted per api.md §2.5) — not an error (system-design.md §3.6); log warning; return [].
 
-3. result = await EntityAnalysisSkill(EntityAnalysisInput(article.title, article.body), self._config).run() — a fresh instance per call (§8.2).
+3. existing_ids = await self._repo.fetch_entity_event_ids_by_source_url(article.source_url) (§10.1). Non-empty: a redelivery after this article was already persisted (system-design.md §3.4) — skip the Skill, publish stream:entity_event_completed for each id in existing_ids, log entity_analysis_republished (below), return [] (nothing was newly persisted; CleanedNewsConsumer only needs a normal return to ACK, §11.2).
 
-4. result.failure_reason set: log entity_analysis_completed (below, entity_event_ids=[]); raise result.failure_reason() — the original exception, re-raised as itself in every case.
+4. result = await EntityAnalysisSkill(EntityAnalysisInput(article.title, article.body), self._config).run() — a fresh instance per call (§8.2).
 
-5. result.failure_reason is None (incl. entity_events=[]): build one EntityEvent per item (below), reading source_id/source_url/source_name/published_at off article (still a separate CleanedNews variable — never nested onto EntityEvent itself), and stock = get_hk_stock_list_cache().entries[item.stock_code] (§4.2) — an O(1) dict lookup, guaranteed present since EntityAnalysisSkill's own Function Calling loop (§8.2) already verified this exact stock_code against the same cache; {
-    6. self._repo.persist_entities() (below) writes each via INSERT ... ON CONFLICT (source_url, stock_code)
+5. result.failure_reason set: log entity_analysis_completed (below, entity_event_ids=[]); raise result.failure_reason() — the original exception, re-raised as itself in every case.
 
-    7. DO NOTHING RETURNING entity_event_id, setting entity_event_id onto each EntityEvent actually inserted and filtering out the rest;
+6. result.failure_reason is None (incl. entity_events=[]): build one EntityEvent per item (below), reading source_id/source_url/source_name/published_at off article (still a separate CleanedNews variable — never nested onto EntityEvent itself), and stock = get_hk_stock_list_cache().entries.get(item.stock_code) (§4.2) — an O(1) dict lookup. EntityAnalysisSkill's Function Calling loop (§8.2) already verified this stock_code, but against the entries dict as it was at lookup time; a POST /hk-stock-list-sync landing during a later await (e.g. the final structured-output call) can rebind entries to a list without it. On None: drop that item, log warning entity_stock_no_longer_listed (cleaned_id, stock_code), and continue with the rest; {
+    7. self._repo.persist_entities() (§10.1) writes all of them in one transaction, each via INSERT ... ON CONFLICT (source_url, stock_code)
+       DO NOTHING RETURNING entity_event_id, setting entity_event_id onto each EntityEvent actually inserted and filtering out the rest;
 
     8. publish stream:entity_event_completed for each one inserted;
 
@@ -3201,27 +3327,27 @@ class EntityEvent:
                                                      # event_type_primary/sentiment_label/sentiment_score/
                                                      # headline/entity_summary all read off .output, not
                                                      # duplicated as their own fields here
-    stock: Stock                                    # §4.2 — get_hk_stock_list_cache().entries[analysis_outcome.output.stock_code],
-                                                       # an O(1) lookup; also where exchange/stock_code
-                                                       # come from (§10.1's promoted-fields note, below) —
-                                                       # never itself persisted (see below) — recomputed
-                                                       # fresh on both write (find_entity_events()) and
-                                                       # read-back (_row_to_entity_event(), §10.1)
+    stock: Stock                                    # §4.2 — write: get_hk_stock_list_cache().entries[analysis_outcome.output.stock_code];
+                                                       # read-back: rebuilt from the row (_row_to_entity_event(), §10.1).
+                                                       # Also where exchange/stock_code come from (§10.1's
+                                                       # promoted-fields note, below) — see below
     entity_event_id: Optional[UUID] = None       # set by EntityEventRepository.persist_entities() only if this row's insert actually succeeds
-    created_at: Optional[datetime] = None        # mirrors the row's created_at — same datetime.utcnow() value, set alongside entity_event_id
+    created_at: Optional[datetime] = None        # mirrors the row's created_at — same datetime.now(timezone.utc) value, set alongside entity_event_id
 ```
 
 No nested `CleanedNews` field: `source_id`/`source_url`/`source_name`/`published_at` are the only four `CleanedNews` fields anything ever reads off a persisted `EntityEvent` — `title`/`body` never are, on either the write side (`find_entity_events()` already reads them straight off its own `article` variable, before `EntityEvent` is even built) or the read side (`AggregationService.process_entity_event()`, `ScoringService.score_event()`). Carrying a full `CleanedNews` here just to leave `title`/`body` unset on every read-back (`entity_events` never stores them) bought nothing; four flat fields do.
 
 No `exchange`/`stock_code`/`event_type_primary`/`sentiment_label`/`sentiment_score`/`headline`/`entity_summary` fields on `EntityEvent` itself — every one of them is already reachable, with nothing lost: `event_type_primary`/`sentiment_label`/`sentiment_score`/`headline`/`entity_summary` off `analysis_outcome.output` (`AnalysisOutcome` has all five), `exchange`/`stock_code` off `stock` (`Stock` has both, §4.2). Carrying a duplicate flat field for each just to avoid one extra attribute hop would be the "separate persisted-shape type" §3.2's intro warns against, applied to an in-Python convenience field instead of a DB column. The DB row still has its own independent columns for all seven, though (system-design.md §10.1, unaffected by this) — `EntityEventRepository.persist_entities()`/`_row_to_entity_event()` (below) read/write those columns directly off `entity.stock`/`entity.analysis_outcome.output` rather than off `EntityEvent` itself.
 
-`stock` as a whole still isn't persisted — no `entity_events` column, no JSONB key holds a `Stock`. One derived value from it is, though: `entity.stock.company_name` (§4.2 — `company_name_zh`, falling back to `company_name_en` when empty) is snapshotted into `additional_outcome.output.company_name` at write time (below), matching system-design.md §10.1's documented structure for the one field there the LLM never produces. That snapshot is deliberately historical — a later HK Stock List correction (a company rename, say) won't reach rows already written — but that's the right trade-off for a JSONB traceability field recording the name as of scoring time, not a live-lookup field. It's a separate concern from `EntityEvent.stock` itself: anything needing the *current* company name (or `exchange`/`stock_code`) reads `stock` fresh off the live `HKStockListCache` (§4.2), keyed by `analysis_outcome.output.stock_code` — both when `find_entity_events()` first builds this `EntityEvent` and again in `_row_to_entity_event()` (below), which never reads `company_name` back off the row at all — `AnalysisOutcome` has no field for it, so reconstruction gets it exclusively from `stock`, never from the snapshot.
+`stock` is snapshotted into the row at write time — `exchange`/`stock_code` as their own columns, `company_name_zh`/`company_name_en` inside `additional_outcome.output` (§10.1) — and `_row_to_entity_event()` (§10.1) rebuilds `Stock` from that snapshot alone, never from the live `HKStockListCache` (§4.2). Only the write side (`find_entity_events()`) reads the cache. This keeps Aggregation and Scoring independent of the HK Stock List: a stock removed by a later `POST /hk-stock-list-sync`, or an empty fallback cache after a failed startup load (§4.2), would otherwise make every read-back of its rows fail, leaving those EntityEvents unaggregatable and their Events unscorable. The snapshot is deliberately historical — a later HK Stock List correction (a company rename, say) won't reach rows already written — and nothing downstream of read-back needs the current name.
 
 No `metadata`/`updated_at` fields: `metadata` on the wire is only ever `{"cleaned_id": ...}`, already fully recoverable from `source_id`, so there's nothing it carries that `EntityEvent` doesn't already have; `updated_at` is written once at INSERT and never read anywhere in this doc — DB-only bookkeeping, not something any consumer needs on the Python side.
 
 #### Logging: `entity_analysis_completed`
 
 The full `entity_analysis_completed` log event (system-design.md §9.8) is logged directly — no intermediate type. `EntityAnalysisService.find_entity_events()` calls `logger.info("entity_analysis_completed", **dataclasses.asdict(result.skill_log), cleaned_id=cleaned_id, source_url=article.source_url, entity_event_ids=entity_event_ids)`, where `entity_event_ids` is `[]` for any `failure_reason` outcome (logged immediately, before `self._repo.persist_entities()` is ever reached) and `[e.entity_event_id for e in persisted]` on success, after `self._repo.persist_entities()` returns `persisted`. `result.skill_log` is unconditionally present either way, so this call needs no special-casing per outcome.
+
+The redelivery path (step 3 above) never runs the Skill, so there's no `skill_log` to log — it logs `logger.info("entity_analysis_republished", cleaned_id=cleaned_id, source_url=article.source_url, entity_event_ids=existing_ids)` instead.
 
 `EntityEventRepository` (§10.1) is what actually persists these — `EntityAnalysisService` only calls `self._repo.persist_entities()`, described in `find_entity_events()`'s Purpose block above.
 
@@ -3281,7 +3407,7 @@ flowchart TD
     A([_consumer_loop]) --> B[create_group_if_not_exists\nstream:raw_news_cleaned / sapi-entity-analysis]
     B --> C[read_from COUNT=ENTITY_ANALYSIS_BATCH_SIZE BLOCK=ENTITY_ANALYSIS_BATCH_TIMEOUT_MS\nconsumer=config.consumer_name]
     C -->|Empty| C
-    C -->|Messages| D[worker_pool.dispatch each message\nSemaphore ENTITY_ANALYSIS_MAX_CONCURRENT]
+    C -->|Messages| D[gather worker_pool.dispatch over the batch\nSemaphore ENTITY_ANALYSIS_MAX_CONCURRENT\nnext read_from once all return]
     D --> R{len get_hk_stock_list_cache\n> 0?}
     R -->|No - not ready| S[Log warning hk_stock_list_not_ready\nDo not ACK - redeliver later]
     R -->|Yes| E{cleaned_id in\nprocessing_cleaned_ids Set?}
@@ -3328,9 +3454,10 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=ENTITY_ANALYSIS_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= ENTITY_ANALYSIS_MAX_RETRY,
           publish to STREAM_ENTITY_ANALYSIS_DEAD_LETTER and ACK (never reaches
-          _process_one()). Otherwise, extract cleaned_id from fields and call
-          worker_pool.dispatch(lambda: self._process_one(cleaned_id, message_id))
-          — identical dispatch call as _consumer_loop() uses.
+          _process_one()). Otherwise, extract cleaned_id from fields and
+          dispatch via worker_pool.dispatch(lambda: self._process_one(cleaned_id, message_id))
+          — the remaining messages gathered as one batch, identical to
+          _consumer_loop() (§11.3).
           except Exception: log warning entity_analysis_reclaim_sweep_failed
           with exc_info, do not re-raise — retried next tick.
 ```
@@ -3342,6 +3469,7 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
 Two layers, both required, one per class:
 1. **In-memory `Set[str]` `processing_cleaned_ids`, owned by `CleanedNewsConsumer`** — guards concurrent duplicate dispatch, whether the duplicate arrives from the same batch, a later `read_from()` batch, or `_reclaim_loop()`. Safe with no locking (single-threaded asyncio) precisely because check-and-insert has no `await` between them (see `_process_one()` above).
 2. **DB composite unique index on `entity_events (source_url, stock_code)`, enforced inside `EntityEventRepository.persist_entities()`**, `INSERT ... ON CONFLICT (source_url, stock_code) DO NOTHING` — guards cross-batch/cross-restart redelivery, per-entity. This is the layer that actually saves you if a duplicate *does* get past the Set (e.g. a genuine crash-and-restart, where the Set was wiped) — the DB write, not the Set, is the real correctness guarantee, the same relationship the Set/DB-constraint pair always has.
+3. **Redelivery after persist, handled by `EntityAnalysisService.find_entity_events()`'s step 3 (§11.1)** — an article whose rows already exist is republished rather than re-analysed (system-design.md §3.4); Aggregation absorbs the resulting duplicate signal (§12.1).
 
 ### 11.3 `app/entity_analysis/worker_pool.py` — `WorkerPool`
 
@@ -3350,17 +3478,26 @@ class WorkerPool:
     def __init__(self, max_concurrent: int, rate_limit_backoff_s: int): ...
 
     async def dispatch(self, coro_factory: Callable[[], Awaitable[None]]) -> None:
-        """Acquire the semaphore, check rate_limit_until, run coro_factory()."""
+        """Acquire the semaphore, check rate_limit_until, run coro_factory().
+        Returns only once coro_factory() has completed."""
+        async with self._semaphore:
+            while (remaining := self._rate_limit_until - asyncio.get_running_loop().time()) > 0:
+                await asyncio.sleep(remaining)
+            await coro_factory()
 
     def trigger_backoff(self) -> None:
         """Set self._rate_limit_until = now() + rate_limit_backoff_s.
-        Called by any worker whose Skill call returned
-        failure_reason is LLMRateLimitException — the exception itself never
-        reaches this level; each Skill's own run() catches it and reports
-        the outcome normally."""
+        Called by the layer's Consumer when its Service call raises
+        LLMRateLimitException (§11.2's _process_one())."""
 ```
 
-Per system-design.md §12.1's Rate Limit Backoff mechanism: backoff is layer-Pool-level, not per-worker — `dispatch()` checks `self._rate_limit_until` *before* acquiring the semaphore and, if still within the backoff window, awaits `asyncio.sleep()` until it elapses before proceeding. This is the same `WorkerPool` class reused (with independent instances/config) by the Entity Analysis Layer here and the Scoring Layer (§13).
+Per system-design.md §12.1's Rate Limit Backoff mechanism: backoff is layer-Pool-level, not per-worker. `dispatch()` checks `self._rate_limit_until` *after* acquiring the semaphore, in a loop: a caller already waiting on the semaphore when `trigger_backoff()` fires still waits out the backoff once it gets a slot, and a second `trigger_backoff()` that extends the deadline mid-sleep is honoured. Holding a slot while sleeping costs nothing — the whole pool is paused anyway. Work already running is never interrupted.
+
+**`dispatch()` awaits the work, so callers dispatch a whole batch together.** Both of a layer's loops (`_consumer_loop()`/`_reclaim_loop()`, §11.2) run `await asyncio.gather(*(self._worker_pool.dispatch(...) for each message))` over the batch they just read, and read again only once every dispatch has returned — matching system-design.md §3.3's per-batch concurrency. Both loops share the one pool, so `max_concurrent` caps the layer as a whole. Because the work runs inside the layer's own Task, cancelling that Task (shutdown, or §16's Coroutine Monitoring restart) cancels in-flight work with it — `WorkerPool` owns no Tasks of its own. Batch-size trade-off: system-design.md §3.3.
+
+> `RATE_LIMIT_BACKOFF_S * 1000` must stay below `STREAM_CLAIM_TIMEOUT_MS` — system-design.md §12.1 (claim-timeout constraint).
+
+This is the same `WorkerPool` class reused (with independent instances/config) by the Entity Analysis Layer here and the Scoring Layer (§13).
 
 ### 11.4 Error Handling (system-design.md §3.6 table — implementation cross-reference)
 
@@ -3369,7 +3506,7 @@ Per system-design.md §12.1's Rate Limit Backoff mechanism: backoff is layer-Poo
 | LLM API call failure (`LLMProviderException`/`LLMAuthenticationException`) | Caught inside `SkillBase.run()` (§8.1, inherited by `EntityAnalysisSkill`) → `result.failure_reason=type(err)`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` from `result.skill_log` with `entity_event_ids=[]` (nothing was persisted) and re-raises the original exception directly (`raise result.failure_reason()`); `CleanedNewsConsumer` does not ACK. `LLMAuthenticationException` additionally triggers a CRITICAL alert, inlined in `run()`'s `except` block (§8.1) |
 | LLM schema violation | Same, `result.failure_reason=LLMSchemaViolationException` (no fallback exists for this Skill, system-design.md §9.7) — never raised, same logging/outcome/no-ACK treatment |
 | `LLMRateLimitException` | Caught inside `run()` → `result.failure_reason=LLMRateLimitException`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` and re-raises `LLMRateLimitException` itself; `CleanedNewsConsumer` calls `WorkerPool.trigger_backoff()`, does not ACK |
-| All entities filtered out | Valid `output_items=[]`; one row written, `find_entity_events()` returns normally, `CleanedNewsConsumer` ACKs |
+| All entities filtered out | Valid `output_items=[]`; no row written, nothing published, `find_entity_events()` returns normally, `CleanedNewsConsumer` ACKs |
 | `cleaned_id` missing from SADI | `NewsClient.fetch_cleaned_news()` returns `None`; `EntityAnalysisService.find_entity_events()` logs warning, returns normally (not an error, system-design.md §3.6); `CleanedNewsConsumer` ACKs (retry can't help) |
 | DB write failure | `DatabaseClient.execute_returning()` raises `ServiceUnavailableException` after retries exhausted; `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method) |
 | SADI API failure | `NewsClient` raises `NewsClientException` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method, same as a DB write failure above) |
@@ -3392,22 +3529,33 @@ ACK doesn't fit the simple "call the Service, get an outcome back, ACK" shape us
 class AggregationService:
     def __init__(self, config: AggConfig):
         self._entity_event_repo = get_entity_event_repository()   # §10.1 — process_entity_event()'s read
-        self._event_repo = get_event_repository()         # §10.2 — flush()'s write
+        self._event_repo = get_event_repository()         # §10.2 — _persist_and_publish()'s write, _process()'s duplicate check
         self._redis_stream = get_redis_stream_client()    # §6.1 — publish only, never consumes here
         self._event_store = get_event_aggregation_store()   # §12.5
         self._config = config
         self._groups: dict[GroupKey, GroupCoroutine] = {}   # the Coroutine Manager (§12.3)
         self._group_semaphore = asyncio.Semaphore(config.max_concurrent)
+        self._last_flushed: dict[UUID, datetime] = {}   # event_id → aggregation_updated_at this process last flushed
 
-    async def process_entity_event(self, entity_event_id: UUID, on_processed: Callable[[], Awaitable[None]]) -> None:
+    async def process_entity_event(self, entity_event_id: UUID, on_processed: Callable[[], Awaitable[None]],
+                                   on_failed: Callable[[], None]) -> None:
         """All business logic for one EntityEvent lives here — GroupCoroutine
         (§12.3) runs none of it. No ordering requirements beyond __init__ —
         safe to call directly, any number of times, concurrently. on_processed
         is zero-arg — the caller (AggregationConsumer._route_one(), §12.2)
         has already bound whatever data it needs (entity_event_id, message_id)
         into it, since this method's own business logic has no use for
-        message_id beyond forwarding it."""
+        message_id beyond forwarding it. on_failed is its failure-side
+        counterpart: it releases the caller's in-flight guard without ACKing
+        (§12.2), so a redelivery is retried rather than skipped. A failure
+        before the enqueue below propagates to the caller instead, which
+        releases the guard itself."""
         entity_event = await self._entity_event_repo.fetch_entity_event(entity_event_id)   # §10.1 — same row EntityEventRepository.persist_entities() wrote
+        if entity_event is None:
+            # No row for this id — a redelivery can never make it appear, so ACK rather than retry (§12.6)
+            logger.warning("aggregation_entity_event_missing", entity_event_id=entity_event_id)
+            await on_processed()
+            return
         group_key = GroupKey(entity_event.stock.exchange, entity_event.stock.stock_code, entity_event.analysis_outcome.output.event_type_primary)   # §10.1 — EntityEvent has no flat fields of its own for these
         group = self._groups.get(group_key)
         if group is None:
@@ -3427,21 +3575,104 @@ class AggregationService:
                 self._group_semaphore.release()   # lost the race — give back the permit; group already exists
 
         async def _process() -> None:
-            active_event = await self._event_store.get_active_event(entity_event.stock.exchange, entity_event.stock.stock_code, entity_event.analysis_outcome.output.event_type_primary)
-            updated = merge_or_create(active_event, entity_event, self._config)
-            await self._event_store.upsert_active_event(updated, ttl_for(updated, self._config))
-            await on_processed()
+            step = "get_active_event"
+            try:
+                active_event = await self._event_store.get_active_event(entity_event.stock.exchange, entity_event.stock.stock_code, entity_event.analysis_outcome.output.event_type_primary)
+                # Duplicate signal (system-design.md §3.4/§4.4): already merged into the active
+                # Event (not yet flushed, or flushed but still active), or already flushed into
+                # some Event. Checked here, inside the group's serial queue, so it can't race
+                # a concurrent merge of the same entity_event_id.
+                step = "duplicate_check"
+                if (active_event is not None and entity_event_id in active_event.entity_event_ids) \
+                        or await self._event_repo.fetch_mapped_event_id(entity_event_id) is not None:
+                    logger.info("aggregation_duplicate_skipped", entity_event_id=entity_event_id, group_key=group_key)
+                    await on_processed()
+                    return
+                if active_event is not None and is_late(active_event, entity_event, self._config):   # §12.4
+                    # Skipped for now, not merged elsewhere (system-design.md §4.4) — ACKed,
+                    # since redelivery can't change the outcome
+                    logger.warning("aggregation_late_entity_event_skipped", entity_event_id=entity_event_id,
+                                   group_key=group_key, published_at=entity_event.published_at,
+                                   active_event_id=active_event.event_id, active_last_seen_at=active_event.last_seen_at)
+                    await on_processed()
+                    return
+                updated = merge_or_create(active_event, entity_event, self._config)
+                if active_event is not None and updated.event_id != active_event.event_id:
+                    # A new Event replaces the group's active one in the same Redis key —
+                    # persist the replaced Event's final state first, or its unflushed
+                    # merges are lost (system-design.md §4.5)
+                    step = "persist_replaced_event"
+                    await self._persist_and_publish([active_event])
+                step = "upsert_active_event"
+                await self._event_store.upsert_active_event(updated, ttl_for(updated, self._config))
+                step = "on_processed"
+                await on_processed()
+            except Exception:
+                # Never re-raised: one failed EntityEvent must not take down its group
+                # (GroupCoroutine, §12.3). on_failed() releases the in-flight guard
+                # without ACKing, so the reclaim loop retries it (§12.2).
+                logger.error("aggregation_process_failed", entity_event_id=entity_event_id,
+                             group_key=group_key, step=step, exc_info=True)
+                on_failed()
 
         await group.enqueue(_process)
 
     async def flush(self) -> None:
-        """Pure business logic: self._event_repo.persist_events() (§10.2)
-        writes every currently-active Redis Event to DB in one
-        transaction and returns the flushed Events, then this method
-        publishes stream:event_aggregated once per Event.event_id. No
-        consumer-loop concerns — AggregationConsumer decides *when* to
+        """Pure business logic:
+            active = await self._event_store.scan_all()
+            changed = [e for e in active
+                       if self._last_flushed.get(e.event_id) != e.aggregation_updated_at]
+            await self._persist_and_publish(changed)
+            self._last_flushed = {e.event_id: e.aggregation_updated_at for e in active}
+        Only Events whose aggregation_updated_at moved since this process
+        last flushed them are sent (system-design.md §4.5). _last_flushed
+        starts empty, so the first flush after startup sends every active
+        Event — crash recovery is unchanged. It's reassigned only after
+        _persist_and_publish() returns, so a failed flush re-sends the same
+        Events next time; rebuilding it from `active` also drops entries for
+        keys that expired or were replaced. A key changed by _process()
+        between scan_all() and the reassignment records its older scanned
+        value, which differs from the newer one, so the next flush sends it.
+        No consumer-loop concerns — AggregationConsumer decides *when* to
         call this (queue-empty, interval timer, or graceful shutdown,
         §12.2); this method just does it."""
+
+    async def _persist_and_publish(self, events: list[Event]) -> None:
+        """Transactional outbox (system-design.md §4.5):
+        1. self._event_repo.persist_events(events) (§10.2) — one transaction;
+           only newer state is written, and a written row is pending publish
+           by construction (its aggregation_updated_at is now newer than its
+           published_aggregation_updated_at).
+        2. pending = self._event_repo.fetch_unpublished_events(
+           [e.event_id for e in events]) — only the Events given here, never
+           the whole table. A publish lost to a crash is still retried:
+           after a restart, flush()'s empty _last_flushed sends every active
+           Event, and a publish that failed while running leaves
+           _last_flushed unchanged, so the same Events come back next flush.
+           Not recovered: an Event whose Redis key expired before either —
+           a crash plus downtime longer than its TTL (system-design.md §13.2).
+        3. For each pending Event: publish stream:event_aggregated (event_id,
+           v="1"), then self._event_repo.mark_published(event_id,
+           aggregation_updated_at) — the version just published, so a newer
+           write landing in between stays pending.
+        An Event whose aggregation_updated_at didn't advance is never
+        pending, so Scoring never re-scores an unchanged Event. Delivery is
+        at-least-once: a crash between publish and mark_published re-publishes
+        the same version, which Scoring re-scores harmlessly. Shared by
+        flush() and _process()'s replaced-Event branch."""
+
+    async def close(self) -> None:
+        """Cancels every live GroupCoroutine's Task (§12.3) and awaits them.
+        Each group runs its own asyncio.Task, separate from the layer Task, so
+        cancelling the layer Task alone leaves groups merging while the
+        clients close under them. Called only from main.py's shutdown (§16),
+        after the layer Tasks are cancelled and awaited (final flush done) and
+        before clients close — never from AggregationConsumer.start()'s
+        finally, which also runs on a crash-restart: cancelling groups there
+        would strand their queued items in _enqueued (§12.2). Nothing is lost:
+        work cut off before its ACK is redelivered on the next start, and
+        anything merged after the final flush stays in Redis for the next
+        startup's first flush."""
 ```
 
 `AggregationService` is itself a module-level singleton + getter (§5.1), same shape as `EntityAnalysisService` (§11.1):
@@ -3514,7 +3745,7 @@ flowchart TD
     C -->|Empty - queue-empty trigger| FLUSH[service.flush]
     C -->|AGG_DB_FLUSH_INTERVAL_S elapsed\nsince last flush, checked each iteration| FLUSH
     C -->|Messages| RTE{entity_event_id in\n_enqueued Set?}
-    RTE -->|Yes| SKIP[Skip - already enqueued or mid-flush\nleave unACKed for this delivery]
+    RTE -->|Yes| SKIP[Skip - already in flight\nleave unACKed for this delivery]
     RTE -->|No| ADD[Add to _enqueued Set — no await\nbetween this check and this insert]
     ADD --> D[service.process_entity_event entity_event_id, on_processed\nAggregationService — see above]
     D --> C
@@ -3540,7 +3771,20 @@ Purpose : Shared entry point for routing one EntityEvent id, whether it
           arrived via _consumer_loop()'s read_from() or _reclaim_loop()'s
           autoclaim() (§6.1). Implements the flowchart above from the
           _enqueued check onward, then calls
-          self._service.process_entity_event(entity_event_id, lambda: self._on_processed(entity_event_id, message_id)).
+          self._service.process_entity_event(entity_event_id,
+          lambda: self._on_processed(entity_event_id, message_id),
+          lambda: self._enqueued.discard(entity_event_id)) inside
+          try/except Exception: a failure before the enqueue (e.g. the
+          fetch_entity_event() DB read) discards entity_event_id from
+          _enqueued, logs warning aggregation_route_failed with exc_info,
+          and leaves the message unACKed — not re-raised, so one bad
+          message never takes down the consumer loop.
+Why failures release the guard : _enqueued must be cleared on every
+          outcome, not just success — an entry left behind would make every
+          redelivery SKIP until delivery_count reaches AGG_MAX_RETRY and
+          dead-letters a message whose cause (a transient DB/Redis error)
+          had long since cleared. On failure it's cleared without ACKing,
+          so the reclaim loop retries.
 Why the _enqueued guard exists : merge_or_create() (§12.4) does an
           unconditional entity_event_ids.append() with no dedup check — it's
           not safe to call twice for the same entity_event_id. A busy
@@ -3551,6 +3795,9 @@ Why the _enqueued guard exists : merge_or_create() (§12.4) does an
           here, with no `await` in between, closes that gap — same pattern
           as CleanedNewsConsumer's processing_cleaned_ids (§11.2) and
           ScoringConsumer's _in_process (§13.2), now applied to this layer too.
+          It only covers a duplicate that arrives while the first copy is
+          still in flight; one arriving after it was processed is caught by
+          _process()'s duplicate check (§12.1) instead.
 ```
 
 `_enqueued` entries are removed by `_on_processed()` above, called from inside the unit of work `AggregationService.process_entity_event()` builds (§12.1), once `GroupCoroutine._run()` (below) actually gets to it and the merge+upsert for that specific `entity_event_id` completes — not on enqueue, so a message genuinely still waiting in the group's backlog continues to correctly read as "already enqueued" and any redelivery of it keeps no-op'ing until it's actually processed.
@@ -3639,7 +3886,7 @@ class GroupCoroutine:
 
 > **Invariant: this race-freedom depends on two things staying true that aren't visible from the code alone.** `self._queue` must stay unbounded (`asyncio.Queue()`, no `maxsize`) — an unbounded queue's `put()` never suspends, which is what makes a caller's "look up group → enqueue → put on queue" one uninterruptible stretch relative to `_run()`'s own "check `queue.empty()` → evict" stretch; either can run first safely, but only because neither can be interrupted mid-way. `_on_idle` (§12.1's `_on_idle`) must also stay fully synchronous — no `await` inside it — for the same reason: an `await` there would let another task interleave between the empty-check and the dict `pop()`, reopening the exact race this design closes. If `self._queue` ever gets a `maxsize` (e.g. for backpressure) or `_on_idle` ever needs to `await` something, this section's whole safety argument needs revisiting, not just a local tweak.
 
-> **Trade-off: opaque `work` hides context from the stack trace.** When `work()` raises, the exception surfaces at `GroupCoroutine._run()`'s `await work()` — the traceback shows nothing about *which* business step failed (fetch, merge, upsert, or the `on_processed` ACK) or which `entity_event_id`/group it belonged to, since none of that is visible to `_run()`. This is inherent to the pattern (any command/executor design pays this price for the decoupling), not a defect introduced here — but it means `AggregationService.process_entity_event()`'s `_process()` closure (§12.1) must log enough context itself (`entity_event_id`, `group_key`, and which step was in progress) before propagating, typically by wrapping its body in a `try`/`except` that logs and re-raises — otherwise a `GroupCoroutine` crash is nearly undiagnosable from the stack trace alone.
+> **Trade-off: opaque `work` hides context from the stack trace.** When `work()` raises, the exception surfaces at `GroupCoroutine._run()`'s `await work()` — the traceback shows nothing about *which* business step failed (fetch, merge, upsert, or the `on_processed` ACK) or which `entity_event_id`/group it belonged to, since none of that is visible to `_run()`. This is inherent to the pattern (any command/executor design pays this price for the decoupling), not a defect introduced here — but it means `AggregationService.process_entity_event()`'s `_process()` closure (§12.1) must log enough context itself — it does: its `try`/`except` logs `aggregation_process_failed` with `entity_event_id`, `group_key`, and the step in progress, and doesn't re-raise. `_run()`'s own `except` (above) stays as the backstop for a bug outside that `try`.
 
 The Coroutine Manager (`self._groups: dict[GroupKey, GroupCoroutine]`, gated by `self._group_semaphore = asyncio.Semaphore(config.max_concurrent)` on creation — both on `AggregationService`, §12.1) is not a separate module — it is state and logic living directly in `AggregationService`, since its only job is routing and lifecycle, both trivial dict operations; §2's project structure does not name it as a separate file either.
 
@@ -3661,7 +3908,7 @@ Purpose : Given the current active-Event for this group (§3.3's Event, in
           window/hard-cap math below). "Source data is not modified" (system-design.md
           §4.4) — entity_events.published_at itself stays NULL in the DB;
           this is a local substitution for this computation only.
-          aggregation_updated_at is set here — datetime.utcnow(), on every
+          aggregation_updated_at is set here — datetime.now(timezone.utc), on every
           returned Event, both branches — not left for EventRepository's
           UPSERT (§10.2) to stamp at flush time: it's a business-logic
           timestamp (Scoring's staleness key, system-design.md §10.2) meaning "this
@@ -3676,7 +3923,7 @@ Merge/hard-cap/TTL algorithm (rationale — out-of-order arrival, `published_at`
 ```python
 def merge_or_create(active_event: Optional[Event], entity_event: EntityEvent, config: AggConfig) -> Event:
     published_at = entity_event.published_at or entity_event.created_at
-    aggregation_updated_at = datetime.utcnow()
+    aggregation_updated_at = datetime.now(timezone.utc)
 
     if active_event is None:
         return Event(
@@ -3717,6 +3964,16 @@ def merge_or_create(active_event: Optional[Event], entity_event: EntityEvent, co
     )
 ```
 
+#### Function: `is_late(active_event: Event, entity_event: EntityEvent, config: AggConfig) -> bool`
+
+True when `entity_event` is dated before `active_event.last_seen_at` by more than `SLIDING_WINDOW_HOURS` — the case where `merge_or_create()` would otherwise start an older Event and take over the group's active key, closing a live Event early (system-design.md §4.4). Same `published_at` fallback as `merge_or_create()`. Pure, no I/O.
+
+```python
+def is_late(active_event: Event, entity_event: EntityEvent, config: AggConfig) -> bool:
+    published_at = entity_event.published_at or entity_event.created_at
+    return (active_event.last_seen_at - published_at).total_seconds() / 3600 > config.sliding_window_hours
+```
+
 #### Function: `ttl_for(active_event: Event, config: AggConfig) -> int`
 
 `remaining_lifespan = EVENT_MAX_TIMESPAN_HOURS - (entity_event.published_at - event.first_seen_at)`, TTL `= min(SLIDING_WINDOW_HOURS, remaining_lifespan)` — same formula `merge_or_create()` above already applies, expressed there in terms of the raw incoming `entity_event.published_at`. That value is no longer in scope by the time `ttl_for()` runs — it's called on `updated`, the `Event` `merge_or_create()` (§12.4) already returned, after `entity_event` has gone out of scope. The equivalent value here is `active_event.last_seen_at`: `merge_or_create()` already set it to `max(old last_seen_at, entity_event.published_at)`, which equals `entity_event.published_at` exactly in the normal in-order-arrival case, and is the best available substitute (the most recent timestamp actually known for this Event) on the rare out-of-order path, where `entity_event.published_at` itself is no longer the most current reference point anyway.
@@ -3725,8 +3982,11 @@ def merge_or_create(active_event: Optional[Event], entity_event: EntityEvent, co
 def ttl_for(active_event: Event, config: AggConfig) -> int:
     span_hours = (active_event.last_seen_at - active_event.first_seen_at).total_seconds() / 3600
     remaining_lifespan_hours = config.event_max_timespan_hours - span_hours
-    return int(min(config.sliding_window_hours, remaining_lifespan_hours) * 3600)
+    grace_s = 2 * config.db_flush_interval_s   # every key outlives at least one flush (system-design.md §11.2)
+    return int(min(config.sliding_window_hours, remaining_lifespan_hours) * 3600) + grace_s
 ```
+
+The grace period matters near the hard cap, where the remaining lifespan — and so the bare TTL — can be seconds, or round to `0` (`EXPIRE 0` deletes the key at once), letting an ACKed merge expire before any flush persists it. It doesn't affect merging: `merge_or_create()` decides from its own span check, so a key outliving the cap just makes the next EntityEvent start a new Event, with the old one flushed first (§12.1).
 
 Called by `AggregationService.process_entity_event()`'s unit-of-work closure (§12.1) immediately after `merge_or_create()`, passed to `EventAggregationStore.upsert_active_event()`'s `ttl_s` parameter.
 
@@ -3810,10 +4070,11 @@ def create_event_aggregation_store() -> EventAggregationStore:
 
 | Scenario | Implementation |
 |---|---|
-| DB read failure (EntityEvent fetch) | `EntityEventRepository.fetch_entity_event()` (§10.1) raises inside `AggregationService.process_entity_event()`; propagates uncaught to `AggregationConsumer._route_one()`, the consumer/reclaim loop's caller; message left unACKed, log warning |
-| `RedisStateClient` unreachable | `EventAggregationStore` methods raise, inside `AggregationService.process_entity_event()`'s unit-of-work closure; do not ACK; retry per `REDIS_RECONNECT_INTERVAL_S` at the call site |
+| DB read failure (EntityEvent fetch) | `EntityEventRepository.fetch_entity_event()` (§10.1) raises inside `AggregationService.process_entity_event()`, before anything is enqueued; caught by `AggregationConsumer._route_one()` (§12.2): discard from `_enqueued`, log warning `aggregation_route_failed`, leave unACKed — the reclaim loop retries |
+| EntityEvent row not found | `fetch_entity_event()` returns `None` — `stream:entity_event_completed` is only published after `persist_entities()` commits (§11.1), so this means the row is gone, and no redelivery can fix it. `process_entity_event()` logs `aggregation_entity_event_missing` (warning) and calls `on_processed()` (ACK) without enqueueing |
+| `RedisStateClient` unreachable, or any other failure inside the unit of work (duplicate-check read, replaced-Event persist, merge, upsert, ACK) | Caught by `_process()`'s own `try`/`except` (§12.1): log ERROR `aggregation_process_failed` with `entity_event_id`/`group_key`/`step`, call `on_failed()` (discard from `_enqueued`, no ACK), don't re-raise — the group keeps running and the reclaim loop retries |
 | DB Flush failure | `EventRepository.persist_events()` (§10.2) rolls back and re-raises after `_db_write_with_retry()`'s retries are exhausted (§5.2); `AggregationService.flush()` propagates — the next scheduled flush attempt will retry the same still-active Redis state, nothing is lost |
-| `GroupCoroutine` failure | Unhandled exception inside `_run()` — from `await work()`, i.e. from the unit of work's own merge/upsert/`on_processed` call, since `_run()` itself has no business logic to fail — is caught by `_run()` just long enough to call `on_idle` (§12.3: removes the dead group from `AggregationService._groups` and releases its semaphore permit, same as the clean idle-timeout exit) before re-raising and letting the Task crash; its queued messages remain unACKed and stay marked in `AggregationConsumer`'s `_enqueued` (the entries are never falsely freed by a crash — `on_processed` only runs once its enclosing `work` completes successfully, and it's the one thing that both ACKs and clears `_enqueued`, together). They are recovered once `_reclaim_loop()` (§12.2) autoclaims them past `STREAM_CLAIM_TIMEOUT_MS` and routes them back through `AggregationConsumer._route_one()` → `AggregationService.process_entity_event()`, which creates a fresh `GroupCoroutine` for the group (the dead one's dict entry was already removed, so it can never be reused) |
+| `GroupCoroutine` failure | Only reachable by a bug outside `_process()`'s `try` (§12.3's backstop): `_run()` calls `on_idle` (removes the dead group from `AggregationService._groups` and releases its semaphore permit) and re-raises, crashing the layer Task — Coroutine Monitoring (§16) restarts it. Messages still queued on that group stay unACKed and in `_enqueued`; `_enqueued` lives on the `AggregationConsumer` instance, which the restart reuses, so they are only recovered by dead-lettering at `AGG_MAX_RETRY` — acceptable for a genuine bug, which redelivery couldn't fix anyway |
 | `RedisStreamClient` unreachable | Per §6.1's reconnect behaviour |
 
 ---
@@ -3949,7 +4210,8 @@ def create_scoring_service(config: ScoringConfig) -> ScoringService:
 #### Method: `ScoringService.score_event()` internals
 
 ```
-Purpose : 1. event = await self._event_repo.fetch_event(event_id) (§10.2);
+Purpose : 1. event = await self._event_repo.fetch_event(event_id) (§10.2).
+             None: log warning scoring_event_missing; return (ACKed, §13.6).
              expected = event.aggregation_updated_at. constituent_entity_events
              = await self._entity_event_repo.fetch_entity_events_for_event(event_id)
              (§10.1). source_names = [s.source_name for s in event.source_list].
@@ -3994,10 +4256,12 @@ Purpose : 1. event = await self._event_repo.fetch_event(event_id) (§10.2);
              needs protecting: the expensive EventLLMScoringSkill LLM call
              (step 7) about to run, not the cheap write just above it.
           7. result2 = await EventLLMScoringSkill(EventLLMScoringInput(event,
-             brief_summary, result.skill_log.fallback)).run() — a fresh
-             instance per call (§8.4); rule_score_detail (step 3) is already
+             constituent_entity_events[0].stock, brief_summary,
+             result.skill_log.fallback)).run() — a fresh instance per call
+             (§8.4); every constituent shares the Event's stock_code (the
+             merge key, §12.3), so [0] is as good as any; rule_score_detail (step 3) is already
              available, so there's nothing left to gather this against
-             either. scored_at = utcnow(), captured here — the moment run()
+             either. scored_at = datetime.now(timezone.utc), captured here — the moment run()
              actually returns, matching EventScore.scored_at's own
              "EventLLMScoringSkill completion time" (above) — not later,
              after step 9's DB round-trip.
@@ -4299,6 +4563,7 @@ async def count_active_sources(config: ScoringConfig) -> int:
 | Scenario | Implementation |
 |---|---|
 | DB read failure | `EventRepository.fetch_event()`/`EntityEventRepository.fetch_entity_events_for_event()` (§10.2/§10.1) raise inside `ScoringService.score_event()`; propagates uncaught to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK |
+| Event row not found | `fetch_event()` returns `None` — `stream:event_aggregated` is only published after `persist_events()` commits (§12.1), so this means the row is gone, and no redelivery can fix it. `score_event()` logs `scoring_event_missing` (warning) and returns; ACKed the same as success (§13.2) |
 | BriefSummarySkill: `LLMSchemaViolationException` | Fallback applied inside the Skill (§8.3) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
 | EventLLMScoringSkill: `LLMSchemaViolationException` | Fallback applied inside the Skill (§8.4) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
 | Either Skill: `LLMRateLimitException`/`LLMProviderException`/`LLMAuthenticationException` | Caught inside `SkillBase.run()` (§8.1, inherited by both Skills) → `result.failure_reason=type(err)` (the caught exception's own class), never raised by `run()` itself; `ScoringService.score_event()` logs the Skill's completion event from `result.skill_log` and re-raises `result.failure_reason()` directly, same as `find_entity_events()` (§11.1); `ScoringConsumer` calls `WorkerPool.trigger_backoff()` only for `LLMRateLimitException`, removes from `_in_process`, does not ACK either way. `LLMAuthenticationException` additionally triggers a CRITICAL alert, inlined in `SkillBase.run()`'s `except` block |
@@ -4610,7 +4875,7 @@ Pure — no I/O, no mutation, returns `(final_base_rule_score, final_abs_final_s
 
 ```python
 def _apply_recency(aggregation_updated_at: datetime, stored_base_rule_score: float, direction: int, stock_impact_score: float, decay_lambda: float) -> tuple[float, float]:
-    hours_elapsed = (datetime.utcnow() - aggregation_updated_at).total_seconds() / 3600
+    hours_elapsed = (datetime.now(timezone.utc) - aggregation_updated_at).total_seconds() / 3600
     recency_score = 10 * math.exp(-decay_lambda * hours_elapsed)
     final_base_rule_score = (stored_base_rule_score + recency_score * 0.20) * direction
     final_abs_final_score = abs(final_base_rule_score * 0.67 + stock_impact_score * 0.33 * 2)
@@ -4665,7 +4930,7 @@ def _incremental_merge(current: dict[UUID, CacheRecord], candidates: dict[UUID, 
 async def _write_new_version(self, sorted_records: list[CacheRecord], old_version: Optional[int]) -> None:
     new_version = await self._cache_store.incr_version_counter()
     await self._cache_store.write_cache_version(
-        new_version, json.dumps([r.to_dict() for r in sorted_records]), datetime.utcnow(), old_version,
+        new_version, json.dumps([r.to_dict() for r in sorted_records]), datetime.now(timezone.utc), old_version,
     )
     # write_cache_version (§10.4) performs SET v{new}, SET current_version, DEL v{old}, SET last_updated
     # as one atomic MULTI/EXEC pipeline — readers never observe a version between "new written" and
@@ -4849,8 +5114,8 @@ Returns : HTTP 200 (healthy or degraded) or HTTP 503 (unhealthy)
 
 ```
 database    = ok   if `SELECT 1` succeeds, else error
-redis_stream = ok  if RedisStreamClient PING succeeds, else error
-redis_state  = ok  if RedisStateClient PING succeeds, else error
+redis_stream = ok  if RedisStreamClient.ping() (§6.1) succeeds, else error
+redis_state  = ok  if RedisStateClient.ping() (§6.2) succeeds, else error
 hk_stock_list = ok if len(hk_stock_list_cache) > 0, else not_ready   # §4.2 — in-process, no
     Redis; hk_stock_list_cache injected via Depends(get_hk_stock_list_cache),
     imported directly from app.common.hk_stock_list (§4.2), not §15.6
@@ -4989,8 +5254,6 @@ from app.common.http_client import create_http_client
 from app.clients.news_client import create_news_client
 from app.clients.admin_client import create_admin_client
 from app.common.hk_stock_list import refresh_hk_stock_list
-from app.common.lookup_stock import lookup_stock  # bound into EntityAnalysisSkill's tool dispatch
-from app.skills.entity_analysis_skill import EntityAnalysisSkill
 from app.entity_analysis.worker_pool import WorkerPool
 from app.persistent.entity_event_repository import create_entity_event_repository
 from app.persistent.event_repository import create_event_repository
@@ -5026,10 +5289,10 @@ async def lifespan(app: FastAPI):
     db = await create_db_client(config.db)
     redis_stream = await create_stream_client(config.redis.stream_url)
     redis_state = await create_state_client(config.redis.state_url)
-    http_client = create_http_client(timeout=config.llm.api_timeout_s)
+    http_client = create_http_client(config.http.timeout_s)
 
     llm_adapter = create_llm_adapter(config.llm)
-    news_client = create_news_client(http_client, config.entity_analysis.sadi_api_url, config.entity_analysis.sadi_api_timeout_s)
+    news_client = create_news_client(http_client, config.entity_analysis.sadi_api_url)
     admin_client = create_admin_client(http_client, config.scoring.admin_api_url)
     entity_event_repository = create_entity_event_repository()
     event_repository = create_event_repository()
@@ -5076,7 +5339,7 @@ async def lifespan(app: FastAPI):
     # in this function is threaded into a Consumer by hand any more.
     create_entity_analysis_service(config.entity_analysis)
     cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis)
-    create_aggregation_service(config.agg)
+    aggregation_service = create_aggregation_service(config.agg)
     agg_consumer = AggregationConsumer(config.agg)
     create_scoring_service(config.scoring)
     scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring)
@@ -5138,6 +5401,7 @@ async def lifespan(app: FastAPI):
     for task in layer_tasks.values():
         task.cancel()
     await asyncio.gather(*layer_tasks.values(), return_exceptions=True)
+    await aggregation_service.close()   # group Tasks outlive the layer Task (§12.1)
     await llm_adapter.close()
     await http_client.aclose()
     await redis_stream.close()
@@ -5166,7 +5430,9 @@ alembic revision --autogenerate -m "description"
 alembic downgrade -1
 ```
 
-### `alembic/versions/001_create_tables.py`
+One migration file per table group, added by whichever layer first writes to it — an applied migration is never edited afterwards, so a table is only created once something actually uses it. File order follows the foreign-key dependencies below (`event_entity_map` references `entity_events`; `event_scores` references `events`).
+
+### `alembic/versions/001_create_entity_events.py`
 
 **`entity_events`**
 ```sql
@@ -5198,6 +5464,8 @@ CREATE INDEX idx_entity_events_exchange ON entity_events (exchange);
 CREATE INDEX idx_entity_events_stock_event_type ON entity_events (stock_code, event_type_primary);
 ```
 
+### `alembic/versions/002_create_events.py`
+
 **`events`**
 ```sql
 CREATE TABLE events (
@@ -5211,6 +5479,7 @@ CREATE TABLE events (
     last_seen_at                 TIMESTAMPTZ NOT NULL,
     brief_summary                 JSONB,
     aggregation_updated_at        TIMESTAMPTZ NOT NULL,
+    published_aggregation_updated_at TIMESTAMPTZ,   -- outbox marker: last aggregation_updated_at published to stream:event_aggregated (§10.2); NULL = never published
     updated_at                    TIMESTAMPTZ NOT NULL,
     created_at                    TIMESTAMPTZ NOT NULL
 );
@@ -5220,6 +5489,22 @@ CREATE INDEX idx_events_stock_event_type ON events (stock_code, event_type_prima
 CREATE INDEX idx_events_aggregation_updated_at ON events (aggregation_updated_at);
 CREATE INDEX idx_events_stock_code ON events (stock_code);
 ```
+
+**`event_entity_map`**
+```sql
+CREATE TABLE event_entity_map (
+    event_id          UUID NOT NULL REFERENCES events(event_id),
+    entity_event_id     UUID NOT NULL REFERENCES entity_events(entity_event_id),
+    created_at            TIMESTAMPTZ NOT NULL,
+    CONSTRAINT pk_event_entity_map PRIMARY KEY (event_id, entity_event_id),
+    CONSTRAINT uq_event_entity_map_entity_event_id UNIQUE (entity_event_id)
+    -- "one EntityEvent belongs to exactly one Event" (system-design.md §10.4)
+);
+
+CREATE INDEX idx_event_entity_map_event_id ON event_entity_map (event_id);
+```
+
+### `alembic/versions/003_create_event_scores.py`
 
 **`event_scores`**
 ```sql
@@ -5244,19 +5529,6 @@ CREATE INDEX idx_event_scores_base_rule_score ON event_scores (base_rule_score);
 CREATE INDEX idx_event_scores_llm_fallback ON event_scores (llm_fallback);
 ```
 
-**`event_entity_map`**
-```sql
-CREATE TABLE event_entity_map (
-    event_id          UUID NOT NULL REFERENCES events(event_id),
-    entity_event_id     UUID NOT NULL REFERENCES entity_events(entity_event_id),
-    created_at            TIMESTAMPTZ NOT NULL,
-    CONSTRAINT pk_event_entity_map PRIMARY KEY (event_id, entity_event_id),
-    CONSTRAINT uq_event_entity_map_entity_event_id UNIQUE (entity_event_id)
-    -- "one EntityEvent belongs to exactly one Event" (system-design.md §10.4)
-);
-
-CREATE INDEX idx_event_entity_map_event_id ON event_entity_map (event_id);
-```
 
 ---
 
@@ -5276,7 +5548,7 @@ Per the top-level `CLAUDE.md` working rule: check open questions in the system-d
 | Q-8 | Validate BriefSummarySkill's 200-char input cap against real aggregated Events | BriefSummarySkill output quality | Week 2 |
 | Q-9 | Validate `RATE_LIMIT_BACKOFF_S=60` against actual Vertex AI rate limit reset window | LLM throughput | Week 1 |
 | Q-10 | Post-MVP: quality monitoring Service design (log ingestion, LLM-as-Judge, post-event price correlation) | LLM quality improvement | Post-MVP |
-| Q-11 | Validate `LLM_API_TIMEOUT_S=30` and `SADI_API_TIMEOUT_S=10` against real latency measurements | Latency tuning | Week 1 |
+| Q-11 | Validate `LLM_API_TIMEOUT_S=30` and the common `HTTP_TIMEOUT_S=120` (§4.1 — covers SADI, Admin, and HKEXnews calls) against real latency measurements | Latency tuning | Week 1 |
 | Q-15 | Validate `source_heat_score`'s `source_count / TOTAL_ACTIVE_SOURCES` formula against real cross-source corroboration rates | `source_heat_score` calibration | Week 1-2 |
 | Q-16 | Validate `lookup_stock`'s fuzzy name-matching against real HK news article entity mentions | EntityAnalysisSkill accuracy | Week 2 |
 

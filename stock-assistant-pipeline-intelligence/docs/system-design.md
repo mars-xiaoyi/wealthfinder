@@ -197,7 +197,10 @@ flowchart TD
     A[Read batch messages] --> B{Messages received?}
     B -->|Timeout| A
     B -->|Yes| C[Fetch article content from SADI]
-    C --> D[Worker Pool]
+    C --> P{EntityEvents already\npersisted for source_url?}
+    P -->|Yes - redelivery| R[Re-emit signal per EntityEvent\nACK]
+    R --> A
+    P -->|No| D[Worker Pool]
     D --> E[EntityAnalysisSkill per article]
     E -->|Success| F[Write to DB\nEmit signal\nACK]
     E -->|Failure| G{Retry limit reached?}
@@ -214,7 +217,7 @@ flowchart TD
 - Returns up to `ENTITY_ANALYSIS_BATCH_SIZE` messages immediately when available
 - Returns whatever is available after `ENTITY_ANALYSIS_BATCH_TIMEOUT_MS` if batch size not reached
 
-`asyncio.Semaphore(ENTITY_ANALYSIS_MAX_CONCURRENT)` limits concurrent LLM API calls within each batch.
+`asyncio.Semaphore(ENTITY_ANALYSIS_MAX_CONCURRENT)` limits concurrent LLM API calls within each batch. The next read waits until every message in the current batch has finished, so the batch's slowest article bounds it — keeping `ENTITY_ANALYSIS_BATCH_SIZE` close to `ENTITY_ANALYSIS_MAX_CONCURRENT` means a batch rarely queues on the semaphore (tuned under Q-1).
 
 ### 3.4 Idempotency
 
@@ -235,6 +238,15 @@ Safe for asyncio single-threaded concurrency — no locking required.
 
 `entity_events` has a composite unique index on `(source_url, stock_code)`, not `source_url` alone — one article can produce multiple `entity_events` rows, one per verified entity (§9.4's `EntityAnalysisResult.entity_events`), so a single-column unique index on `source_url` would silently drop every entity past the first for a multi-entity article. All DB inserts use `INSERT ON CONFLICT (source_url, stock_code) DO NOTHING`, ensuring redelivered messages never produce duplicate `(article, entity)` records.
 
+**Redelivery after persist — at-least-once signal delivery:**
+
+An article's message can be redelivered after its EntityEvents were already committed — a crash or a failed emit between the DB write and the `stream:entity_event_completed` signal, or a lost ACK. Re-running EntityAnalysisSkill at that point would let the unique constraint silently drop every row as a conflict, so a row whose signal never went out would never reach the Aggregation Layer; and since LLM output isn't deterministic, a re-run may not even produce the same entities. So:
+
+- All of one article's EntityEvents are written in a single DB transaction — an article is either fully persisted or not at all.
+- Before invoking EntityAnalysisSkill, the layer checks whether EntityEvents already exist for the article's `source_url`. If they do, it skips the Skill and re-emits the signal for each existing EntityEvent, then ACKs.
+
+This makes the signal at-least-once: the same `entity_event_id` can reach the Aggregation Layer more than once, which it absorbs as a no-op (§4.4).
+
 ### 3.5 Configuration Parameters
 
 Defined as `EntityAnalysisConfig`: implementation.md §4.1.
@@ -246,7 +258,7 @@ Defined as `EntityAnalysisConfig`: implementation.md §4.1.
 | LLM API call failure | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
 | LLM schema violation (Instructor exhausted retries) | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
 | `LLMRateLimitError` | Pause entire Worker Pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
-| All entities filtered by stock verification | Write empty `entities=[]` record; emit signal; ACK — valid outcome |
+| All entities filtered by stock verification | Valid `entities=[]` outcome — no DB record written, no signal emitted; ACK |
 | `cleaned_id` missing from SADI's `cleaned_news` response (silently omitted per `api.md` §2.5, not an HTTP error) | Log warning with `cleaned_id`; ACK — skip this article. Retrying would not recover an ID that isn't in SADI's response. Not expected in normal operation today (SADI has no `cleaned_news` retention/purge job as of this writing) — the log exists to surface it if that changes |
 | DB write failure | See Section 12.1 DB Write Failure policy |
 | SADI API failure | Do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
@@ -271,8 +283,14 @@ flowchart TD
     E --> F{Group exists?}
     F -->|Yes| G[Enqueue to group]
     F -->|No| H[Create group\nEnqueue]
-    G --> I[Sliding window merge\nUpdate Redis\nACK]
-    H --> I
+    G --> J{EntityEvent already\nin an Event?}
+    H --> J
+    J -->|Yes - duplicate signal| K[Skip\nACK]
+    J -->|No| L{Dated before the active\nEvent's window?}
+    L -->|Yes - late EntityEvent| M[Log and skip\nACK]
+    L -->|No| I[Sliding window merge\nUpdate Redis\nACK]
+    K --> A
+    M --> A
     I --> A
     D --> A
 ```
@@ -289,11 +307,17 @@ coroutines: Dict[(exchange, stock_code, event_type_primary), GroupCoroutine]
 - Each Group Coroutine contains an internal `asyncio.Queue` — EntityEvents for the same group are processed strictly serially, preventing concurrent modification of the same sliding window state
 - Group Coroutine is destroyed after `AGG_GROUP_IDLE_TIMEOUT_S` of inactivity; removed from manager dict on destruction
 
+> **Known limitation — a permit is held for a group's whole life, not just while it works.** Each live Group Coroutine keeps one `AGG_MAX_CONCURRENT` permit until it has been idle for `AGG_GROUP_IDLE_TIMEOUT_S`. When more distinct groups are live than there are permits, the next new group waits for a permit inside the consumer loop — which also runs the flush triggers (§4.5) — so intake and flushing both stall until some group idles out. Nothing is lost (messages wait unACKed, Redis keeps active state), but output lags. MVP mitigation: `AGG_MAX_CONCURRENT` is sized above the peak number of distinct groups live within any `AGG_GROUP_IDLE_TIMEOUT_S` window, and that peak is measured after release. **Proper fix, for a later version:** hold a permit only while a group is actively processing an item (acquire before each unit of work, release after), so the limit caps concurrent Redis/DB work rather than live groups; creating a group would then never block the consumer loop. This changes the group lifecycle (today a permit is acquired on creation and released by the idle teardown), so it's deferred rather than done now.
+
 ### 4.4 Sliding Window Algorithm
 
 Within each Group Coroutine, EntityEvents are processed in arrival order from the internal queue: each incoming EntityEvent either merges into the group's current active Event (extending `first_seen_at`/`last_seen_at` and resetting its Redis TTL) or starts a new one, decided by a time-gap merge window plus a hard cap on the Event's total span, so a slow-burning story can't accrete forever. Exact merge/hard-cap formula and TTL computation: implementation.md §12.4 (`merge_or_create()`, `ttl_for()`).
 
 > **Out-of-order arrival:** messages are processed in the order they're read from the Stream, not article publication order — a crawler batch, retry, or multi-source timing skew can deliver an EntityEvent whose `published_at` is *earlier* than one already merged into the same group. `last_seen_at`/`first_seen_at` must therefore be updated via `max`/`min`, not blind overwrite — a blind overwrite would let `last_seen_at` regress, and never updating `first_seen_at` after Event creation would understate the group's true elapsed span in the hard-cap calculation, letting merges through that `EVENT_MAX_TIMESPAN_HOURS` should have rejected.
+
+> **Late EntityEvents are skipped, for now.** An EntityEvent dated before the group's active Event by more than `SLIDING_WINDOW_HOURS` (a crawler backfill, a long retry) would otherwise start an older Event and take over the group's single active slot (§11.2) — closing the live Event early and splitting its story once the next current article arrives. Instead it's logged and ACKed without being merged anywhere. Merging it into the older, already-flushed Event it belongs to is deferred until the log shows how often this happens.
+
+> **Duplicate EntityEvents:** the Entity Analysis Layer's signal is at-least-once (§3.4), and the merge itself is not idempotent — merging the same EntityEvent twice double-counts it, or, once its original Event has been flushed and left Redis, creates a second Event for an EntityEvent that already belongs to one. Before merging, the Group Coroutine therefore skips (and ACKs) any EntityEvent already in the group's active Event or already mapped in `event_entity_map` (§10.4). The check runs inside the group's serial queue (§4.3), so it can't race with a concurrent merge of the same EntityEvent.
 
 > **`published_at` fallback:** Retrieved via `COALESCE(published_at, created_at)` at query time. Source data is not modified.
 
@@ -310,7 +334,9 @@ On each flush, within a single DB transaction:
 - `aggregation_updated_at` is written as-is from each in-memory `Event` — it is business logic, set the moment a merge/create actually happens (§4.4), not a value the UPSERT computes itself; a group untouched since the last flush keeps its prior value rather than being re-stamped with the current time
 - All EntityEvent-to-Event mappings written to `event_entity_map` via `INSERT ON CONFLICT DO NOTHING`
 
-After transaction commits, `stream:event_aggregated` is emitted per event_id.
+`stream:event_aggregated` is emitted only for Events actually written — new ones, or ones whose `aggregation_updated_at` changed — through a transactional outbox: Postgres and Redis can't share a transaction, so the write itself marks the Event as pending publish (its `aggregation_updated_at` is newer than its last-published version, a column on `events`) in the same DB transaction. After commit, each pending Event among those just persisted is published and then marked published — the check never reads the whole table. A crash between commit and publish leaves the marker in place, and the next flush publishes it — committed state is always published at least once, never silently dropped. The first flush after startup upserts every active Event (so a crash before the previous flush loses nothing); after that, a flush sends only Events whose `aggregation_updated_at` moved since this process last flushed them — re-sending an unchanged Event would only re-run its aggregation queries for nothing. An Event nothing has merged into since the last flush keeps its `aggregation_updated_at`, is a no-op in the DB, and emits nothing — otherwise each idle-queue flush would re-trigger Scoring's LLM calls for every active Event with identical input. A write only lands if its `aggregation_updated_at` is newer than the stored one: a flush works from a Redis snapshot taken before its transaction, and a replaced Event (below) may already have been persisted with newer state in between — the older snapshot must not overwrite it.
+
+> **Replaced Events are flushed first.** Each group holds one active Event in Redis (§11.2). When an incoming EntityEvent falls outside the sliding window or breaks the hard cap (§4.4), the new Event takes over that same Redis slot — so the replaced Event's final state is persisted and emitted immediately, before the overwrite. Otherwise any merges into it since the last flush would be lost.
 
 > **TTL safety constraint:** `AGG_BATCH_TIMEOUT_MS` and `AGG_DB_FLUSH_INTERVAL_S` must be significantly smaller than `SLIDING_WINDOW_HOURS` converted to milliseconds to ensure all active Events are persisted to DB before their Redis TTL expires.
 
@@ -325,9 +351,10 @@ Defined as `AggConfig`: implementation.md §4.1.
 | Scenario | Strategy |
 |---|---|
 | DB read failure | Do not ACK; log warning |
-| RedisStateClient unreachable | Do not ACK; retry with fixed interval |
+| RedisStateClient unreachable | Do not ACK; release the in-flight guard; retried when the reclaim loop redelivers the message (`STREAM_CLAIM_TIMEOUT_MS`) |
 | DB Flush failure | See Section 12.1 DB Write Failure policy |
-| Group Coroutine failure | UnACked messages redelivered via XAUTOCLAIM → group recreated → reprocessed |
+| Group Coroutine crash (a bug outside the per-message failure handling) | Group torn down and the layer Task restarted; messages still queued on that group stay marked in flight, so they're dead-lettered at `AGG_MAX_RETRY` rather than reprocessed — acceptable for a genuine bug, which redelivery couldn't fix |
+| Any per-message failure above | The in-flight duplicate guard is released along with the no-ACK — otherwise every redelivery would be skipped as "already in progress" until it dead-lettered, turning a transient error into a lost EntityEvent |
 | RedisStreamClient unreachable | See Section 12.1 RedisStreamClient policy |
 
 ---
@@ -910,7 +937,7 @@ Exact column types, nullability, and indexes for all four tables are defined onc
 
 ### 10.1 `entity_events` Table
 
-Written by Entity Analysis Layer: one record per verified entity per article, so a multi-entity article produces multiple rows — the idempotency key is `(source_url, stock_code)`, not `source_url` alone, for that reason (§9.4). `sentiment_label`, `sentiment_score`, `headline`, and `entity_summary` are independent columns because Aggregation and Scoring Layers read them directly without JSONB parsing; `event_type_secondary` and `company_name` have no independent query requirement and stay inside the `additional_outcome` JSONB output instead.
+Written by Entity Analysis Layer: one record per verified entity per article, so a multi-entity article produces multiple rows — the idempotency key is `(source_url, stock_code)`, not `source_url` alone, for that reason (§9.4). `sentiment_label`, `sentiment_score`, `headline`, and `entity_summary` are independent columns because Aggregation and Scoring Layers read them directly without JSONB parsing; `event_type_secondary` and `company_name_zh`/`company_name_en` have no independent query requirement and stay inside the `additional_outcome` JSONB output instead.
 
 ### 10.2 `events` Table
 
@@ -922,7 +949,7 @@ Written by Scoring Layer via Upsert: one record per Event, overwritten on each r
 
 ### 10.4 `event_entity_map` Table
 
-Written by Aggregation Layer during DB Flush: the many-to-one association between EntityEvents and Events, one row per EntityEvent — unique on `entity_event_id`, since an EntityEvent belongs to exactly one Event. Written idempotently (`INSERT ... ON CONFLICT DO NOTHING`), since the `entity_event_ids` array backing this in Redis (§11.2) is not cleared after a Flush and so the same mapping may be attempted again on a later cycle. Scoring Layer (via BriefSummarySkill) queries an Event's constituent EntityEvents through this table.
+Written by Aggregation Layer during DB Flush: the many-to-one association between EntityEvents and Events, one row per EntityEvent — unique on `entity_event_id`, since an EntityEvent belongs to exactly one Event. Written idempotently (`INSERT ... ON CONFLICT DO NOTHING`), since the `entity_event_ids` array backing this in Redis (§11.2) is not cleared after a Flush and so the same mapping may be attempted again on a later cycle. Scoring Layer (via BriefSummarySkill) queries an Event's constituent EntityEvents through this table; the Aggregation Layer also reads it to skip an EntityEvent that has already been flushed into an Event (§4.4).
 
 ---
 
@@ -937,7 +964,7 @@ Written by Aggregation Layer during DB Flush: the many-to-one association betwee
 
 ### 11.2 Aggregation Layer — Active Events
 
-One Redis key per active Event, holding the in-progress sliding-window merge state (§4.4) until the next DB Flush persists it. TTL is reset on every merge and bounded by `min(SLIDING_WINDOW_HOURS, remaining_lifespan)`, so a key expires naturally exactly when the sliding window closes or `EVENT_MAX_TIMESPAN_HOURS` is reached (§4.4) — this is also why `AGG_BATCH_TIMEOUT_MS`/`AGG_DB_FLUSH_INTERVAL_S` must stay significantly smaller than `SLIDING_WINDOW_HOURS`: DB Flush (§4.5) must always persist an active Event well before its Redis TTL could expire it. Exact key layout: implementation.md §12.5 (`EventAggregationStore`).
+One Redis key per active Event, holding the in-progress sliding-window merge state (§4.4) until the next DB Flush persists it. TTL is reset on every merge to `min(SLIDING_WINDOW_HOURS, remaining_lifespan)` plus a grace period of two `AGG_DB_FLUSH_INTERVAL_S`, so a key expires shortly after the sliding window closes or `EVENT_MAX_TIMESPAN_HOURS` is reached (§4.4). The grace period guarantees every key outlives at least one flush even near the hard cap, where the remaining lifespan can be seconds; merging is unaffected, since the merge decision comes from the Event's own span, not from whether its key still exists. This is also why `AGG_BATCH_TIMEOUT_MS`/`AGG_DB_FLUSH_INTERVAL_S` must stay significantly smaller than `SLIDING_WINDOW_HOURS`: DB Flush (§4.5) must always persist an active Event well before its Redis TTL could expire it. Exact key layout: implementation.md §12.5 (`EventAggregationStore`).
 
 ### 11.3 Source Configuration
 
@@ -963,6 +990,7 @@ When any Skill's `run()` reports `failure_reason=LLMRateLimitError` (§9.7 — `
 
 - Backoff is applied at the Layer level (Worker Pool), not the individual worker level — prevents concurrent workers from continuing to hit the API during the backoff window
 - Message is not ACKed during backoff; redelivered after backoff period ends
+- **Claim-timeout constraint:** `RATE_LIMIT_BACKOFF_S` must stay below `STREAM_CLAIM_TIMEOUT_MS` (converted to seconds). A message stays pending in the Stream while the pool sleeps, so a longer backoff lets the reclaim loop claim it and raise its `delivery_count` — repeated rate limits could then dead-letter a healthy message
 - Log WARNING on each rate limit event with `layer`, `backoff_until` fields
 
 **LLM Authentication Failure**
@@ -1029,7 +1057,7 @@ Each layer writes unrecoverable messages to its own Dead Letter Stream when `del
 | `stream:scoring_dead_letter` | Scoring Layer |
 | `stream:cache_dead_letter` | Cache Layer |
 
-Dead Letter message fields: `message_id`, `event_id` / `entity_event_id`, `error_type`, `error_detail`, `delivery_count`, `failed_at`, `layer`.
+Dead Letter message fields: `message_id`, `fields` (the original message), `delivery_count`, `failed_at`, `v`. Exact payload: implementation.md §6.1.
 
 **Retry Count via delivery_count**
 
@@ -1087,6 +1115,19 @@ This lightweight mechanism handles coroutine crash recovery without requiring ha
 
 Full environment variable list (with defaults) and project directory structure are defined in implementation.md §4.1 and §2 respectively — not duplicated here.
 
+### 13.2 Scaling and Availability Considerations
+
+SAPI is designed and deployed as **exactly one replica** for now — multiple replicas and high availability have not been designed. Several mechanisms rely on that single process, and would break silently if a second replica were started. This section records them, so a future multi-replica design starts from a known list.
+
+| Area | Relies on a single replica because… | What multi-replica / HA would need |
+|---|---|---|
+| Aggregation per-group ordering (§4.3) | Each process runs its own Group Coroutine per group, and the consumer group hands out messages one at a time, not by group. Two replicas could each merge an EntityEvent into the same active Event and overwrite each other's write to its Redis key — one merge silently lost after both were ACKed | Route each group to one replica (e.g. partition by group key), or make the Redis read-merge-write atomic per key |
+| Cache Layer single writer (§6.1, §6.5) | Cache version builds must not run concurrently; one process with one consumer loop guarantees it | A single elected writer (leader election) |
+| Group permits (§4.3, known limitation) | `AGG_MAX_CONCURRENT` caps live groups per process, and is sized for one process's load | The per-unit-of-work permit already noted in §4.3 |
+| HK Stock List (§9.2.1) | Each process holds its own in-memory copy; `POST /hk-stock-list-sync` refreshes only the replica that receives the call | Broadcast the sync to every replica, or a shared store |
+| In-flight duplicate guards (§3.4, §4.3, §5.4) | Per-process sets; a duplicate delivered to another replica isn't seen | Acceptable as-is — the DB-level idempotency each layer already has is the real guarantee; Aggregation is covered by its own row above |
+| Availability | One replica is a single point of failure. While it's down, Redis Streams buffer unread and unACKed messages and Redis keeps active Events, so a restart resumes without loss — within the limits of Redis TTLs (§11.2). One known gap: the outbox (§4.5) only re-checks Events still active in Redis, so if a crash lands between an Event's commit and its publish and the downtime outlasts that Event's Redis TTL, its `stream:event_aggregated` signal is never sent and it's never scored | A standby replica, which first needs every row above resolved |
+
 ---
 
 ## 14. Open Questions
@@ -1103,7 +1144,7 @@ Full environment variable list (with defaults) and project directory structure a
 | Q-8 | Validate BriefSummarySkill input character cap (200 chars total entity_summary) against real aggregated Events; adjust if key_numbers extraction quality is insufficient | BriefSummarySkill output quality | Week 2 |
 | Q-9 | Validate `RATE_LIMIT_BACKOFF_S=60` against actual Vertex AI rate limit reset window; adjust if provider reset is faster or slower | LLM throughput | Week 1 |
 | Q-10 | Post-MVP: Design quality monitoring Service — log ingestion pipeline, LLM-as-Judge evaluation for EntityAnalysisSkill and BriefSummarySkill, post-event price correlation analysis for EventScoringSkill (Option C) | LLM quality improvement | Post-MVP |
-| Q-11 | Validate `LLM_API_TIMEOUT_S=30` and `SADI_API_TIMEOUT_S=10` against real latency measurements in Week 1; Vertex AI asia-east1 median latency may differ from defaults | Latency tuning | Week 1 |
+| Q-11 | Validate `LLM_API_TIMEOUT_S=30` and the common `HTTP_TIMEOUT_S=120` (SADI, Admin, HKEXnews calls) against real latency measurements in Week 1; Vertex AI asia-east1 median latency may differ from defaults | Latency tuning | Week 1 |
 | Q-12 | ~~`event_type_score` enum mapping (§5.6) is only defined for EARNINGS/MA/REGULATORY/GENERAL_ANNOUNCEMENT (per PRD §12.1). `BUYBACK`, `MANAGEMENT_CHANGE`, `ANALYST_RATING`, `DIVIDEND` have no assigned score~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — full 8-value mapping added in §5.6, with rationale. Flagged there as an MVP starting calibration to be revisited via customer/analyst feedback post-MVP (see PRD §3.3, §16.1) |
 | Q-13 | ~~`source_authority_score` and `source_heat_score` (§5.6) have no defined computation formula — only example output values exist.~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — formulas added in §5.6 (MAX for authority; `source_count / TOTAL_ACTIVE_SOURCES` for heat) |
 | Q-14 | ~~HK Stock List for `lookup_stock` (§9.2): no single free source provides `{stock_code, company_name_zh, company_name_en, sector}` in the required shape. Also unresolved: which service owns the ingestion job.~~ | Blocks EntityAnalysisSkill implementation | **Resolved** — see §9.2.1. Data source: HKEXnews's own bilingual JSON endpoints, cross-checked against the official "List of Securities" for equity filtering. `sector` removed from `lookup_stock`/`EntityAnalysisSkill` entirely (no consumer, no bulk source — see §9.2.1). Ownership: SAPI owns the fetch/filter/write code (eager blocking fetch at startup); Admin owns triggering ongoing refresh via a new `HK_STOCK_LIST_SYNC` job calling `POST /v1/hk-stock-list-sync`. No TTL — persistent cache, replaced only on a successful sync. `GET /health` gates readiness on 0-entry state |
