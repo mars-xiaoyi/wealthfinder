@@ -65,6 +65,7 @@ Stores job configuration. One record per named job. Modified by operators only.
 | `aastocks-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "AASTOCKS"}` | 00:00 UTC | 1 / `HOUR` |
 | `yahoo-hk-crawl` | `RECURRING` | `CRAWL` | `{"source_name": "YAHOO_HK"}` | 00:00 UTC | 1 / `HOUR` |
 | `hkex-master-list-sync` | `RECURRING` | `MASTER_LIST_SYNC` | `{}` | 00:00 UTC | 1 / `DAY` |
+| `morning-brief-refresh` | `RECURRING` | `MORNING_BRIEF_REFRESH` | `{}` | operator-set — before users read the Morning Brief | 1 / `DAY` |
 
 > **HKEX:** Two daily executions — evening (14:00 UTC = 22:00 HKT, post-market) and morning (01:00 UTC = 09:00 HKT, pre-open). Both use `interval = 1 DAY`, generating exactly one trigger per day each.
 >
@@ -324,7 +325,7 @@ Same check as `CRAWL`'s `init()` (§2.2): query `job_executions` for an existing
 
 ```mermaid
 flowchart TD
-    A([execute called]) --> B[POST /v1/hkex-master-list-sync\non SAPI]
+    A([execute called]) --> B[POST /v1/admin/hk-stock-list-sync\non SAPI]
     B --> C{Result?}
     C -->|200| D([return normally])
     C -->|503, timeout, or connection failure\ne.g. SAPI unreachable| E([raise MasterListSyncFailedError])
@@ -339,6 +340,14 @@ No-op in MVP.
 ### 3.5 `complete_with_error()`
 
 Logs a CRITICAL alert with fields: `job_id`, `execution_id`, `error_detail`.
+
+### 3.6 `MORNING_BRIEF_REFRESH`
+
+| handler_key | Handles |
+|---|---|
+| `MORNING_BRIEF_REFRESH` | Daily request to rebuild SAPI's Morning Brief cache with fresh recency (SAPI TAD §6.9) |
+
+Same shape as `MASTER_LIST_SYNC` (§3.2–§3.5): the same `init()` check, then `execute()` calls `POST /v1/admin/morning-brief-refresh` on SAPI (api.md §3.5) — a synchronous call that returns once the new cache version is written — and returns normally on `200`; a `503`, timeout, or connection failure raises and the execution is marked `FAILED`. `complete_with_success()` is a no-op; `complete_with_error()` logs CRITICAL as in §3.5.
 
 ---
 
@@ -495,7 +504,7 @@ admin/
 │   │   └── JobHandler.java              # JobHandler interface; JobContext class
 │   ├── handlers/
 │   │   ├── CRAWL.java                   # class CRAWL implements JobHandler; reads source_name from job_params
-│   │   └── MASTER_LIST_SYNC.java        # class MASTER_LIST_SYNC implements JobHandler; POST /hkex-master-list-sync on SAPI
+│   │   └── MASTER_LIST_SYNC.java        # class MASTER_LIST_SYNC implements JobHandler; POST /v1/admin/hk-stock-list-sync on SAPI
 │   ├── stream/
 │   │   └── CrawlCompletedConsumer.java  # XREADGROUP consumer for stream:crawl_completed; XAUTOCLAIM; Dead Letter
 │   ├── api/

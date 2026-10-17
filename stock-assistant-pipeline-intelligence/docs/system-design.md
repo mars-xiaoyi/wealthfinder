@@ -180,7 +180,7 @@ All signals use Redis Streams via `RedisStreamClient`. Each stream serves as bot
 
 > **Persistence guarantee:** Redis Streams persist messages until ACKed. On service restart, each layer resumes from its last consumed position via Consumer Group with no data loss.
 
-> **Batching mechanism:** Each layer uses `XREADGROUP COUNT {BATCH_SIZE} BLOCK {TIMEOUT_MS}`. This single command handles both batch size and timeout triggers natively.
+> **Batching mechanism:** Each layer uses `XREADGROUP COUNT {BATCH_SIZE} BLOCK {TIMEOUT_MS}`. It returns as soon as any messages are available, up to `BATCH_SIZE`; `TIMEOUT_MS` only bounds the wait while the stream is empty. It does not wait for a batch to fill — under a trickle, reads carry one message each. That's fine where each message is processed independently; the Cache Layer, where every batch costs a full cache rewrite, coalesces several reads into one batch (§6.2).
 
 ---
 
@@ -213,9 +213,9 @@ flowchart TD
 
 ### 3.3 Batching and Concurrency
 
-`XREADGROUP COUNT ENTITY_ANALYSIS_BATCH_SIZE BLOCK ENTITY_ANALYSIS_BATCH_TIMEOUT_MS` handles both triggers natively:
-- Returns up to `ENTITY_ANALYSIS_BATCH_SIZE` messages immediately when available
-- Returns whatever is available after `ENTITY_ANALYSIS_BATCH_TIMEOUT_MS` if batch size not reached
+`XREADGROUP COUNT ENTITY_ANALYSIS_BATCH_SIZE BLOCK ENTITY_ANALYSIS_BATCH_TIMEOUT_MS`:
+- Returns up to `ENTITY_ANALYSIS_BATCH_SIZE` messages as soon as any are available — it doesn't wait for the batch to fill
+- Blocks for up to `ENTITY_ANALYSIS_BATCH_TIMEOUT_MS` only while the stream is empty (§2.3)
 
 `asyncio.Semaphore(ENTITY_ANALYSIS_MAX_CONCURRENT)` limits concurrent LLM API calls within each batch. The next read waits until every message in the current batch has finished, so the batch's slowest article bounds it — keeping `ENTITY_ANALYSIS_BATCH_SIZE` close to `ENTITY_ANALYSIS_MAX_CONCURRENT` means a batch rarely queues on the semaphore (tuned under Q-1).
 
@@ -257,7 +257,7 @@ Defined as `EntityAnalysisConfig`: implementation.md §4.1.
 |---|---|
 | LLM API call failure | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
 | LLM schema violation (Instructor exhausted retries) | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
-| `LLMRateLimitError` | Pause entire Worker Pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
+| `LLMRateLimitException` | Pause entire Worker Pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
 | All entities filtered by stock verification | Valid `entities=[]` outcome — no DB record written, no signal emitted; ACK |
 | `cleaned_id` missing from SADI's `cleaned_news` response (silently omitted per `api.md` §2.5, not an HTTP error) | Log warning with `cleaned_id`; ACK — skip this article. Retrying would not recover an ID that isn't in SADI's response. Not expected in normal operation today (SADI has no `cleaned_news` retention/purge job as of this writing) — the log exists to surface it if that changes |
 | DB write failure | See Section 12.1 DB Write Failure policy |
@@ -353,7 +353,7 @@ Defined as `AggConfig`: implementation.md §4.1.
 | DB read failure | Do not ACK; log warning |
 | RedisStateClient unreachable | Do not ACK; release the in-flight guard; retried when the reclaim loop redelivers the message (`STREAM_CLAIM_TIMEOUT_MS`) |
 | DB Flush failure | See Section 12.1 DB Write Failure policy |
-| Group Coroutine crash (a bug outside the per-message failure handling) | Group torn down and the layer Task restarted; messages still queued on that group stay marked in flight, so they're dead-lettered at `AGG_MAX_RETRY` rather than reprocessed — acceptable for a genuine bug, which redelivery couldn't fix |
+| Group Coroutine failure (a bug in the per-message failure handling itself) | Logged CRITICAL; the group continues with its next item. Each group runs in its own Task, so the failure stays inside the group — the layer keeps running and Coroutine Monitoring never sees it. Only the failing EntityEvent is lost: it stays marked in flight, so it's dead-lettered at `AGG_MAX_RETRY` rather than reprocessed — acceptable for a genuine bug, which redelivery couldn't fix |
 | Any per-message failure above | The in-flight duplicate guard is released along with the no-ACK — otherwise every redelivery would be skipped as "already in progress" until it dead-lettered, turning a transient error into a lost EntityEvent |
 | RedisStreamClient unreachable | See Section 12.1 RedisStreamClient policy |
 
@@ -363,7 +363,7 @@ Defined as `AggConfig`: implementation.md §4.1.
 
 ### 5.1 Responsibility
 
-Score Events pushed by the Aggregation Layer. Execute BriefSummarySkill, then Rule Score and EventScoringSkill in parallel. Apply direction in Score Fusion. Persist score records to DB via conditional update.
+Score Events pushed by the Aggregation Layer. Execute BriefSummarySkill with Rule Score computed alongside it, then EventScoringSkill on BriefSummarySkill's output. Apply direction in Score Fusion. Persist score records to DB via conditional update.
 
 Each Skill is responsible for constructing its own input from raw DB data. The Scoring Layer passes constituent EntityEvent records and Event metadata to each Skill; the Skill applies its own input selection and formatting rules internally. This ensures input construction logic and prompt design remain co-located within the same module.
 
@@ -373,56 +373,62 @@ Each Skill is responsible for constructing its own input from raw DB data. The S
 flowchart TD
     A[Read batch messages] --> B{Messages received?}
     B -->|Timeout| A
-    B -->|Yes| C{In Processing Map?}
-    C -->|Yes, same version| D[Skip\nACK]
-    C -->|Yes, new version| E[Update Map\ndrop in-progress]
-    C -->|No| F[Add to Map]
-    F --> G[BriefSummarySkill]
-    G -->|Failure| H[Fallback headline]
-    G --> I[Check Map]
+    B -->|Yes| C{Event already\nbeing scored?}
+    C -->|Yes| D[Skip\nleave unACKed]
+    C -->|No| F[Mark in flight\nread source weights]
+    F --> G[BriefSummarySkill\nwith Rule Score alongside]
+    G -->|Schema violation| H[Fallback summary]
+    G -->|LLM call failed| X[Do not ACK\nretried on redelivery]
+    G --> I{Stale?}
     H --> I
-    I -->|Stale| J[Drop\nACK]
-    I -->|Fresh| K[Rule Score + EventScoringSkill\nin parallel]
-    K --> L[Check Map]
-    L -->|Stale| J
-    L -->|Fresh| M[Score Fusion\nConditional UPDATE]
+    I -->|Yes| J[Drop\nACK]
+    I -->|No| K[EventScoringSkill]
+    K -->|Schema violation| KF[Fallback score]
+    K -->|LLM call failed| X
+    K --> L{Stale?}
+    KF --> L
+    L -->|Yes| J
+    L -->|No| M[Score Fusion\nConditional UPSERT]
     M -->|Stale| J
-    M -->|Success| N[Remove from Map\nEmit signal\nACK]
+    M -->|Written| N[Emit signal\nACK]
+    D --> A
+    J --> A
     N --> A
+    X --> A
 ```
 
 ### 5.3 Scoring Layer Execution Sequence
 
-BriefSummarySkill executes first. Rule Score and EventScoringSkill execute in parallel after BriefSummarySkill completes.
+Rule Score runs alongside BriefSummarySkill, since it doesn't need its output. EventScoringSkill runs after BriefSummarySkill completes.
 
 ```
-BriefSummarySkill
-    ↓
-Rule Score (parallel)    EventScoringSkill (parallel, uses BriefSummarySkill output)
-    ↓                              ↓
+BriefSummarySkill (parallel)    Rule Score (parallel)
+    ↓                                  │
+EventScoringSkill (uses BriefSummarySkill output)
+    ↓                                  ↓
                 Score Fusion
 ```
 
-**Rationale:** EventScoringSkill takes `summary_full` and `key_numbers` from BriefSummarySkill as input — these are the distilled, structured representations of the Event content. This avoids requiring EventScoringSkill to re-interpret raw article content, reduces token consumption, and produces more consistent scoring inputs. Rule Score does not depend on BriefSummarySkill and runs in parallel with EventScoringSkill.
+**Rationale:** EventScoringSkill takes `summary_full` and `key_numbers` from BriefSummarySkill as input — these are the distilled, structured representations of the Event content. This avoids requiring EventScoringSkill to re-interpret raw article content, reduces token consumption, and produces more consistent scoring inputs. Rule Score does not depend on BriefSummarySkill, so it is computed while BriefSummarySkill runs. Source authority weights are read once, before either starts: Rule Score needs them, and so does BriefSummarySkill, to order its input and pick its fallback headline (§9.5) — Skills receive data, they don't fetch it.
 
-### 5.4 Processing Map
+### 5.4 In-flight Guard
 
-An in-memory Map prevents duplicate processing across concurrent triggers and detects mid-processing data changes:
-
-```
-processing_events: Dict[event_id, aggregation_updated_at]
-```
+An in-memory set of the `event_id`s currently being scored prevents the same Event from being scored twice at once, whichever trigger delivers it (a new message or a reclaimed one). A second trigger for an Event already in flight is skipped and left unACKed; it's redelivered later, after the first pass finishes. The guard holds no version information — mid-processing data changes are detected by re-reading the Event's `aggregation_updated_at` (§5.5).
 
 - Safe for asyncio single-threaded concurrency — no locking required
-- On service restart: Map is empty; in-progress Events are redelivered from Redis Stream and reprocessed normally
+- On service restart: the set is empty; in-progress Events are redelivered from Redis Stream and reprocessed normally
+
+**Already-scored Events.** Each Event has exactly one `event_scores` row, and it records which version of the Event (`aggregation_updated_at`) its score was computed for. When a message arrives for a version that's already scored — a duplicate from the Aggregation Layer's at-least-once outbox (§4.5), a redelivery after a crash before ACK, or a crash between the score write and its signal — the layer skips both Skills and just re-emits `stream:event_scored`. Duplicates cost a single read instead of two LLM calls, and a lost signal is recovered without re-scoring.
+
+**Reused summaries.** The stored brief summary records the same version, and whether it came from the fallback. If a pass fails after BriefSummarySkill succeeded — typically EventScoringSkill's LLM call — the redelivered message reuses the stored summary for that version instead of calling BriefSummarySkill again, so a struggling LLM provider doesn't double the cost of every retry. The same applies when the step running alongside BriefSummarySkill fails (e.g. a Redis read): the layer still waits for BriefSummarySkill and stores its result before giving up on the message, so the call already in progress isn't wasted.
 
 ### 5.5 Stale Data Detection
 
 | Check Point | Mechanism |
 |---|---|
-| After BriefSummarySkill | Compare `processing_events[event_id]` with current `aggregation_updated_at` |
-| After Rule Score + EventScoringSkill | Same in-memory comparison |
-| Score Fusion write | Conditional `UPDATE event_scores WHERE event_id = :id AND events.aggregation_updated_at = :expected`; 0 rows = stale |
+| After BriefSummarySkill | Re-read the Event's `aggregation_updated_at` and compare it with the value read when scoring started — skips the EventScoringSkill call if the Event has changed |
+| After EventScoringSkill | Same comparison |
+| Score Fusion write | Conditional UPSERT into `event_scores`, gated on `events.aggregation_updated_at` still equal to the starting value; nothing written = stale. The correctness guarantee — the two re-reads only avoid wasted LLM calls |
 
 ### 5.6 Rule Score — Dimensions, Weights, and Recency/Direction Exclusion
 
@@ -474,19 +480,19 @@ Direction is applied in Score Fusion (Step 7), not in Rule Score (Step 6a). This
 
 ### 5.7 Score Fusion — Direction
 
-Direction is derived from `stock_impact_score` (`sign(stock_impact_score)`, falling back to Sentiment Aggregation's `weighted_signed_score` §5.8 when `stock_impact_score = 0` under `llm_fallback=true`), not from `sentiment_label` — more accurate in financial context where news sentiment does not always align with stock price impact direction. Direction is then applied to `base_rule_score` and fused with `stock_impact_score` into `abs_final_score`, the Event's final ranking score. Exact formula: implementation.md §13.4 (`_score_fusion()`).
+Direction is derived from `stock_impact_score` (`sign(stock_impact_score)`, falling back to the sign of Sentiment Aggregation's `weighted_signed_score` §5.8 whenever `stock_impact_score` is 0 — the EventScoringSkill fallback's 0 or a genuinely neutral score, since a 0 carries no direction either way), not from `sentiment_label` — more accurate in financial context where news sentiment does not always align with stock price impact direction. Direction is then applied to `base_rule_score` and fused with `stock_impact_score` into `abs_final_score`, the Event's final ranking score. Exact formula: implementation.md §13.4 (`_score_fusion()`).
 
-> **Persistence:** The computed `direction` (±1) is written to `event_scores.direction`. This lets the Cache Layer (§6.3) correctly reapply direction when recomputing `final_abs_final_score` with real-time recency, without re-deriving the sentiment fallback.
+> **Persistence:** The computed `direction` (±1) is written to `event_scores.direction`. This lets the Cache Layer (§6.3) correctly reapply direction when recomputing `final_abs_final_score` with recency at each cache build, without re-deriving the sentiment fallback.
 
 > **Score cross-type comparability:** `event_type_score` (weight 0.30) assigns higher base scores to more impactful event types (EARNINGS=9.0, REGULATORY=8.0, GENERAL_ANNOUNCEMENT=4.0). This ensures `abs_final_score` is comparable across different `event_type_primary` values without additional normalisation.
 
 ### 5.8 Sentiment Aggregation
 
-Event-level sentiment is computed from all constituent EntityEvents, weighted by source authority from `source:config`. `weighted_signed_score` supplies the direction fallback used in Score Fusion (§5.7) when `stock_impact_score = 0` (`llm_fallback=true`). `sentiment_strength_score` feeds the Rule Score dimension (§5.6).
+Event-level sentiment is computed from all constituent EntityEvents, weighted by source authority from `source:config`. `weighted_signed_score` supplies the direction fallback used in Score Fusion (§5.7) whenever `stock_impact_score` is 0. `sentiment_strength_score` feeds the Rule Score dimension (§5.6).
 
-> **Display label:** The Morning Brief's 利好/利空/中性 label is not computed or exposed by SAPI at all — see §6.6. The client derives it from the sign of `base_rule_score`, which already carries `event_scores.direction` (§6.3). This works uniformly regardless of `llm_fallback`, since `direction` (and therefore `base_rule_score`'s sign) is always set via the fallback derived here — the client never needs `stock_impact_score`'s sign specifically.
+> **Display label:** The Morning Brief's 利好/利空 label is not computed or exposed by SAPI at all — see §6.6. The client derives it from the sign of `base_rule_score`, which already carries `event_scores.direction` (§6.3). This works uniformly regardless of `llm_fallback`, since `direction` (and therefore `base_rule_score`'s sign) is always set via the fallback derived here — the client never needs `stock_impact_score`'s sign specifically. The label is binary at MVP: `direction` is always ±1 (a sentiment sign of exactly 0 resolves to +1), so a routine, neutral Event shows as 利好. A real 中性 — `direction = 0` when both `stock_impact_score` and `weighted_signed_score` are 0 — is a possible later improvement; it would change the API's sign semantics, drop such Events' rule-score share from `abs_final_score`, and need the Cache Layer's recency recomputation (§6.3) to handle a 0 direction.
 
-Both are source-authority-weighted averages across the Event's constituent EntityEvents — `weighted_signed_score` over each EntityEvent's directional sentiment (POSITIVE/NEUTRAL/NEGATIVE → +1/0/-1), `sentiment_strength_score` over raw `sentiment_score` regardless of direction. Exact formula: implementation.md §13.3 (`compute_sentiment_aggregation()`).
+Both are source-authority-weighted averages across the Event's constituent EntityEvents — `weighted_signed_score` over each EntityEvent's directional sentiment (POSITIVE/NEUTRAL/NEGATIVE → +1/0/-1), `sentiment_strength_score` over raw `sentiment_score` regardless of direction. Each `sentiment_score` is in `[0,1]`, so `sentiment_strength_score` is scaled ×10 before entering Rule Score, onto the same `[0,10]` range as the other three dimensions (§5.6); `weighted_signed_score` is used only for its sign. Exact formula: implementation.md §13.3 (`compute_sentiment_aggregation()`).
 
 ### 5.9 Per-Event Fallbacks
 
@@ -505,9 +511,10 @@ Defined as `ScoringConfig`: implementation.md §4.1.
 | Scenario | Strategy |
 |---|---|
 | DB read failure | Do not ACK; log warning |
-| BriefSummarySkill failure | Fallback applied; processing continues |
-| EventScoringSkill failure | Fallback applied; processing continues |
-| `LLMRateLimitError` | Pause entire Scoring Layer concurrent pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
+| BriefSummarySkill output fails schema validation | Fallback applied (§5.9); processing continues |
+| EventScoringSkill output fails schema validation (or an empty `adjustment_reason`) | Fallback applied (§5.9); processing continues |
+| Either Skill's LLM call fails (provider error, authentication) | Do not ACK; retried on redelivery — a fallback would persist a degraded result for an outage that's usually transient |
+| `LLMRateLimitException` | Pause entire Scoring Layer concurrent pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
 | source:config unreachable | Use default weights; log warning; processing continues |
 | DB write failure | See Section 12.1 DB Write Failure policy |
 | RedisStreamClient unreachable | See Section 12.1 RedisStreamClient policy |
@@ -518,7 +525,7 @@ Defined as `ScoringConfig`: implementation.md §4.1.
 
 ### 6.1 Responsibility
 
-Consume scored Event IDs, fetch and merge Scored Events, compute real-time recency scores using `event.aggregation_updated_at`, and maintain a versioned Morning Brief cache in Redis. Processes messages serially — no concurrent cache updates.
+Consume scored Event IDs, fetch and merge Scored Events, compute recency scores using `event.aggregation_updated_at` at each build (including a daily refresh, §6.9), and maintain a versioned Morning Brief cache in Redis. Processes messages serially — no concurrent cache updates.
 
 **The very first cache version is built once, eagerly, at service startup — not as part of the message-consumption flow below.** Before this layer's consumer starts reading `stream:event_scored`, a one-time startup step checks whether a cache version already exists (Redis persisted across a restart); if not, it does a single full DB fetch of everything currently in `event_scores` and builds the initial version from that, zero rows or many. This closes the gap where the service reports healthy (§12.1) but `GET /morning-brief` has nothing to serve because no event has streamed through yet — without it, that gap could otherwise persist indefinitely on a low-traffic deployment. §6.2's flow below is deliberately simpler as a result: it has no "first run" branch of its own, since a version always already exists by the time it starts consuming (implementation.md §14.1's `build_initial_version()`/`build_new_version()` split).
 
@@ -537,15 +544,19 @@ flowchart TD
     I --> A
 ```
 
+> **One read may not be one batch.** "Read batch messages" coalesces: after the first message arrives, the layer keeps reading until `CACHE_BATCH_TIMEOUT_MS` since that first message, then builds once. It has no batch-size limit — a build costs the same however many scores it merges, since it rewrites the whole cache — so it only cares whether new scores arrived — a single `XREADGROUP` returns as soon as anything is available (§2.3), and every build rewrites the whole cache.
+
 > **"Read current cache" recomputes recency from fields the cache carries for exactly this purpose — never a DB read, and never a value carried over from a previous build's own recency-adjusted output.** §6.3's formula needs `aggregation_updated_at`, the stored (pre-recency) `base_rule_score`, and `direction` — none of which change unless an Event is genuinely re-scored — so the cache's own structure (§6.6) carries all three as internal fields alongside the display ones. Reading *those* back and recomputing from them every build is safe; reading back `final_base_rule_score`/`final_abs_final_score` themselves and feeding them into the formula again would add a second recency contribution on top of the first, compounding indefinitely for any Event that goes many builds without a genuine re-score — the bug this design replaced. Because refreshing an already-cached Event's recency no longer needs the DB at all, the DB fetch immediately below stays bounded to *this cycle's batch only*, regardless of how large the cache itself has grown — the cache currently has no retention policy of its own (§14, Open Questions), so a per-build cost proportional to total cache size would only ever grow.
 
 ### 6.3 Recency Score Computation
 
-At each cache build, `recency_score` is computed for all Events from `event.aggregation_updated_at` using the same exponential decay as §1.6, then folded back into `final_base_rule_score`/`final_abs_final_score` via the same weights and direction as Score Fusion (§5.7) — recency's 0.20 share, held out of the stored `base_rule_score` at scoring time (§5.6), is added back in here. Exact formula: implementation.md §14.3 (`_apply_recency()`).
+At each cache build, `recency_score` is computed for all Events from `event.aggregation_updated_at` using the same exponential decay as §1.6, then folded back into `final_base_rule_score`/`final_abs_final_score` via the same weights and direction as Score Fusion (§5.7) — recency's 0.20 share, held out of the stored `base_rule_score` at scoring time (§5.6), is added back in here. Exact formula: implementation.md §14.3 (`apply_recency()`).
 
-> `direction` is read from the persisted `event_scores.direction` column (§5.7, §10.3) — not recomputed from `sign(stock_impact_score)` — so the sentiment-derived fallback direction (used when `stock_impact_score = 0` under `llm_fallback=true`) is preserved correctly during recency recomputation. For an Event already in the cache, `direction` (and `stored_base_rule_score`, and `aggregation_updated_at`) come from the cache's own internal fields (§6.6) rather than a fresh read of this column — the two are always identical, since neither changes without a genuine re-score, which is exactly what makes reading them from the cache safe.
+> **Recency is as of the cache version's build.** A version's scores and order are fixed when it's written: by a build triggered by new scores, or by the daily refresh (§6.9), which rebuilds the cache with recency as of that moment even when no new scores arrived. The same cache version therefore always returns the same Events in the same order, and the ranking changes only when `cache_version` does. The formula stays server-side — the client receives finished scores, never the formula or its inputs. Reading a version is cheap: a version never changes once written, so SAPI keeps the current version's parsed records in memory — handed over directly by the build that wrote them — and parses from Redis only when it doesn't already hold that version (after a restart). Versions are stored as UTF-8 JSON, which keeps Chinese text at about half the size of escaped JSON.
 
-Sorting uses `final_abs_final_score`. The stored `abs_final_score` in `event_scores` is a historical snapshot excluding recency — and is also the value `NOISE_FILTER_THRESHOLD` gates on for cache inclusion (§6.4); recency affects only sort order, never membership.
+> `direction` is read from the persisted `event_scores.direction` column (§5.7, §10.3) — not recomputed from `sign(stock_impact_score)` — so the sentiment-derived fallback direction (used whenever `stock_impact_score` is 0, §5.7) is preserved correctly during recency recomputation. For an Event already in the cache, `direction` (and `stored_base_rule_score`, and `aggregation_updated_at`) come from the cache's own internal fields (§6.6) rather than a fresh read of this column — the two are always identical, since neither changes without a genuine re-score, which is exactly what makes reading them from the cache safe.
+
+Sorting uses `final_abs_final_score`, with the tie-breakers in §6.6. The stored `abs_final_score` in `event_scores` is a historical snapshot excluding recency — and is also the value `NOISE_FILTER_THRESHOLD` gates on for cache inclusion (§6.4); recency affects only sort order, never membership.
 
 ### 6.4 Incremental Merge Rules
 
@@ -570,15 +581,17 @@ All three operations execute atomically via Redis Pipeline `MULTI/EXEC`:
 
 `morning_brief:version_counter` is a persistent monotonically incrementing counter with no TTL.
 
+> **Readers need two reads, so they can lose a race the pipeline itself can't.** A reader fetches the pointer, then that version's data; a build committing in between deletes the version it just read. The pointer and `last_updated` are read together in one atomic read (so they always match), and a reader that then finds its version gone re-reads the pointer and tries again — a missing version can only mean a newer one replaced it. Without that retry, the race would surface as an empty Morning Brief with a `200`.
+
 ### 6.6 Scored Event Structure
 
 Each item in the Morning Brief cache is a Scored Event: a handful of top-level fields used for filtering and sorting (`event_id`, `exchange`, `stock_code`, `event_type_primary`, `abs_final_score`, `base_rule_score`, `first_seen_at`, `last_seen_at`), plus two nested objects for display — `event` (source list, summaries, key numbers) and `score` (impact score, rule/LLM score detail). Exact shape: implementation.md §3.5 (`ScoredEventRecord`).
 
-> **`abs_final_score` and `base_rule_score`** are real-time computed values including `recency_score`, not the stored snapshots from `event_scores`. **`base_rule_score` is signed** — it carries `event_scores.direction` (§6.3), positive for 利好 and negative for 利空. This is the field the client should use for the display direction label; sorting/tie-breaking (§6.2, §6.4) uses `|base_rule_score|`, not its raw signed value.
+> **`abs_final_score` and `base_rule_score`** include `recency_score` as of the cache version's build (§6.3), not the stored snapshots from `event_scores`. **`base_rule_score` is signed** — it carries `event_scores.direction` (§6.3), positive for 利好 and negative for 利空. This is the field the client should use for the display direction label; sorting/tie-breaking (§6.2, §6.4) uses `|base_rule_score|`, not its raw signed value.
 
 > **No `sentiment_label`/direction-label field is exposed.** The 利好/利空 label is a display concern the client derives from the sign of `base_rule_score`, not computed or stored server-side. This works uniformly including when `llm_fallback=true`, since `direction` (and therefore `base_rule_score`'s sign) is always set via the Sentiment Aggregation fallback (§5.8) in that case.
 
-> **`event.aggregation_updated_at`, `score.stored_base_rule_score`, `score.direction` are internal-only.** They exist so §6.2's "Read current cache" step can recompute `recency_score`/`final_base_rule_score`/`final_abs_final_score` for an already-cached Event on the next build without a DB read (§6.3) — `stored_base_rule_score` is the same value as `base_rule_score` but unsigned and excluding recency, i.e. exactly `event_scores.base_rule_score` as originally written, never overwritten. No API consumer should ever see these three; SAPI's `GET /morning-brief` response schema doesn't declare them and drops them automatically on the way out (implementation.md §14.5/§3.5).
+> **`event.aggregation_updated_at`, `score.stored_base_rule_score`, `score.direction` are internal-only.** They exist so §6.2's "Read current cache" step — on every build, including the daily refresh (§6.9) — can recompute `recency_score`/`final_base_rule_score`/`final_abs_final_score` for a cached Event without a DB read — `stored_base_rule_score` is the same value as `base_rule_score` but unsigned and excluding recency, i.e. exactly `event_scores.base_rule_score` as originally written, never overwritten. No API consumer should ever see these three; SAPI's `GET /morning-brief` response schema doesn't declare them and drops them automatically on the way out (implementation.md §14.5/§3.5).
 
 **Top-level field rationale:**
 
@@ -586,8 +599,8 @@ Each item in the Morning Brief cache is a Scored Event: a handful of top-level f
 |---|---|
 | `exchange`, `stock_code` | Query filter conditions |
 | `event_type_primary` | Potential future filter condition |
-| `abs_final_score` | Primary sort key (includes real-time recency) |
-| `base_rule_score` | Signed (carries `direction`); `\|base_rule_score\|` used as secondary sort key for tie-breaking (includes real-time recency); sign is the client's source for the 利好/利空 display label |
+| `abs_final_score` | Primary sort key (includes recency as of the version's build) |
+| `base_rule_score` | Signed (carries `direction`); `\|base_rule_score\|` used as secondary sort key for tie-breaking (includes recency as of the version's build); sign is the client's source for the 利好/利空 display label |
 | `first_seen_at`, `last_seen_at` | Additional tie-breaking sort keys |
 
 **Excluded from the API response:** `additional_outcome`, `updated_at`, `created_at`, `metadata`, `recency_score` — internal fields not relevant to Morning Brief display, and never written into the cache at all. `aggregation_updated_at`/`stored_base_rule_score`/`direction` (above) are the one exception to "excluded fields are never written" — they *are* written into the cache (nested under `event`/`score`), just excluded from what the API response schema exposes.
@@ -601,11 +614,18 @@ Defined as `CacheConfig`: implementation.md §4.1.
 | Scenario | Strategy |
 |---|---|
 | DB read failure | Do not ACK; log warning |
-| RedisStateClient unreachable | Do not ACK; retry with fixed interval |
-| Atomic pipeline failure | See Section 12.1 DB Write Failure policy |
+| RedisStateClient unreachable | The batch's build fails: do not ACK; retried when the batch is reclaimed — the layer keeps running |
+| Atomic pipeline failure | The atomic write leaves nothing behind; same as above — no in-place retry, the batch is retried via reclaim |
 | Orphaned version cleanup failure | Log warning; retry on next cleanup interval |
-| Startup cache build failure (§6.1) | Log CRITICAL; service startup continues regardless — no version exists yet, so the first real message on `stream:event_scored` builds one from just that batch, not the full historical state |
+| Startup cache build failure (§6.1) | Log CRITICAL; service startup continues regardless. No version exists yet, so the first message on `stream:event_scored` triggers the same full build from every scored Event instead of an incremental one — the whole history is recovered as soon as the DB is reachable again; until then the API reports the cache unavailable |
 | RedisStreamClient unreachable | See Section 12.1 RedisStreamClient policy |
+| Daily refresh fails (§6.9) | The refresh request fails (Redis or DB unreachable) and Admin's job records it as failed; nothing is written, and the previous version keeps serving |
+
+### 6.9 Daily Refresh
+
+The cache is otherwise rebuilt only when new scores arrive, so on a quiet day its recency would stay as of the last build. Once a day, Admin's scheduler (`admin-tad.md` §3.6) calls `POST /v1/admin/morning-brief-refresh` (`docs/api.md` §3.5), which rebuilds the cache from what it already holds — recency recomputed for every cached Event, re-sorted, a new version written, no DB read. The time of day is Admin's configuration; SAPI has no schedule of its own.
+
+The refresh is a normal cache build, run directly by the endpoint and returned synchronously, so Admin's job records real success or failure. Builds still never overlap (§6.1): every build — triggered by new scores or by the refresh — runs under one in-process lock, so a refresh that arrives during a score-triggered build waits for it, and vice versa. The lock relies on SAPI running as a single process (§13.2).
 
 ---
 
@@ -636,6 +656,8 @@ GET /health
 - `database`/`redis_stream`/`redis_state` all `ok` and `hk_stock_list` `ok`, but any `layers.*` is `error` → `200 degraded` (the only condition that produces `degraded` — a layer's consumer coroutine has crashed but not yet been auto-restarted by Coroutine Monitoring's `done_callback`, §12.1; self-healing and transient, so still `200`, not `503`)
 - Database or Redis unreachable, or `hk_stock_list` is `not_ready` → `503 unhealthy`
 
+**Each dependency check is time-bounded and runs concurrently.** An unresponsive DB or Redis (connection open but not answering) would otherwise hang the request past the orchestrator probe's own deadline, which then reads as an unexplained probe failure instead of a `503` naming the failed component. A check that exceeds the timeout reports `error`, the same as an unreachable one. The bound sits around the health checks only, not on the DB/Redis clients: a client-wide Redis socket timeout would cut off the consumers' blocking `XREADGROUP` reads (§2.3).
+
 > Post-MVP extension: add Dead Letter Stream backlog monitoring per layer to detect processing failures earlier.
 
 ### 7.2 Morning Brief Endpoint
@@ -644,7 +666,7 @@ GET /health
 
 ### 7.3 Server Processing Logic
 
-Two-step selection against the current cache version: first, watchlist-matching Events ranked by score, up to `k`; if that doesn't fill `k`, backfill with the highest-scoring non-watchlist Events. Exact algorithm: implementation.md §15.3 (`get_morning_brief()`).
+Two-step selection against the current cache version, in the order that version was built with (§6.3) — the API reads, it never re-scores: first, watchlist-matching Events, up to `k`; if that doesn't fill `k`, backfill with the highest-scoring non-watchlist Events. The response keeps that order — watchlist Events first, then the backfill, each ranked by score — so the client can tell them apart by position as well as by stock code. Exact algorithm: implementation.md §15.3 (`get_morning_brief()`).
 
 ### 7.4 Response
 
@@ -672,7 +694,7 @@ Vertex AI (Gemini), `asia-east1`, via `google-genai` (raw calls) and Instructor 
 
 ### 8.2.1 Timeout Management
 
-LLM and SADI API call timeouts are both centralised in environment variables rather than scattered per call site. On timeout, both raise `LLMProviderError` (LLM) or propagate as a SADI API failure — existing error handling policies apply (§3.6, §12.1).
+LLM and SADI API call timeouts are both centralised in environment variables rather than scattered per call site. On timeout, both raise `LLMProviderException` (LLM) or propagate as a SADI API failure — existing error handling policies apply (§3.6, §12.1).
 
 ### 8.3 Standard Data Structures
 
@@ -688,14 +710,14 @@ All provider-specific exceptions are mapped to standard types. Skill layer handl
 
 | Exception | Retryable | Trigger |
 |---|---|---|
-| `LLMRateLimitError` | Yes | Provider rate limit hit |
-| `LLMProviderError` | Yes | Provider-side error (5xx, network timeout) |
-| `LLMAuthenticationError` | Yes (message-level; not self-healing) | Provider rejects the call as unauthenticated/unauthorized (401/403 — invalid/expired credentials, revoked service account, missing IAM role, API not enabled) |
-| `LLMSchemaViolationError` | No | Instructor internal retries exhausted; output still does not conform to schema |
+| `LLMRateLimitException` | Yes | Provider rate limit hit |
+| `LLMProviderException` | Yes | Provider-side error (5xx, network timeout) |
+| `LLMAuthenticationException` | Yes (message-level; not self-healing) | Provider rejects the call as unauthenticated/unauthorized (401/403 — invalid/expired credentials, revoked service account, missing IAM role, API not enabled) |
+| `LLMSchemaViolationException` | No | Instructor internal retries exhausted; output still does not conform to schema |
 
-> `LLMSchemaViolationError` occurs when Pydantic validators defined in the output schema (e.g. value range constraints) are repeatedly violated after Instructor's internal retries. Gemini's `response_schema` parameter prevents missing field and type errors at the API level; Pydantic validators are the second-layer protection for business logic constraints.
+> `LLMSchemaViolationException` occurs when Pydantic validators defined in the output schema (e.g. value range constraints) are repeatedly violated after Instructor's internal retries. Gemini's `response_schema` parameter prevents missing field and type errors at the API level; Pydantic validators are the second-layer protection for business logic constraints.
 
-> Handling mechanisms for `LLMRateLimitError` (Worker Pool backoff) and `LLMAuthenticationError` (CRITICAL escalation, since unlike a transient 5xx it fails identically until an operator intervenes) are covered once, in §12.1's Rate Limit Backoff and LLM Authentication Failure mechanisms — not repeated here. `BusinessValidationError` is a log-only event type (not an exception class), covered in §9.7/§9.8.
+> Handling mechanisms for `LLMRateLimitException` (Worker Pool backoff) and `LLMAuthenticationException` (CRITICAL escalation, since unlike a transient 5xx it fails identically until an operator intervenes) are covered once, in §12.1's Rate Limit Backoff and LLM Authentication Failure mechanisms — not repeated here. `BusinessValidationError` is a log-only event type (not an exception class), covered in §9.7/§9.8.
 
 ---
 
@@ -775,18 +797,18 @@ Each returns `[{"i": internal_id, "c": stock_code, "n": name, "s": sort_key}, ..
 
 > **`sector` is removed from `lookup_stock`/`EntityAnalysisSkill` entirely for MVP**, not just left unsourced. It had no scoring-critical or API-facing consumer (only reached an LLM prompt as loose context, and sat unqueried in `additional_outcome` JSONB), and with no bulk source it would be null for effectively every entity — a nullable field that's almost always empty adds schema/prompt-handling complexity for no real benefit, and doesn't save any future work either: PRD §13.4 lists "Sector / stock filtering UI" as Post-MVP, and building that later requires the same wiring regardless of whether a dead placeholder field existed here in the meantime.
 
-**Storage: a single in-process, in-memory cache — no Redis.** The fetched-and-filtered result is held in one shared mutable instance inside the SAPI process, constructed once at startup and updated in place thereafter (a full attribute rebind on refresh, never a partial mutation, so a lookup already in progress against the old snapshot is unaffected). No `RedisStateClient` key is used for this data: SAPI always re-fetches from HKEXnews directly regardless of whether a previous copy already exists, so writing the result to Redis and reading it back would be pure round-trip overhead with no benefit for a single-instance deployment — and it would introduce a second copy that a `POST /hk-stock-list-sync` call would need to explicitly propagate into the already-running process's in-memory data anyway, since Redis holding fresher data doesn't by itself update what `lookup_stock` reads. Revisit Redis-backed storage only if/when SAPI runs multiple replicas, so they can share one fetch and propagate one sync to all of them — out of scope for the current single-instance MVP.
+**Storage: a single in-process, in-memory cache — no Redis.** The fetched-and-filtered result is held in one shared mutable instance inside the SAPI process, constructed once at startup and updated in place thereafter (a full attribute rebind on refresh, never a partial mutation, so a lookup already in progress against the old snapshot is unaffected). No `RedisStateClient` key is used for this data: SAPI always re-fetches from HKEXnews directly regardless of whether a previous copy already exists, so writing the result to Redis and reading it back would be pure round-trip overhead with no benefit for a single-instance deployment — and it would introduce a second copy that a `POST /admin/hk-stock-list-sync` call would need to explicitly propagate into the already-running process's in-memory data anyway, since Redis holding fresher data doesn't by itself update what `lookup_stock` reads. Revisit Redis-backed storage only if/when SAPI runs multiple replicas, so they can share one fetch and propagate one sync to all of them — out of scope for the current single-instance MVP.
 
 **Ownership: SAPI owns the fetch/filter/load code; Admin owns triggering ongoing refreshes.** Two distinct triggers load the same in-process cache, both executing the same code path:
 
 1. **SAPI startup (eager, blocking):** `main.py` fetches, filters, and populates the HK Stock List *before* the Entity Analysis Layer's consumer coroutine starts pulling work — a missing HK Stock List silently fails every entity in the first batch (§9.3's loop just treats them as `found=false`, no error surfaced), so this cannot be lazy-on-first-call the way `source:config` (§1.5) is.
-2. **`POST /v1/hk-stock-list-sync` (Admin-triggered, ongoing):** a SAPI endpoint that re-runs the same fetch/filter/load synchronously on request, rebinding the same process's in-memory data. Admin's scheduler calls this daily (00:00 UTC, matching the existing `watchlist-sync` slot) via a new `HK_STOCK_LIST_SYNC` job type — see `admin-tad.md`. No request body; response `200 {"status": "success", "entries_loaded": N}` on success. Two distinct failure modes map to different HTTP statuses: `503` if HKEXnews itself is unreachable/erroring (a resource issue), or `500` if HKEXnews responded but its data couldn't be parsed into the expected shape (a code/schema issue) — the existing in-memory data is left untouched either way on failure.
+2. **`POST /v1/admin/hk-stock-list-sync` (Admin-triggered, ongoing):** a SAPI endpoint that re-runs the same fetch/filter/load synchronously on request, rebinding the same process's in-memory data. Admin's scheduler calls this daily (00:00 UTC, matching the existing `watchlist-sync` slot) via a new `HK_STOCK_LIST_SYNC` job type — see `admin-tad.md`. No request body; response `200 {"status": "success", "entries_loaded": N}` on success. Two distinct failure modes map to different HTTP statuses: `503` if HKEXnews itself is unreachable/erroring (a resource issue), or `500` if HKEXnews responded but its data couldn't be parsed into the expected shape (a code/schema issue) — the existing in-memory data is left untouched either way on failure.
 
-**No staleness tracking beyond the fetch/sync call's own success or failure.** There is no TTL and no separate "last refreshed at" record — the in-process cache is only ever replaced by a successful run of trigger 1 or 2 above; a delayed or failed Admin job simply leaves the previous snapshot in place rather than emptying it. Staleness is observable from `POST /hk-stock-list-sync`'s own response status (surfaced in Admin's `job_executions`), without a dedicated Redis key to track it.
+**No staleness tracking beyond the fetch/sync call's own success or failure.** There is no TTL and no separate "last refreshed at" record — the in-process cache is only ever replaced by a successful run of trigger 1 or 2 above; a delayed or failed Admin job simply leaves the previous snapshot in place rather than emptying it. Staleness is observable from `POST /admin/hk-stock-list-sync`'s own response status (surfaced in Admin's `job_executions`), without a dedicated Redis key to track it.
 
 > **Startup readiness gate:** while the HK Stock List is still 0 entries — whether the initial fetch is still in progress or has failed outright, a distinction not observable from cache state alone — `hk_stock_list` reports `not_ready` and `GET /health` reports `status: unhealthy` (`HTTP 503`), alongside `database`/`redis_stream`/`redis_state` in the health response (§7.1). This lets an orchestrator (k8s readiness probe or equivalent) correctly hold traffic until the list is actually usable. Since there's no TTL, this state is never entered due to staleness alone — only ever before the first successful load.
 
-> **On sync failure (either trigger):** log the error; leave the existing in-memory data as-is (no partial overwrite). A failed `POST /v1/hk-stock-list-sync` call returns a non-2xx status so Admin's job records it as `FAILED` — visible in `job_executions`.
+> **On sync failure (either trigger):** log the error; leave the existing in-memory data as-is (no partial overwrite). A failed `POST /v1/admin/hk-stock-list-sync` call returns a non-2xx status so Admin's job records it as `FAILED` — visible in `job_executions`.
 
 > **Entity Analysis Layer readiness gate:** while the HK Stock List has 0 entries (startup window, an ongoing HKEXnews outage, or a pending fix for a schema-break), the Entity Analysis Layer's consumer must not process any message — every `lookup_stock()` call would otherwise resolve to `found=false` regardless of what the article actually says, and an empty-but-"successful" result would be acknowledged and permanently lost. The Entity Analysis Layer checks readiness before touching a message and leaves it unacknowledged (for redelivery) rather than processing it while the list is empty — this is what keeps `GET /health`'s `unhealthy` signal true in effect, not just in name.
 
@@ -848,7 +870,9 @@ Format:
 
 Input selection metadata is recorded in the `brief_summary_completed` log event for quality monitoring purposes. Output: `summary_short` (≤30 chars), `summary_full` (≤150 chars), and up to 3 `key_numbers` — all Traditional Chinese regardless of source article language, and never inferring numbers the input doesn't contain. Full prompt text, few-shot examples, output schema, and business constraint validation table: implementation.md §8.3.
 
-**Fallback (LLMSchemaViolationError):** Apply §5.9 BriefSummarySkill fallback policy.
+Source authority weights for the ordering above and for the fallback come from the Scoring Layer's source configuration (§1.5), read before the Skill starts and passed in (§5.3).
+
+**Fallback (LLMSchemaViolationException):** Apply §5.9 BriefSummarySkill fallback policy.
 
 ### 9.6 EventScoringSkill
 
@@ -871,13 +895,13 @@ key_numbers: <brief_summary.output.key_numbers>
 
 Output: `stock_impact_score` on a `[-5, +5]` scale (a 7-point reference table anchors the scale, from "existential threat" at -5 to "major positive" at +5), prioritizing forward-looking signals and explicit financial data over qualitative description, plus a ≤80-character `adjustment_reason` explaining the dominant signal. Full prompt text, few-shot examples, output schema, and business constraint validation table: implementation.md §8.4.
 
-**Fallback (LLMSchemaViolationError or empty adjustment_reason):** Apply §5.9 EventScoringSkill fallback policy.
+**Fallback (LLMSchemaViolationException or empty adjustment_reason):** Apply §5.9 EventScoringSkill fallback policy.
 
 ### 9.7 Skill Error Handling Summary
 
-Each Skill's `run()` catches all four exceptions itself and never lets any of them propagate — it always returns a normal, typed result describing what happened (implementation doc §8.3–§8.6 for the exact contract). The calling Layer (Entity Analysis or Scoring) branches on that result, never on a caught exception: `LLMRateLimitError`/`LLMProviderError` always mean "no ACK, redeliver" (plus a pool-level backoff for rate limits specifically); `LLMSchemaViolationError` means "apply the Skill's fallback and continue" wherever a fallback is defined, or the same "no ACK, redeliver" otherwise (EntityAnalysisSkill has no fallback — §5.9 defines one only for BriefSummarySkill/EventScoringSkill).
+Each Skill's `run()` catches all four exceptions itself and never lets any of them propagate — it always returns a normal, typed result describing what happened (implementation doc §8.3–§8.6 for the exact contract). The calling Layer (Entity Analysis or Scoring) branches on that result, never on a caught exception: `LLMRateLimitException`/`LLMProviderException` always mean "no ACK, redeliver" (plus a pool-level backoff for rate limits specifically); `LLMSchemaViolationException` means "apply the Skill's fallback and continue" wherever a fallback is defined, or the same "no ACK, redeliver" otherwise (EntityAnalysisSkill has no fallback — §5.9 defines one only for BriefSummarySkill/EventScoringSkill).
 
-| Skill | LLMRateLimitError | LLMProviderError | LLMSchemaViolationError |
+| Skill | LLMRateLimitException | LLMProviderException | LLMSchemaViolationException |
 |---|---|---|---|
 | EntityAnalysisSkill | Caught in `run()`; Entity Analysis Layer: backoff, no ACK, redelivery | Caught in `run()`; Entity Analysis Layer: no ACK, redelivery | Caught in `run()` — no fallback defined; Entity Analysis Layer: no ACK, redelivery |
 | BriefSummarySkill | Caught in `run()`; Scoring Layer: backoff, no ACK, redelivery | Caught in `run()`; Scoring Layer: no ACK, redelivery | Caught in `run()`; apply fallback; processing continues |
@@ -885,7 +909,7 @@ Each Skill's `run()` catches all four exceptions itself and never lets any of th
 
 > **Rationale:** EntityAnalysisSkill failures are unrecoverable within the Skill — no downstream processing is possible without valid entity data. BriefSummarySkill and EventScoringSkill have defined fallback policies that allow scoring to continue with degraded but usable output.
 
-> `LLMAuthenticationError` (§8.5) is caught in `run()` and classified identically to `LLMProviderError` in the table above for every Skill — no ACK, redelivery, no fallback — so it isn't broken out as its own column here. What distinguishes it is visibility, not message-level handling: the shared `SkillUtils.classify_llm_error()` all three Skills' `run()` calls (implementation doc §8.1) logs CRITICAL on it specifically, since it's the one thing in this table that will keep failing identically for every subsequent message across both Layers until an operator intervenes, rather than a one-off or self-resolving condition. See Section 12.1's LLM Authentication Failure mechanism.
+> `LLMAuthenticationException` (§8.5) is caught in `run()` and classified identically to `LLMProviderException` in the table above for every Skill — no ACK, redelivery, no fallback — so it isn't broken out as its own column here. What distinguishes it is visibility, not message-level handling: `SkillBase.run()`'s shared `except` block, inherited by all three Skills (implementation doc §8.1), logs CRITICAL on it specifically, since it's the one thing in this table that will keep failing identically for every subsequent message across both Layers until an operator intervenes, rather than a one-off or self-resolving condition. See Section 12.1's LLM Authentication Failure mechanism.
 
 ---
 
@@ -945,7 +969,7 @@ Written by Aggregation Layer via Upsert: one record per aggregated Event. `aggre
 
 ### 10.3 `event_scores` Table
 
-Written by Scoring Layer via Upsert: one record per Event, overwritten on each re-score, excluding `recency_score` (§1.6). `direction` is persisted rather than left derivable from `stock_impact_score` alone, so the Cache Layer can reapply the sentiment-derived fallback direction during real-time recency recomputation (§6.3) without re-deriving it. `scored_at` is an independent column, not nested in `llm_score_detail`, because it is a time-series query key for the future quality monitoring Service (§9.8).
+Written by Scoring Layer via Upsert: one record per Event, overwritten on each re-score, excluding `recency_score` (§1.6). `direction` is persisted rather than left derivable from `stock_impact_score` alone, so the Cache Layer can reapply the sentiment-derived fallback direction during recency recomputation at each cache build (§6.3) without re-deriving it. `scored_at` is an independent column, not nested in `llm_score_detail`, because it is a time-series query key for the future quality monitoring Service (§9.8).
 
 ### 10.4 `event_entity_map` Table
 
@@ -972,7 +996,7 @@ A single HASH, TTL-refreshed from Admin API on expiry (§1.5). Exact key layout:
 
 ### 11.3.1 HK Stock List
 
-Not Redis-backed — held entirely in an in-process, in-memory cache instead, with no `RedisStateClient` key of its own. See §9.2.1 for the full storage design (a single shared mutable cache, populated by SAPI startup and rebound in place by `POST /hk-stock-list-sync`) and §9.2 for how `lookup_stock` reads it.
+Not Redis-backed — held entirely in an in-process, in-memory cache instead, with no `RedisStateClient` key of its own. See §9.2.1 for the full storage design (a single shared mutable cache, populated by SAPI startup and rebound in place by `POST /admin/hk-stock-list-sync`) and §9.2 for how `lookup_stock` reads it.
 
 ### 11.4 Cache Layer — Morning Brief
 
@@ -986,7 +1010,7 @@ The versioned-replacement scheme (§6.5) needs a version counter, a pointer to t
 
 **Rate Limit Backoff**
 
-When any Skill's `run()` reports `failure_reason=LLMRateLimitError` (§9.7 — `LLMRateLimitError` is caught inside the Skill itself and never reaches the Layer as a raised exception), the receiving Layer sets a `rate_limit_until` deadline and every worker checks it before starting new work, sleeping if still within the backoff window.
+When any Skill's `run()` reports `failure_reason=LLMRateLimitException` (§9.7 — `LLMRateLimitException` is caught inside the Skill itself and never reaches the Layer as a raised exception), the receiving Layer sets a `rate_limit_until` deadline and every worker checks it before starting new work, sleeping if still within the backoff window.
 
 - Backoff is applied at the Layer level (Worker Pool), not the individual worker level — prevents concurrent workers from continuing to hit the API during the backoff window
 - Message is not ACKed during backoff; redelivered after backoff period ends
@@ -995,9 +1019,9 @@ When any Skill's `run()` reports `failure_reason=LLMRateLimitError` (§9.7 — `
 
 **LLM Authentication Failure**
 
-When `VertexAIAdapter` (§8) sees a 401/403 from the provider, it raises `LLMAuthenticationError` (§8.5) — no logging of its own; the Adapter's only job is translating the provider's response into one of its four typed exceptions. The calling Skill's `run()` catches it exactly like `LLMProviderError` (message-level: no ACK, no backoff), via the shared `SkillUtils.classify_llm_error()` (implementation doc §8.1 — Skill-side, not part of the LLM Adapter itself; a pure helper called directly, not inherited) — one method rather than duplicated per Skill. What's different from every other exception in §8.5 is that this one is not a one-off or self-resolving condition — it means the configured credentials/IAM are broken, so it will fail identically for every subsequent LLM call, across both the Entity Analysis and Scoring Layers, until an operator fixes it. Per-message handling alone (buried in per-message INFO-level completion logs, §9.8) would not surface that quickly enough — `classify_llm_error()` additionally logs CRITICAL specifically for this exception type, in place of the ERROR-level log every other exception type gets (normal classification — `LlmErrorEntry`, `failure_reason` — still applies).
+When `VertexAIAdapter` (§8) sees a 401/403 from the provider, it raises `LLMAuthenticationException` (§8.5) — no logging of its own; the Adapter's only job is translating the provider's response into one of its four typed exceptions. The calling Skill's `run()` catches it exactly like `LLMProviderException` (message-level: no ACK, no backoff), in the one `except` block of `SkillBase.run()` (implementation doc §8.1) that all three Skills inherit — Skill-side, not part of the LLM Adapter itself, and written once rather than per Skill. What's different from every other exception in §8.5 is that this one is not a one-off or self-resolving condition — it means the configured credentials/IAM are broken, so it will fail identically for every subsequent LLM call, across both the Entity Analysis and Scoring Layers, until an operator fixes it. Per-message handling alone (buried in per-message INFO-level completion logs, §9.8) would not surface that quickly enough — that `except` block additionally logs CRITICAL specifically for this exception type, in place of the ERROR-level log every other exception type gets (normal classification — `LlmErrorEntry`, `failure_reason` — still applies).
 
-- Logged once per occurrence, from one shared method (`SkillUtils.classify_llm_error()`, called directly by all three Skills — a pure helper, not a base class) rather than duplicated per Skill or living as a side effect of the Adapter call
+- Logged once per occurrence, from `SkillBase.run()`'s shared `except` block (inherited by all three Skills) rather than duplicated per Skill or living as a side effect of the Adapter call
 - Rate-limiting/deduping this CRITICAL log across a sustained outage (so a broken credential doesn't produce one CRITICAL per message) is deliberately deferred — not implemented in this pass
 - No circuit breaker that skips attempting the LLM call while auth is known-broken is implemented either — deliberately deferred; today this behaves like any other sustained provider outage (redeliver, eventually dead-letter) with the addition of the CRITICAL alert above
 
@@ -1073,11 +1097,13 @@ delivery_count >= MAX_RETRY → write to Dead Letter Stream → ACK original mes
 A periodic coroutine scans and removes stale cache versions every `CACHE_ORPHAN_CLEANUP_INTERVAL_S`:
 
 ```
-SCAN morning_brief:v*
-→ Keep morning_brief:v{current_version}
-→ Delete all other morning_brief:v* keys
+Read current_version
+SCAN morning_brief:v<number> (never the version counter)
+→ Delete versions older than current_version
 → Log cleanup results
 ```
+
+Only versions *older* than the one read are deleted: a build can commit between reading the pointer and the scan, making a newer version current, and versions only increase — so anything at or above the value read is left for a later sweep rather than risk deleting the live cache.
 
 A failed sweep (e.g. a transient Redis error) is caught inside the coroutine itself — log warning, retry on the next interval tick — and never allowed to crash the coroutine. This matters beyond the individual sweep: this coroutine runs concurrently with the Cache Layer's main consumer loop (§6.1's "no concurrent cache updates"), and an uncaught exception here that took down only this coroutine, while the consumer loop kept running unsupervised, would leave the layer in a state Coroutine Monitoring (below) can't cleanly recover — see its note on restart guarantees.
 
@@ -1097,9 +1123,9 @@ This lightweight mechanism handles coroutine crash recovery without requiring ha
 
 `GET /health` uses Task liveness to report `layers.*` status: a Task that has exited unexpectedly reports `error` until it is successfully restarted.
 
-> **Scope, for the Entity Analysis and Scoring Layers specifically:** each layer's own `_process_one()` wraps its entire per-message body in its own `except Exception`, catching an unanticipated bug at the single-message boundary — CRITICAL log, no ACK, redeliver — rather than letting it propagate up to this Task-level mechanism. Coroutine Monitoring is still what catches a bug anywhere *outside* `_process_one()` (e.g. in `_consumer_loop()`/`_reclaim_loop()` themselves) for those two layers, and it remains the only recovery mechanism, unchanged, for the Aggregation and Cache Layers.
+> **Scope, for the Entity Analysis and Scoring Layers specifically:** each layer's own `_process_one()` wraps its entire per-message body in its own `except Exception`, catching an unanticipated bug at the single-message boundary — CRITICAL log, no ACK, redeliver — rather than letting it propagate up to this Task-level mechanism. Coroutine Monitoring is still what catches a bug anywhere *outside* `_process_one()` (e.g. in `_consumer_loop()`/`_reclaim_loop()` themselves) for those two layers, and it remains the only recovery mechanism, unchanged, for the Cache Layer. The Aggregation Layer handles per-EntityEvent failures inside each Group Coroutine (§4.7), which runs as its own Task — so a failure there never reaches this Task-level mechanism; Coroutine Monitoring covers bugs in Aggregation's consumer and reclaim loops.
 
-> **Restart guarantee.** Each layer's Task runs its main consumer loop concurrently with one secondary loop (`_reclaim_loop()`, or `orphan_cleanup_loop()` for Cache Layer) — a bare `asyncio.gather()` of the two would, on one raising, propagate that exception without cancelling the other, leaving it running orphaned while "recreate Task" above spins up a brand-new pair alongside it. For Cache Layer specifically, a leaked second consumer loop calling `build_new_version()` concurrently with the new one would violate the Cache Layer's single-writer requirement (§6.1). Each layer's Task-launching coroutine is therefore required to guarantee both loops have fully stopped before this mechanism's "recreate Task" step runs — never partially crash-and-restart into a state where an old and new loop coexist.
+> **Restart guarantee.** Each layer's Task runs its main consumer loop concurrently with one secondary loop (`_reclaim_loop()`, or `orphan_cleanup_loop()` for Cache Layer) — a bare `asyncio.gather()` of the two would, on one raising, propagate that exception without cancelling the other, leaving it running orphaned while "recreate Task" above spins up a brand-new pair alongside it. For Cache Layer, a leaked second consumer loop couldn't build concurrently with the new one — every build runs under one lock (§6.9) — but it would double every build. Each layer's Task-launching coroutine is therefore required to guarantee both loops have fully stopped before this mechanism's "recreate Task" step runs — never partially crash-and-restart into a state where an old and new loop coexist.
 
 ---
 
@@ -1122,9 +1148,10 @@ SAPI is designed and deployed as **exactly one replica** for now — multiple re
 | Area | Relies on a single replica because… | What multi-replica / HA would need |
 |---|---|---|
 | Aggregation per-group ordering (§4.3) | Each process runs its own Group Coroutine per group, and the consumer group hands out messages one at a time, not by group. Two replicas could each merge an EntityEvent into the same active Event and overwrite each other's write to its Redis key — one merge silently lost after both were ACKed | Route each group to one replica (e.g. partition by group key), or make the Redis read-merge-write atomic per key |
-| Cache Layer single writer (§6.1, §6.5) | Cache version builds must not run concurrently; one process with one consumer loop guarantees it | A single elected writer (leader election) |
+| Cache Layer single writer (§6.1, §6.5, §6.9) | Cache builds — from new scores or the daily refresh — must never overlap; an in-process lock guarantees it. A second replica would have its own lock and could build concurrently, overwriting a newer version | One lock across replicas (e.g. a Redis lock), or a single elected writer |
 | Group permits (§4.3, known limitation) | `AGG_MAX_CONCURRENT` caps live groups per process, and is sized for one process's load | The per-unit-of-work permit already noted in §4.3 |
-| HK Stock List (§9.2.1) | Each process holds its own in-memory copy; `POST /hk-stock-list-sync` refreshes only the replica that receives the call | Broadcast the sync to every replica, or a shared store |
+| HK Stock List (§9.2.1) | Each process holds its own in-memory copy; `POST /admin/hk-stock-list-sync` refreshes only the replica that receives the call | Broadcast the sync to every replica, or a shared store |
+| Morning Brief parsed-version memory (§6.3) | Each process keeps the current cache version's parsed records, handed over by its own build; a second replica's API would hold none and parse from Redis on every new version | Acceptable as-is — it falls back to reading Redis, just without the saving |
 | In-flight duplicate guards (§3.4, §4.3, §5.4) | Per-process sets; a duplicate delivered to another replica isn't seen | Acceptable as-is — the DB-level idempotency each layer already has is the real guarantee; Aggregation is covered by its own row above |
 | Availability | One replica is a single point of failure. While it's down, Redis Streams buffer unread and unACKed messages and Redis keeps active Events, so a restart resumes without loss — within the limits of Redis TTLs (§11.2). One known gap: the outbox (§4.5) only re-checks Events still active in Redis, so if a crash lands between an Event's commit and its publish and the downtime outlasts that Event's Redis TTL, its `stream:event_aggregated` signal is never sent and it's never scored | A standby replica, which first needs every row above resolved |
 
@@ -1147,10 +1174,10 @@ SAPI is designed and deployed as **exactly one replica** for now — multiple re
 | Q-11 | Validate `LLM_API_TIMEOUT_S=30` and the common `HTTP_TIMEOUT_S=120` (SADI, Admin, HKEXnews calls) against real latency measurements in Week 1; Vertex AI asia-east1 median latency may differ from defaults | Latency tuning | Week 1 |
 | Q-12 | ~~`event_type_score` enum mapping (§5.6) is only defined for EARNINGS/MA/REGULATORY/GENERAL_ANNOUNCEMENT (per PRD §12.1). `BUYBACK`, `MANAGEMENT_CHANGE`, `ANALYST_RATING`, `DIVIDEND` have no assigned score~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — full 8-value mapping added in §5.6, with rationale. Flagged there as an MVP starting calibration to be revisited via customer/analyst feedback post-MVP (see PRD §3.3, §16.1) |
 | Q-13 | ~~`source_authority_score` and `source_heat_score` (§5.6) have no defined computation formula — only example output values exist.~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — formulas added in §5.6 (MAX for authority; `source_count / TOTAL_ACTIVE_SOURCES` for heat) |
-| Q-14 | ~~HK Stock List for `lookup_stock` (§9.2): no single free source provides `{stock_code, company_name_zh, company_name_en, sector}` in the required shape. Also unresolved: which service owns the ingestion job.~~ | Blocks EntityAnalysisSkill implementation | **Resolved** — see §9.2.1. Data source: HKEXnews's own bilingual JSON endpoints, cross-checked against the official "List of Securities" for equity filtering. `sector` removed from `lookup_stock`/`EntityAnalysisSkill` entirely (no consumer, no bulk source — see §9.2.1). Ownership: SAPI owns the fetch/filter/write code (eager blocking fetch at startup); Admin owns triggering ongoing refresh via a new `HK_STOCK_LIST_SYNC` job calling `POST /v1/hk-stock-list-sync`. No TTL — persistent cache, replaced only on a successful sync. `GET /health` gates readiness on 0-entry state |
+| Q-14 | ~~HK Stock List for `lookup_stock` (§9.2): no single free source provides `{stock_code, company_name_zh, company_name_en, sector}` in the required shape. Also unresolved: which service owns the ingestion job.~~ | Blocks EntityAnalysisSkill implementation | **Resolved** — see §9.2.1. Data source: HKEXnews's own bilingual JSON endpoints, cross-checked against the official "List of Securities" for equity filtering. `sector` removed from `lookup_stock`/`EntityAnalysisSkill` entirely (no consumer, no bulk source — see §9.2.1). Ownership: SAPI owns the fetch/filter/write code (eager blocking fetch at startup); Admin owns triggering ongoing refresh via a new `HK_STOCK_LIST_SYNC` job calling `POST /v1/admin/hk-stock-list-sync`. No TTL — persistent cache, replaced only on a successful sync. `GET /health` gates readiness on 0-entry state |
 | Q-15 | Validate `source_heat_score`'s `source_count / TOTAL_ACTIVE_SOURCES` formula (§5.6) against real cross-source corroboration rates. With only 4 MVP sources it's coarse (each source is a 2.5-point jump); untested whether Events typically get corroborated across multiple sources at all | `source_heat_score` calibration | Week 1-2 |
 | Q-16 | Validate `lookup_stock`'s fuzzy name-matching (§9.2) against real HK news article entity mentions — is `NAME_MATCH_MIN_OVERLAP_RATIO=0.6` correctly separating genuine abbreviated/partial company names from false-positive matches on generic shared characters (e.g. "地產" across property companies)? Adjust threshold, or add a top-2-candidate ambiguity margin check, based on findings | EntityAnalysisSkill accuracy; false-positive entity verification risk | Week 2 |
-| Q-17 | The Morning Brief cache (§6) has no retention policy: an Event, once it clears `NOISE_FILTER_THRESHOLD`, stays in the cache indefinitely unless a genuine re-score later drops it back below threshold (§6.4) — nothing ages an Event out on elapsed time alone. Over the service's lifetime this grows without bound. Needs a decision: is unbounded retention actually intended for a "Morning Brief," or should Events past some age/re-score-staleness window be dropped regardless of score? | Cache Layer resource growth (Redis memory); product fit for "Morning Brief" as a rolling window vs. an ever-growing archive | Pre-MVP if resource growth matters at MVP scale, otherwise Post-MVP |
+| Q-17 | The Morning Brief cache (§6) has no retention policy: an Event, once it clears `NOISE_FILTER_THRESHOLD`, stays in the cache indefinitely unless a genuine re-score later drops it back below threshold (§6.4) — nothing ages an Event out on elapsed time alone. Over the service's lifetime this grows without bound. Needs a decision: is unbounded retention actually intended for a "Morning Brief," or should Events past some age/re-score-staleness window be dropped regardless of score? | Morning Brief content: recency can lower an Event's score by at most its 0.20 share (§6.3), so a months-old high-impact Event still outranks a fresh, modest one, and the backfill (§7.3) shows it in today's brief whenever the watchlist doesn't fill `k` — visible to users within the first months; also build cost, since every cache build — on new scores and the daily refresh (§6.9) — recomputes recency for and rewrites the whole cache, and Redis memory | **Pre-go-live** (product decision) — the Cache Layer's post-release validation measures growth and latency as input, but the decision shouldn't wait for it |
 
 ---
 

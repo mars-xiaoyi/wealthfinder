@@ -297,7 +297,8 @@ Base URL: `http://sapi/v1`
 |---|---|---|
 | `GET` | `/health` | Service health check |
 | `GET` | `/morning-brief` | Fetch scored Morning Brief events |
-| `POST` | `/hk-stock-list-sync` | Trigger a refresh of the HK Stock List cache; called by Admin on a schedule |
+| `POST` | `/admin/hk-stock-list-sync` | Trigger a refresh of the HK Stock List cache; called by Admin on a schedule |
+| `POST` | `/admin/morning-brief-refresh` | Rebuild the Morning Brief cache with fresh recency; called by Admin on a schedule |
 
 ---
 
@@ -351,7 +352,7 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 | Parameter | Type | Required | Constraints | Description |
 |---|---|---|---|---|
 | `stocks` | String | Yes | Comma-separated HK stock codes; min 1 | Client watchlist stock codes, bare (no exchange suffix) e.g. `00700,09988,03690` — same canonical form as `events[].stock_code`, no conversion needed either direction |
-| `k` | Integer | No | 1–50; default 20 | Number of events to return |
+| `k` | Integer | No | 1–50; default `TOP_K_DEFAULT` (20) | Number of events to return |
 
 **Response `HTTP 200` — normal:**
 
@@ -411,13 +412,13 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 |---|---|---|
 | `cache_version` | Integer | Current cache version number |
 | `last_updated` | ISO 8601 datetime (UTC) | Time of last successful cache build |
-| `events` | Array | Ordered list of scored events; sorted by `abs_final_score` DESC server-side |
+| `events` | Array | Watchlist-matching events first, then non-watchlist events backfilling up to `k`; each group sorted by `abs_final_score` DESC server-side (ties: `\|base_rule_score\|`, then `last_seen_at`, then `first_seen_at`, all DESC) |
 | `events[].event_id` | UUID | Primary key |
 | `events[].exchange` | String | Exchange identifier, e.g. `HKEX` |
 | `events[].stock_code` | String | Bare HK stock code, e.g. `00700` — no exchange suffix; `events[].exchange` already carries that |
 | `events[].event_type_primary` | String | Primary event classification |
-| `events[].abs_final_score` | Float | Final score including real-time recency; primary sort key |
-| `events[].base_rule_score` | Float | Signed rule score including real-time recency; magnitude (`\|base_rule_score\|`) is the secondary sort key; sign indicates direction — positive (利好) / negative (利空) — for client display |
+| `events[].abs_final_score` | Float | Final score including recency as of the cache version's build (new scores, or the daily refresh, §3.5); primary sort key |
+| `events[].base_rule_score` | Float | Signed rule score including recency as of the cache version's build; magnitude (`\|base_rule_score\|`) is the secondary sort key; sign indicates direction — positive (利好) / negative (利空) — for client display |
 | `events[].first_seen_at` | ISO 8601 datetime (UTC) | Earliest constituent article publish time |
 | `events[].last_seen_at` | ISO 8601 datetime (UTC) | Most recent constituent article publish time |
 | `events[].event.event_type_secondary` | Array of String | Up to 2 secondary event types; empty array if none |
@@ -455,7 +456,7 @@ Returns a ranked list of scored Entity-Event Pairs for the Morning Brief. The se
 
 ---
 
-### 3.4 `POST /v1/hk-stock-list-sync`
+### 3.4 `POST /v1/admin/hk-stock-list-sync`
 
 Triggers a synchronous refresh of the HK Stock List cache used by `lookup_stock` (SAPI TAD §9.2.1). Fetches HKEXnews's bilingual stock-list JSON endpoints, cross-checks against the official "List of Securities" for equity filtering, and replaces the cache on success. Called by Admin's `HK_STOCK_LIST_SYNC` job on a daily schedule (`admin-tad.md`); not required for SAPI's own startup, which performs this same fetch eagerly and independently.
 
@@ -481,6 +482,39 @@ Triggers a synchronous refresh of the HK Stock List cache used by `lookup_stock`
 |---|---|---|
 | `COMMON-5002` | 503 | HKEXnews JSON endpoints or the official "List of Securities" download unreachable/timed out/erroring — a resource/availability issue; existing cache left untouched |
 | `SAPI-5002` | 500 | Fetch succeeded, but the response could not be parsed into the expected shape (HKEXnews changed its schema, or a SAPI-side parsing bug) — a code issue, not an availability one; existing cache left untouched |
+
+---
+
+### 3.5 `POST /v1/admin/morning-brief-refresh`
+
+Rebuilds the Morning Brief cache so its rankings reflect recency as of now. The cache is otherwise rebuilt only when new scores arrive, so on a quiet day its recency would stay as of the last build (SAPI TAD §6.9). Called by Admin's `MORNING_BRIEF_REFRESH` job on a daily schedule (`admin-tad.md` §3.6); the time of day is Admin's configuration.
+
+Synchronous: the response is returned once the new cache version has been written. If a cache build triggered by new scores is already running, the refresh waits for it to finish first.
+
+**Request:** no body.
+
+**Response `HTTP 200`:**
+
+```json
+{
+    "status": "success",
+    "cache_version": 44
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | String | Always `success` on `HTTP 200` |
+| `cache_version` | Integer | The cache version the refresh wrote — `GET /v1/morning-brief` serves it from now on |
+
+**Error codes:**
+
+| Error Code | HTTP Status | Trigger |
+|---|---|---|
+| `COMMON-5001` | 503 | Redis or the database unavailable — no new version written; the previous one keeps serving |
+
+---|---|---|
+| `COMMON-5001` | 503 | Redis unavailable — the request could not be queued |
 
 ---
 
