@@ -1,6 +1,6 @@
 ---
 name: plan-implementation-tickets
-description: Split an approved design (system-design / implementation docs) into implementation tickets in a plan doc (e.g. <service>/docs/impl-plan.md) — draft the next ticket(s), decide spike-vs-code for open questions, surface design gaps found while slicing, and check a layer/feature for complete coverage. Use when the user asks to generate/draft/split the next ticket(s), break a design into tickets, decide whether something needs a spike, or check whether a layer's tickets cover everything. Works for any service in the repo. Produces "Designing" tickets; create-asana-tickets takes them from "Designed" onward.
+description: Split an approved design (system-design / implementation docs) into implementation tickets in a plan doc (e.g. <service>/docs/impl-plan.md) — draft the next ticket(s), decide spike-vs-code for open questions, surface design gaps found while slicing, and check a layer/feature for complete coverage. Use when the user asks to generate/draft/split the next ticket(s), break a design into tickets, decide whether something needs a spike, or check whether a layer's tickets cover everything. Works for any service in the repo. Produces "Designing" tickets; create-monday-tickets takes them from "Designed" onward.
 ---
 
 # Plan Implementation Tickets
@@ -91,7 +91,7 @@ Writing rules:
 - **Point, don't restate.** Signatures, schemas, SQL, and pseudocode live in the spec; the ticket names *which* parts and *how much*. No "Files" line.
 - **Acceptance criteria are testable and can fail.** Name the exact log events, payload fields, status codes, and the specific edge cases (empty result, redelivery, mid-operation failure, exhaustion of retries).
 - **Explicitly deferred is a note to the developer** ("don't build this here"). Naming the owning ticket is optional — don't churn earlier tickets just to add pointers. But do fix a pointer that has become *wrong* (e.g. "next ticket builds X" after X was split out).
-- New tickets are always written as **Designing**. Only the user moves a ticket to `Designed`; `create-asana-tickets` moves it to `Created`. Don't edit `Created` tickets' content.
+- New tickets are always written as **Designing**. Only the user moves a ticket to `Designed`; `create-monday-tickets` moves it to `Created`. Don't edit `Created` tickets' content.
 
 ## 7. Approval workflow
 

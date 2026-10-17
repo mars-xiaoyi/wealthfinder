@@ -1,44 +1,44 @@
 ---
 name: add-integration-test-plan
-description: Review Asana tickets whose Status is "Created" against their plan doc (e.g. <service>/docs/impl-plan.md), correct any that drifted, and for the ones that match write an integration test plan into the ticket and move its Status to "Planned". Works for any service in the repo. Use when the user asks to review/check Created tickets, add integration test plans to Asana tickets, or move tickets to Planned.
+description: Review monday.com tickets whose Status is still the default (`Not Started`, or empty — freshly created) against their plan doc (e.g. <service>/docs/impl-plan.md), correct any that drifted, and for the ones that match write an integration test plan into the ticket's description and set its Status to "Planned". Works for any service in the repo. Use when the user asks to review/check created tickets, add integration test plans to tickets, or move tickets to Planned.
 ---
 
-# Add Integration Test Plans to Asana Tickets
+# Add Integration Test Plans to monday Tickets
 
-For every Asana ticket with Status `Created`: check that it still matches its plan doc. If it doesn't, correct it. If it does, write an integration test plan into the ticket and set its Status to `Planned`.
+For every monday ticket whose Status is still the board default — `Not Started`, or empty (created, not yet reviewed): check that it still matches its plan doc. If it doesn't, correct it. If it does, write an integration test plan into the ticket's description and set its Status to `Planned`.
 
-The Asana tools are MCP tools (`mcp__asana__*`). If they are deferred, load them first with ToolSearch (`select:mcp__asana__asana_list_workspaces,mcp__asana__asana_get_projects,mcp__asana__asana_get_tasks,mcp__asana__asana_get_task,mcp__asana__asana_update_task`).
+The monday tools are MCP tools (`mcp__claude_ai_monday_com__*`). If they are deferred, load them first with ToolSearch (`select:mcp__claude_ai_monday_com__get_user_context,mcp__claude_ai_monday_com__get_board_info,mcp__claude_ai_monday_com__get_board_items_page,mcp__claude_ai_monday_com__change_item_column_values,mcp__claude_ai_monday_com__all_monday_api`).
 
-Asana tickets in this repo are created by the `create-asana-tickets` skill. **Read `.claude/skills/create-asana-tickets/SKILL.md` §3 first.** Its HTML constraints and Asana content rules (no ordering words, other tickets referenced only by GID link, no future-ticket pointers) apply to everything this skill compares and writes.
+monday tickets in this repo are created by the `create-monday-tickets` skill. **Read `.claude/skills/create-monday-tickets/SKILL.md` §3 and §4 first.** Its markdown notes and content rules (no ordering words, other tickets referenced only by item link, no future-ticket pointers) apply to everything this skill compares and writes, and §4 has the description-write mutation.
 
 ---
 
-## 1. Find the `Created` tickets
+## 1. Find the unreviewed tickets
 
-1. `asana_get_projects` with `opt_fields: name,custom_field_settings.custom_field.name` to find the project and its `Status` custom field. If several projects carry one, ask which, or use the project the user names.
-2. `asana_get_tasks` on the project with `opt_fields: name,completed,memberships.section.name,custom_fields.name,custom_fields.display_value,custom_fields.enum_options.name,custom_fields.enum_options.gid`, following `next_page` until it is exhausted. Keep incomplete tasks whose `Status` display value is `Created`.
-3. From the same response, record the `Status` field GID and the option GID for `Planned`. Never hardcode GIDs; they differ per workspace. If no `Planned` option exists, stop and ask.
-4. `asana_get_task` each one with `opt_fields: name,html_notes,notes,dependencies.name`. Work from this live `html_notes`, because the user may have edited the ticket directly in Asana.
+1. Find the board: the one the user names, else the project board from `get_user_context` (so far **WealthFinder**, `5031953275`). If several boards are plausible, ask.
+2. `get_board_info` with `filters.columns.only: true`: record the Status column id (`project_status` on WealthFinder) and check it has a `Planned` label. If not, stop and ask — don't create labels on your own.
+3. `get_board_items_page` with `includeColumns: true`, following `nextCursor` while `has_more`. Keep items whose Status is **`Not Started` or empty**. `Not Started` is the board's default label for a new item, so it means unreviewed. Items with any other Status (`Planned`, `Working on it`, …) are past this step.
+4. For each one, `get_board_items_page` with `itemIds: [<id>]`, `includeItemDescription: true`. Work from this live description, because the user may have edited the ticket directly in monday.
 
-If nothing is `Created`, say so and stop.
+If no item is `Not Started` or empty, say so and stop.
 
 ## 2. Find each ticket's source section
 
-- The ticket's `Service:` line and name tell you which plan doc it came from. Search for ticket-breakdown docs (e.g. `**/impl-plan.md`) and match the ticket heading to the Asana name, ignoring backticks.
+- The ticket's `Service:` line and name tell you which plan doc it came from. Search for ticket-breakdown docs (e.g. `**/impl-plan.md`) and match the ticket heading to the item name, ignoring backticks.
 - Re-read the doc now. It may have changed since the ticket was created.
 - If no section matches, or more than one does, flag the ticket and skip it. Don't guess.
 
 ## 3. Compare: does the ticket still match the doc?
 
-Compare **substance, not text**. The Asana copy legitimately differs from the doc because of the content rules: ordering words are dropped, dependencies become links, and there is no "Source:" footer. Those differences are not mismatches.
+Compare **substance, not text**. The monday copy legitimately differs from the doc because of the content rules: ordering words are dropped, dependencies become links, and there is no "Source:" footer. Those differences are not mismatches.
 
 It **is** a mismatch when the two disagree on something an implementer would act on: scope items, acceptance criteria, doc `§` pointers, deferred items, dependencies, or the size in the name. Missing or truncated sections count too, and so does a content-rule violation (e.g. a "next ticket" pointer).
 
 **On a mismatch:**
 - The plan doc is the source of truth. List the exact differences per ticket.
-- Mechanical drift (a missing bullet, a stale `§` number, truncation, a content-rule violation): update the ticket's `html_notes` to match the doc. Preserve anything the user added in Asana that the doc doesn't contradict.
-- If the Asana side looks like a deliberate edit, or the doc itself looks wrong, don't overwrite either side. Show both versions and ask.
-- Leave a corrected ticket at `Created`; don't plan it in the same run. Report it so the user can review the correction first. A re-run will plan it.
+- Mechanical drift (a missing bullet, a stale `§` number, truncation, a content-rule violation): rewrite the ticket's description to match the doc (see §5 for how). Preserve anything the user added in monday that the doc doesn't contradict.
+- If the monday side looks like a deliberate edit, or the doc itself looks wrong, don't overwrite either side. Show both versions and ask.
+- Leave a corrected ticket's Status as it was (`Not Started` or empty); don't plan it in the same run. Report it so the user can review the correction first. A re-run will plan it.
 
 **On a match:** continue to §4.
 
@@ -67,8 +67,8 @@ Don't read an overall result (a status, a summary flag) straight off the ticket'
 
 If a stub means this ticket can't exercise the real success result, the ticket that replaces the stub with the real implementation must re-run this ticket's cases:
 - Add an acceptance criterion and a test case to **that** ticket: "re-run the integration cases from <link to this ticket>". Its expected values are worked out the same way, with that ticket's remaining stubs still in place.
-- The reference goes from the later ticket back to the earlier one, which the Asana content rules allow because it's a dependency. The earlier ticket never points forward.
-- If the later ticket isn't `Created` yet, add the criterion to its plan doc section only, so it carries over when the ticket is created.
+- The reference goes from the later ticket back to the earlier one, which the content rules allow because it's a dependency. The earlier ticket never points forward.
+- If the later ticket isn't on the board yet, add the criterion to its plan doc section only, so it carries over when the ticket is created.
 
 ### Case checklist
 
@@ -93,34 +93,42 @@ Leave out cases the ticket doesn't build (deferred items), and don't restate uni
 If the ticket's acceptance criteria and the spec disagree in a way that changes what a case would assert, it is a design decision and not yours to settle silently. A common case: the criteria promise a success result, but a field this ticket stubs forces a failure result under the spec's rule. Ask the user (AskUserQuestion), offering both readings, before writing that ticket's plan. Continue with the other tickets meanwhile.
 
 Once the user decides:
-1. Update that ticket's acceptance criteria to the decided version in **both** the plan doc and Asana. They are now the source of truth for the plan.
+1. Update that ticket's acceptance criteria to the decided version in **both** the plan doc and monday. They are now the source of truth for the plan.
 2. Write the plan from the updated criteria.
 3. Re-check every ticket the decision affects, especially the one that will replace the stub (see above). Update its criteria and test plan too.
 
 ## 5. Write the plan into the ticket
 
-Append one section to the **live** `html_notes`, after the last existing section and before any trailing footer, leaving everything else byte-for-byte unchanged:
+Add one section at the end of the **live** description, after the last existing section, leaving everything else unchanged:
 
-```html
-<h2>Integration test plan</h2><strong>Setup:</strong> <real deps, how the app is started, failure-injection method, live opt-in marker if any, test file location>.
-<ol><li><strong><case name>:</strong> <trigger> → <exact expected result>.</li>...</ol>
+```markdown
+## Integration test plan
+
+**Setup:** <real deps, how the app is started, failure-injection method, live opt-in marker if any, test file location>.
+
+1. **<case name>:** <trigger> → <exact expected result>.
+...
 ```
 
 - Each case states its **trigger** and its **observable expected result** (status code, field values, `error_code`, log event, state identity or size). Avoid vague wording like "works correctly" or "handles errors".
-- Follow the content rules: to build on another ticket's suite, link that ticket with `<a data-asana-gid="<gid>"/>`. Never write "the previous ticket's suite".
+- Follow the content rules: to build on another ticket's suite, link that item by URL. Never write "the previous ticket's suite".
 - If the ticket already has an `Integration test plan` section, don't overwrite it. Show what you would change and ask.
-- Don't copy the plan into the plan doc. It lives only in Asana unless the user asks otherwise.
+- Don't copy the plan into the plan doc. It lives only in monday unless the user asks otherwise.
 
-Update tickets **one at a time, sequentially**. Send `html_notes` and the Status change in the same `asana_update_task` call:
-`custom_fields: {"<status field gid>": "<Planned option gid>"}`.
-If a call errors or its response is lost, re-read the task before retrying.
+**How to write it.** monday can't append to an item description (`add_content_to_doc_from_markdown` rejects description ids), and `set_item_description_content` **replaces** the whole description. So:
+1. Rebuild markdown from the live description blocks read in §1. Each block's `content` is a delta: `normal text` → paragraph, `medium title` → `##`, `large title` → `#`, `small title` → `###`, `bulleted list` → `- `, `numbered list` → `1. `, with `indentation` → nested list; attributes `bold` → `**…**`, `italic` → `*…*`, `code` → `` `…` ``, `link` → `[…](url)`. If a block type or attribute has no markdown equivalent (table, image, color, …), stop and ask — rewriting would lose it.
+2. Append the test plan section and write the result with `set_item_description_content` (mutation in `create-monday-tickets` §4, markdown via `variables`).
+3. Then set Status: `change_item_column_values` with `{"<status column id>": {"label": "Planned"}}`.
+
+Update tickets **one at a time, sequentially**. If a call errors or its response is lost, re-read the item before retrying.
 
 ## 6. Verify
 
-`asana_get_task` each updated ticket and check:
+Re-read each updated item (`get_board_items_page` with `itemIds`, `includeItemDescription: true`, `includeColumns: true`) and check:
 - Status is `Planned`.
-- The test plan section is present, complete, and well-formed. Dependency links resolved to the right tasks.
-- Everything outside the new section is unchanged from the live version you read in §1.
+- The test plan section is present and complete, every case as its own list block. Item links point to the right tickets.
+- Every block from the live version you read in §1 is still there, in order, with the same type, text, and formatting (block ids change on rewrite; compare content, not ids).
+- Description blocks come back in pages of 25. If the read stops at exactly 25 blocks, fetch the rest with `all_monday_api`: `query { items(ids: [<id>]) { description { blocks(limit: 25, page: 2) { type content } } } }` (then page 3, …). Compare the total against the `block_ids` count from the write before calling anything truncated.
 
 Fix any problem and re-verify.
 
