@@ -167,7 +167,7 @@ flowchart TD
 
 ### 2.3 Inter-Layer Signals
 
-All signals use Redis Streams via `RedisStreamClient`. Each stream serves as both the signal and the persistent queue for the receiving layer. All messages include a `v` field for message schema versioning — consumers check `v` before parsing and route to Dead Letter on version mismatch.
+All signals use Redis Streams via `RedisStreamClient`. Each stream serves as both the signal and the persistent queue for the receiving layer. All messages include a `v` field for message schema versioning — consumers check `v` and the message's id field before parsing and route a message straight to Dead Letter when `v` is missing or unrecognised or the id is missing or malformed, since it can never succeed; each message is handled in isolation, so one bad message never holds up the rest of its batch.
 
 | Stream | Producer | Consumer Group | Message Fields | Role |
 |---|---|---|---|---|
@@ -515,7 +515,7 @@ Defined as `ScoringConfig`: implementation.md §4.1.
 | EventScoringSkill output fails schema validation (or an empty `adjustment_reason`) | Fallback applied (§5.9); processing continues |
 | Either Skill's LLM call fails (provider error, authentication) | Do not ACK; retried on redelivery — a fallback would persist a degraded result for an outage that's usually transient |
 | `LLMRateLimitException` | Pause entire Scoring Layer concurrent pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
-| source:config unreachable | Use default weights; log warning; processing continues |
+| source:config unreachable | Do not ACK; retried on redelivery, same as a DB read failure — a default-weight fallback would persist degraded scores for an outage that's usually transient |
 | DB write failure | See Section 12.1 DB Write Failure policy |
 | RedisStreamClient unreachable | See Section 12.1 RedisStreamClient policy |
 
@@ -771,10 +771,10 @@ Used exclusively by EntityAnalysisSkill. Executed by the Skill layer as an in-pr
 
 **Code format normalization:** the HK Stock List's native format (both HKEXnews and the official "List of Securities") is a bare 5-digit zero-padded code, e.g. `"00700"` — no exchange suffix. `hkex:hk_stock_list` (§11.3.1) is keyed by this native form directly, with no transformation at load time. One conversion happens at the `lookup_stock` boundary; the other direction is now a no-op:
 
-- **Inbound:** strip any non-digit characters from `name_or_code` (drops a trailing `.HK` if a caller happens to still include one), then zero-pad the remaining digits to 5 — `"700"`, `"0700"`, and `"00700.HK"` all normalize to the same key, `"00700"`, before the lookup.
+- **Inbound:** a `name_or_code` that is wholly a code — 2–5 digits, optionally followed by a trailing `.HK` a caller may still include — has the suffix dropped and its digits zero-padded to 5: `"700"`, `"0700"`, and `"00700.HK"` all normalize to the same key, `"00700"`, before the lookup. Anything else, including a company name that contains digits (`"361度"`), is a name query.
 - **Outbound:** the returned `stock_code` field is that same stored native code, unchanged — no suffix is appended. `exchange` (always `"HKEX"` at MVP scope) is returned as its own field instead of being encoded into `stock_code`; every other stock-bearing schema in this document (`entity_events`/`events`/`event_scores`, the Aggregation Redis key, the Morning Brief API) already carries this exact same separate `exchange` field, so folding a redundant marker into `stock_code` here added nothing — this is now one unified concept and one unified value ("HKEX"), not two ("HK" here vs. "HKEX" everywhere else).
 
-**Fuzzy name matching:** the HK Stock List (§9.2.1) is small (~2,000–2,600 equities after filtering) and held entirely in SAPI's own process memory — both the exact-code and fuzzy-name paths match against that same in-memory data, with no Redis involved at all (Redis has no native fuzzy text search, and the exact-code path gains nothing from a separate round trip when the full set is already in-process regardless). No external fuzzy-matching library is needed — candidates are ranked by character-overlap ratio against `NAME_MATCH_MIN_OVERLAP_RATIO`, ties broken by longest-common-subsequence length; exact algorithm: implementation.md §4.2 (`lookup_stock()`'s `_fuzzy_match()`).
+**Fuzzy name matching:** the HK Stock List (§9.2.1) is small (~2,000–2,600 equities after filtering) and held entirely in SAPI's own process memory — both the exact-code and fuzzy-name paths match against that same in-memory data, with no Redis involved at all (Redis has no native fuzzy text search, and the exact-code path gains nothing from a separate round trip when the full set is already in-process regardless). No external fuzzy-matching library is needed — the query and each name are case-folded and stripped of whitespace, then candidates are ranked by character-overlap ratio against `NAME_MATCH_MIN_OVERLAP_RATIO`, ties broken by longest-common-subsequence length; exact algorithm: implementation.md §4.2 (`lookup_stock()`'s `_fuzzy_match()`).
 
 > `overlap_ratio` is normalized by `len(query)`, not the candidate's length — this is what makes a short, abbreviated query (e.g. `"阿里"` against `"阿里巴巴集團控股有限公司"`) score 100% regardless of how much longer the candidate name is, matching the common case of partial/abbreviated company names in news text.
 

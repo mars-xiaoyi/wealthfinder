@@ -696,19 +696,24 @@ No cache parameter: `lookup_stock()` calls `get_hk_stock_list_cache()` directly.
 from app.common.hk_stock_list import get_hk_stock_list_cache
 ```
 
-**Format detection and code normalization** (system-design.md §9.2): strip non-digit characters from `name_or_code`, zero-pad to 5 digits; if the result is entirely digits and the original contained at least 2 digits, treat as a code lookup — `get_hk_stock_list_cache().entries.get(normalized)` — a hit returns the `Stock` already stored there directly (no wrapping step; see above's note on `entries`' value type), a miss returns `None`. Otherwise, treat as a name query and run fuzzy matching against the same `get_hk_stock_list_cache().entries`.
+**Format detection and code normalization** (system-design.md §9.2): if `name_or_code`, with surrounding whitespace trimmed, fully matches `\d{2,5}(\.HK)?` (case-insensitive), treat it as a code lookup — drop the `.HK` suffix, zero-pad the digits to 5, then `get_hk_stock_list_cache().entries.get(normalized)` — a hit returns the `Stock` already stored there directly (no wrapping step; see above's note on `entries`' value type), a miss returns `None`. Anything else — a single digit, or a name that merely contains digits such as `"361度"` — is a name query and runs fuzzy matching against the same `get_hk_stock_list_cache().entries`. A `name_or_code` that is empty after trimming is a miss: return `None` without scanning, logged with `path="fuzzy_name"`, `candidates_scanned=0`, `found=False` (`_fuzzy_match` divides by `len(query)`, so it must never see an empty query).
 
 **Fuzzy name matching** (rationale: system-design.md §9.2):
 
 ```python
+def _normalize_name(text: str) -> str:
+    return "".join(text.split()).casefold()   # HKEX English names are upper case; spaces are not evidence
+
 def _fuzzy_match(query: str, candidates: dict[str, Stock], min_overlap_ratio: float) -> Optional[str]:
+    q = _normalize_name(query)
     scored = []
     for code, entry in candidates.items():
         for candidate_name in (entry.company_name_zh, entry.company_name_en):
-            overlap = len(set(query) & set(candidate_name))  # multiset overlap per system-design.md §9.2
-            overlap_ratio = overlap / len(query)
+            name = _normalize_name(candidate_name)
+            overlap = len(set(q) & set(name))  # multiset overlap per system-design.md §9.2
+            overlap_ratio = overlap / len(q)
             if overlap_ratio >= min_overlap_ratio:
-                lcs = _lcs_length(query, candidate_name)
+                lcs = _lcs_length(q, name)
                 scored.append((overlap, lcs, code))
     if not scored:
         return None
@@ -730,7 +735,7 @@ import logging
 
 _SLOW_CALL_THRESHOLD_MS = 20   # WARNING instead of INFO above this; not env-configurable
 
-async def lookup_stock(name_or_code, min_overlap_ratio) -> Optional[Stock]:
+def lookup_stock(name_or_code, min_overlap_ratio) -> Optional[Stock]:
     start = time.perf_counter()
     hk_stock_list_cache = get_hk_stock_list_cache()
     # ... existing exact-code / fuzzy-name branches build `result: Optional[Stock]`
@@ -1100,7 +1105,7 @@ CONSUMER_GROUP_CACHE        = "sapi-cache"
 | `STREAM_EVENT_AGGREGATED` | Aggregation Layer | `sapi-scoring` |
 | `STREAM_EVENT_SCORED` | Scoring Layer | `sapi-cache` |
 
-> **`v` field — message schema versioning (system-design.md §2.3).** Every published message includes `v` (current value: `"1"`). Each layer's consumer checks `fields["v"]` immediately after `read_from()`/`autoclaim()` returns and before touching any other field; an unrecognised value routes the message straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) without a processing attempt, rather than raising deep inside business logic on a shape it doesn't understand. It uses the same dead-letter payload as the Reclaim and Dead Letter pattern below; on the `read_from()` path, `delivery_count` is `"1"` — a first delivery.
+> **Message shape check — `v` and the id field (system-design.md §2.3).** Every published message carries `v` (current value: `"1"`) and the layer's id field (`cleaned_id`, `entity_event_id` or `event_id`, each a UUID). Each layer's consumer checks both immediately after `read_from()`/`autoclaim()` returns and before any processing: a message whose `v` is missing or unrecognised, or whose id field is missing or not a valid UUID, is routed straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) and ACKed without a processing attempt — it can never succeed, so retrying it would only spend delivery attempts. It uses the same dead-letter payload as the Reclaim and Dead Letter pattern below; on the `read_from()` path, `delivery_count` is `"1"` — a first delivery.
 
 **Module-level singleton, same pattern as `DatabaseClient`** (§5.1). `create_stream_client()` constructs and registers it; every consumer calls `get_redis_stream_client()` directly rather than taking `redis_stream` as a constructor parameter.
 
@@ -1229,6 +1234,7 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": when the underlying c
 
 - **`config.consumer_name`** — each layer's own config (`EntityAnalysisConfig`/`AggConfig`/`ScoringConfig`/`CacheConfig`, §4.1) carries a `consumer_name` field, sourced from the `HOSTNAME` env var with a layer-specific fallback string for local/docker-compose runs (§4.1's note), so it's automatically unique per pod under horizontal scaling with no operator action required. Passed as the `consumer` argument to every `read_from()`/`autoclaim()` call that layer makes.
 - **`_reclaim_loop()`** — a coroutine each layer's `start()` runs alongside its main consumer loop via `asyncio.gather()` (**except Cache Layer — see §14.2's note; its reclaim step runs inside the single serial loop, not as a separate coroutine**). Wakes every `STREAM_CLAIM_TIMEOUT_MS` milliseconds and calls `autoclaim(stream, group, config.consumer_name, min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=<layer's batch size>)`. The loop body is wrapped in `except Exception` (not bare `except:`, so `asyncio.CancelledError` still propagates for shutdown) that logs a warning and does not re-raise; `run_supervised()` is the backstop.
+- **Per-message isolation, in both loops.** Each message from a `read_from()` or `autoclaim()` batch is handled — shape check, retry-exhaustion check, routing — inside its own `except Exception` that logs a warning with `exc_info` and leaves that message un-ACKed, so one message's failure never abandons the rest of its batch (on the reclaim path, every message in the batch has already had its `delivery_count` incremented by `autoclaim()`, so an abandoned batch would push healthy messages toward dead-lettering unprocessed).
 - **Retry-exhaustion check, per reclaimed message, before anything else:**
   ```python
   if reclaimed.delivery_count >= config.max_retry:   # ENTITY_ANALYSIS_MAX_RETRY / AGG_MAX_RETRY / SCORING_MAX_RETRY / CACHE_MAX_RETRY
@@ -3315,7 +3321,7 @@ Two layers, both required, one per class:
 
 ```python
 class WorkerPool:
-    def __init__(self, max_concurrent: int, rate_limit_backoff_s: int): ...
+    def __init__(self, layer: str, max_concurrent: int, rate_limit_backoff_s: int): ...   # layer: "entity_analysis" | "scoring", for logs
 
     async def dispatch(self, coro_factory: Callable[[], Awaitable[None]]) -> None:
         """Acquire the semaphore, check rate_limit_until, run coro_factory().
@@ -3326,14 +3332,15 @@ class WorkerPool:
             await coro_factory()
 
     def trigger_backoff(self) -> None:
-        """Set self._rate_limit_until = now() + rate_limit_backoff_s.
-        Called by the layer's Consumer when its Service call raises
-        LLMRateLimitException (§11.2's _process_one())."""
+        """Set self._rate_limit_until = now() + rate_limit_backoff_s, then log WARNING
+        rate_limit_backoff_started with layer and backoff_until (UTC ISO 8601) —
+        system-design.md §12.1. Called by the layer's Consumer when its Service call
+        raises LLMRateLimitException (§11.2's _process_one())."""
 ```
 
 Backoff is pool-level (system-design.md §12.1). `dispatch()` checks `self._rate_limit_until` *after* acquiring the semaphore, in a loop, so a caller already waiting on the semaphore still waits out the backoff, and a `trigger_backoff()` that extends the deadline mid-sleep is honoured. Work already running is not interrupted.
 
-**`dispatch()` awaits the work**, so both loops (`_consumer_loop()`/`_reclaim_loop()`, §11.2) `asyncio.gather()` a whole batch of dispatches and read again only once all return (system-design.md §3.3). Both share the pool, so `max_concurrent` caps the layer. `WorkerPool` owns no Tasks; cancelling the layer Task cancels in-flight work.
+**`dispatch()` awaits the work**, so both loops (`_consumer_loop()`/`_reclaim_loop()`, §11.2) `asyncio.gather()` a whole batch of dispatches and read again only once all return (system-design.md §3.3). Both share the pool, so `max_concurrent` caps the layer. `WorkerPool` owns no Tasks; cancelling the layer Task cancels in-flight work. After each gathered batch, the loop logs INFO `entity_analysis_batch_completed` (Scoring: `scoring_batch_completed`, §13.2) with `batch_size` and `latency_ms` — the per-batch measure Q-1 tunes `*_BATCH_SIZE`/`*_BATCH_TIMEOUT_MS` against (§18).
 
 > `RATE_LIMIT_BACKOFF_S * 1000` must stay below `STREAM_CLAIM_TIMEOUT_MS` — system-design.md §12.1 (claim-timeout constraint).
 
@@ -3456,8 +3463,11 @@ class AggregationService:
             active = await self._event_store.scan_all()
             changed = [e for e in active
                        if self._last_flushed.get(e.event_id) != e.aggregation_updated_at]
-            await self._persist_and_publish(changed)
+            started = time.perf_counter()
+            published = await self._persist_and_publish(changed)
             self._last_flushed = {e.event_id: e.aggregation_updated_at for e in active}
+            log INFO aggregation_flush_completed with events_persisted=len(changed),
+                events_published=published, latency_ms (since `started`)
         Only Events whose aggregation_updated_at moved since this process
         last flushed them are sent (system-design.md §4.5). _last_flushed
         starts empty, so the first flush after startup sends every active
@@ -3471,8 +3481,8 @@ class AggregationService:
         call this (queue-empty, interval timer, or graceful shutdown,
         §12.2); this method just does it."""
 
-    async def _persist_and_publish(self, events: list[Event]) -> None:
-        """Transactional outbox (system-design.md §4.5):
+    async def _persist_and_publish(self, events: list[Event]) -> int:
+        """Transactional outbox (system-design.md §4.5); returns the number of Events published:
         1. self._event_repo.persist_events(events) (§10.2) — one transaction;
            only newer state is written, and a written row is pending publish
            by construction (its aggregation_updated_at is now newer than its
@@ -4345,7 +4355,7 @@ async def count_active_sources(config: ScoringConfig) -> int:
 | BriefSummarySkill: `LLMSchemaViolationException` | Fallback applied inside the Skill (§8.3) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
 | EventLLMScoringSkill: `LLMSchemaViolationException` | Fallback applied inside the Skill (§8.4) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
 | Either Skill: `LLMRateLimitException`/`LLMProviderException`/`LLMAuthenticationException` | Caught inside `SkillBase.run()` (§8.1, inherited by both Skills) → `result.failure_reason=type(err)` (the caught exception's own class), never raised by `run()` itself; `ScoringService.score_event()` logs the Skill's completion event from `result.skill_log` and re-raises `result.failure_reason()` directly, same as `find_entity_events()` (§11.1); `ScoringConsumer` calls `WorkerPool.trigger_backoff()` only for `LLMRateLimitException`, removes from `_in_process`, does not ACK either way. `LLMAuthenticationException` additionally triggers a CRITICAL alert, inlined in `SkillBase.run()`'s `except` block |
-| `source:config` unreachable | Default weights (P1/P2/P3) used; log warning; processing continues |
+| `source:config` unreachable | The Redis error propagates from `get_source_weights()`/`count_active_sources()` (§13.5) — no fallback weights, no Admin call — to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK (rationale: system-design.md §5.11) |
 | DB write failure | `_db_write_with_retry()` exhausts retries inside `EventRepository.update_brief_summary()`/`EventScoreRepository.persist_score_if_not_stale()` (§10.2/§10.3), raises; propagates uncaught to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK |
 | `RedisStreamClient` unreachable | Per §6.1 |
 
@@ -4523,7 +4533,8 @@ class CacheService:
         4. merged = _incremental_merge({}, candidates, self._config.noise_filter_threshold)
            (§14.4) — against an empty dict this is a plain threshold filter.
         5. sorted_records = sorted(merged.values(), key=ranking_key, reverse=True) (§14.3).
-        6. return await self._write_new_version(sorted_records, old_version=None) (§14.5).
+        6. return await self._write_new_version(sorted_records, old_version=None, started=started) (§14.5),
+           where started = time.perf_counter() taken on entry.
         Called with self._build_lock already held. Catches nothing. At startup, main.py's lifespan (§16) logs CRITICAL and continues
         with current_version unbuilt; from build_new_version(), CacheConsumer's catch (§14.2)
         leaves the batch unACKed, and the next batch tries the full build again."""
@@ -4548,7 +4559,8 @@ class CacheService:
         6. merged = _incremental_merge(current, candidates,
            self._config.noise_filter_threshold) (§14.4).
         7. sorted_records = sorted(merged.values(), key=ranking_key, reverse=True) (§14.3).
-        8. return await self._write_new_version(sorted_records, current_version) (§14.5).
+        8. return await self._write_new_version(sorted_records, current_version, started) (§14.5),
+           where started = time.perf_counter() taken once the lock is held.
         Builds never overlap (§14.5's serial-writer requirement): CacheConsumer calls this
         serially, and the lock covers the refresh endpoint, a second caller (§14.9). Raises
         on failure; the caller decides what that means (CacheConsumer: don't ACK the batch;
@@ -4707,13 +4719,15 @@ def _incremental_merge(current: dict[UUID, CacheRecord], candidates: dict[UUID, 
 ### 14.5 Versioned Cache Replacement (system-design.md §6.5)
 
 ```python
-async def _write_new_version(self, sorted_records: list[CacheRecord], old_version: Optional[int]) -> int:
+async def _write_new_version(self, sorted_records: list[CacheRecord], old_version: Optional[int], started: float) -> int:
     new_version = await self._cache_store.incr_version_counter()
     await self._cache_store.write_cache_version(
         new_version, json.dumps([r.to_dict() for r in sorted_records], ensure_ascii=False),
         datetime.now(timezone.utc), old_version,
     )
     get_cache_reader().prime(new_version, sorted_records)   # §14.8 — the API serves these without parsing
+    logger.info("cache_build_completed", cache_version=new_version, records=len(sorted_records),
+                latency_ms=(time.perf_counter() - started) * 1000)   # build duration, for Cache tuning
     return new_version
     # write_cache_version (§10.4) performs SET v{new}, SET current_version, DEL v{old}, SET last_updated
     # as one atomic MULTI/EXEC pipeline — readers never observe a version between "new written" and
@@ -5132,8 +5146,8 @@ async def lifespan(app: FastAPI):
     # WorkerPools are layer-owned collaborators, constructed here and passed to their Consumer.
     # Skills are never constructed here.
 
-    entity_analysis_worker_pool = WorkerPool(config.entity_analysis.max_concurrent, config.llm.rate_limit_backoff_s)
-    scoring_worker_pool = WorkerPool(config.scoring.max_concurrent, config.llm.rate_limit_backoff_s)
+    entity_analysis_worker_pool = WorkerPool("entity_analysis", config.entity_analysis.max_concurrent, config.llm.rate_limit_backoff_s)
+    scoring_worker_pool = WorkerPool("scoring", config.scoring.max_concurrent, config.llm.rate_limit_backoff_s)
 
     # Each Service takes only its config and pulls its infra via get_X(); each Consumer pulls its
     # Service via get_X_service() (§5.1).
@@ -5344,7 +5358,7 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 
 | # | Gap | Where | Recommended resolution |
 |---|---|---|---|
-| I-1 | **`_fuzzy_match`'s (§4.2) real-world performance is unverified:** an O(N) synchronous scan over ~2,000–2,600 entries on the shared event loop (§16). | §4.2 | `lookup_stock_completed` (§4.2) provides the measurements. Before traffic: a synthetic micro-benchmark plus an event-loop heartbeat-gap test. After: p50/p95/p99 from the logs. If blocking is meaningful, wrap in `asyncio.to_thread()` (as SADI does for `feedparser`); not before, since dispatch overhead may net-lose. |
+| I-1 | **`_fuzzy_match`'s (§4.2) real-world performance is unverified:** an O(N) synchronous scan over ~2,000–2,600 entries on the shared event loop (§16). A synthetic benchmark of the §4.2 code (2,600 entries with Chinese and English names, laptop, Python 3.14) measured a ~2–3 ms floor per call (every call rebuilds each name's character set) and ~12–23 ms when hundreds to ~1,400 names pass the overlap ratio and each runs `_lcs_length()`; expect slower on a shared-vCPU VM. | §4.2 | `lookup_stock_completed` (§4.2) provides the measurements. Before traffic: a synthetic micro-benchmark plus an event-loop heartbeat-gap test. After: p50/p95/p99 from the logs. If blocking is meaningful, wrap in `asyncio.to_thread()` (as SADI does for `feedparser`); not before, since dispatch overhead may net-lose. |
 | I-2 | **Token counts and `instructor_retries` (§7.1, §7.3) are unverified against the pinned SDKs:** assumes `google-genai` exposes Gemini's `usage_metadata` in a known shape and `instructor.from_genai(...)` surfaces a per-call retry count; no versions are pinned. `latency_ms` needs no verification. | §7.1, §7.3 | Before implementing `VertexAIAdapter`: a standalone spike against the real pinned versions on live Vertex AI, printing the raw response to confirm the token-count attribute path and Instructor's retry count. Token counts matter more (they feed cost monitoring); if `instructor_retries` is awkward, ship a documented placeholder `0`. |
 | I-3 | **Per-Skill `Max Tokens` (§8 table: 8192/4096/2048) has no stated derivation** in either doc; they read as round-number placeholders. | §8, system-design.md §9.1 | Validate against real `output_tokens` from the `llm_calls[]` log (system-design.md §9.8): check for calls hitting the max (truncated JSON) and for persistent unused headroom at p95/p99; adjust per Skill. Not blocking; truncation is the likelier failure. |
 ---
