@@ -89,11 +89,17 @@ Create items **one at a time, sequentially**, in dependency order so each item's
    - **Known issue:** on a brand-new item this mutation can fail with `INTERNAL_SERVER_ERROR` because the item's description document doesn't exist yet. Check with `query { items(ids: [<id>]) { description { id } } }`. If there's no description document, stop and ask the user to open the item once in monday (which creates it), then retry. Never fall back to posting the body as an update.
 3. If the ticket has dependencies, set the **Dependent On** column (`dependency_mm86r1ns` on the WealthFinder board — confirm the id with `get_board_info`) with `change_item_column_values`: `{"<column id>": {"item_ids": [<dependency item ids>]}}`.
 
+**Reading a description in full.** `get_board_items_page` with `includeItemDescription` and a plain `description { blocks { ... } }` both return only the first 25 blocks, and nothing says the rest was cut off. Whenever you need a description's whole content — before rebuilding it for `set_item_description_content`, or to verify one — read it with `all_monday_api`:
+```graphql
+query { items(ids: [<id>]) { description { blocks(limit: 100, page: 1) { id type content } } } }
+```
+If a page comes back with exactly 100 blocks, fetch `page: 2`, and so on. A rewrite from a partial read deletes every block you didn't see.
+
 **If a call errors or the response is lost:** do not blindly retry. Re-read (`get_board_items_page` with `itemIds`, or `searchTerm` by name) to see whether the write actually landed, then retry only what's missing.
 
 ## 5. Verify
 
-For every created item, `get_board_items_page` with `itemIds: [<id>]`, `includeItemDescription: true`, `includeColumns: true`, and check:
+For every created item, read its description in full (§4, "Reading a description in full") and its columns (`get_board_items_page` with `itemIds: [<id>]`, `includeColumns: true`), and check:
 - Name is exact (no escaping artifacts).
 - It's on the confirmed board, in the confirmed group.
 - Dependent On lists the right items, and the "Depends on" links point to them.
@@ -117,7 +123,9 @@ Give a short summary: each created ticket with its monday link, the group it was
 
 When asked to change tickets already on the board (e.g. apply a new content rule, remove a line):
 
-1. **Re-fetch each item's current description first** (`get_board_items_page` with `includeItemDescription: true`). The user may have edited it directly in monday (e.g. added an integration test plan). Build the new markdown from that live version and preserve everything the user added — change only what was asked. Since `set_item_description_content` replaces the whole description, anything left out of the markdown is lost.
+1. **Re-fetch each item's current description first, in full** (§4, "Reading a description in full"). The user may have edited it directly in monday (e.g. added an integration test plan). Build the new markdown from that live version and preserve everything the user added — change only what was asked. Since `set_item_description_content` replaces the whole description, anything left out of the markdown is lost.
+   - If the change only alters text inside existing blocks, edit just those blocks instead of rewriting: `mutation ($block_id: String!, $content: JSON!) { update_doc_block(block_id: $block_id, content: $content) { id } }`, where `content` is the block's delta JSON (as read) with the text changed. Everything else stays untouched.
+   - Adding or removing a block needs a full rewrite: `create_doc_block` fails on item descriptions ("Doc not found").
 2. If the change is more than mechanical, list the exact proposed edits per ticket and wait for approval before writing.
 3. Update one item at a time; re-read after any error before retrying.
 4. Verify each updated item as in §5.

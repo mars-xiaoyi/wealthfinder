@@ -18,7 +18,7 @@ monday tickets in this repo are created by the `create-monday-tickets` skill. **
 1. Find the board: the one the user names, else the project board from `get_user_context` (so far **WealthFinder**, `5031953275`). If several boards are plausible, ask.
 2. `get_board_info` with `filters.columns.only: true`: record the Status column id (`project_status` on WealthFinder) and check it has a `Planned` label. If not, stop and ask — don't create labels on your own.
 3. `get_board_items_page` with `includeColumns: true`, following `nextCursor` while `has_more`. Keep items whose Status is **`Not Started` or empty**. `Not Started` is the board's default label for a new item, so it means unreviewed. Items with any other Status (`Planned`, `Working on it`, …) are past this step.
-4. For each one, `get_board_items_page` with `itemIds: [<id>]`, `includeItemDescription: true`. Work from this live description, because the user may have edited the ticket directly in monday.
+4. For each one, read its description in full (`create-monday-tickets` §4, "Reading a description in full" — a plain read stops at 25 blocks). Work from this live description, because the user may have edited the ticket directly in monday.
 
 If no item is `Not Started` or empty, say so and stop.
 
@@ -124,11 +124,11 @@ Update tickets **one at a time, sequentially**. If a call errors or its response
 
 ## 6. Verify
 
-Re-read each updated item (`get_board_items_page` with `itemIds`, `includeItemDescription: true`, `includeColumns: true`) and check:
+Re-read each updated item — its description in full (`create-monday-tickets` §4, "Reading a description in full") and its columns (`get_board_items_page` with `itemIds`, `includeColumns: true`) — and check:
 - Status is `Planned`.
 - The test plan section is present and complete, every case as its own list block. Item links point to the right tickets.
 - Every block from the live version you read in §1 is still there, in order, with the same type, text, and formatting (block ids change on rewrite; compare content, not ids).
-- Description blocks come back in pages of 25. If the read stops at exactly 25 blocks, fetch the rest with `all_monday_api`: `query { items(ids: [<id>]) { description { blocks(limit: 25, page: 2) { type content } } } }` (then page 3, …). Compare the total against the `block_ids` count from the write before calling anything truncated.
+- The block count matches the `block_ids` count the write returned.
 
 Fix any problem and re-verify.
 
