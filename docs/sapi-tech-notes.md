@@ -2,7 +2,7 @@
 
 Learning notes from designing SAPI, the Redis Streams–based pipeline in this repo (Entity Analysis → Aggregation → Scoring → Cache). SAPI's binding design lives in `stock-assistant-pipeline-intelligence/docs/` (`impl.md` = `implementation.md`, `design.md` = `system-design.md` below); nothing here is a design decision for it.
 
-- **Part 1** lists concrete problems found while designing SAPI: what went wrong, why it was easy to miss, and the fix.
+- **Part 1** lists concrete problems found while designing SAPI: what went wrong, why it was easy to miss, and the fix. It ends with the project's development tooling (§1.11).
 - **Part 2** covers the general topics behind them, for future investigation. Each ends with questions worth digging into.
 
 ---
@@ -75,6 +75,15 @@ Aggregation runs one `GroupCoroutine` per `(exchange, stock_code, event_type_pri
 - **Why it was easy to miss:** the cap looks like a resource limit, but it counts live objects, not running work, and waiting for it on the read path turns a capacity issue into "data stopped being persisted".
 - **Status:** open — size `AGG_MAX_CONCURRENT` above the peak number of active groups, and measure it in production.
 - **Topic:** §2.6.
+
+## 1.11 Development tooling
+
+- **uv** — creates the virtualenv and installs pinned dependencies. Chosen because it is much faster than pip and the repo already uses it (SADI's `requirements.lock` is compiled with `uv pip compile`).
+- **pytest + pytest-asyncio** — runs the unit tests; pytest-asyncio lets `async def` tests run without a per-test decorator (`asyncio_mode = "auto"`). Chosen because pytest is the Python standard and SADI already uses both, so tests look the same across services.
+- **ruff** — lints and formats the code in one tool, replacing flake8, isort and black. Chosen because a single fast tool with one config is easier to keep consistent than three. One choice follows from it: FastAPI route dependencies are written as `Annotated[T, Depends(...)]`, FastAPI's recommended form, which also satisfies ruff's `B008` rule against function calls in argument defaults.
+- **mypy (strict)** — checks types statically. Chosen to enforce the repo rule that values crossing a module boundary are strongly typed; strict mode rejects untyped functions and implicit `Any` in `app/`. Tests are checked too, but may leave their functions unannotated.
+
+pytest, ruff and mypy are configured in the service's `pyproject.toml`; test-only dependencies are pinned in `requirements-test.txt`.
 
 ---
 

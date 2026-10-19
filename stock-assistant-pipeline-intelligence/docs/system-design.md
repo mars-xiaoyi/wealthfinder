@@ -257,7 +257,7 @@ Defined as `EntityAnalysisConfig`: implementation.md §4.1.
 |---|---|
 | LLM API call failure | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
 | LLM schema violation (Instructor exhausted retries) | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
-| `LLMRateLimitException` | Pause entire Worker Pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
+| `LLMRateLimitError` | Pause entire Worker Pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
 | All entities filtered by stock verification | Valid `entities=[]` outcome — no DB record written, no signal emitted; ACK |
 | `cleaned_id` missing from SADI's `cleaned_news` response (silently omitted per `api.md` §2.5, not an HTTP error) | Log warning with `cleaned_id`; ACK — skip this article. Retrying would not recover an ID that isn't in SADI's response. Not expected in normal operation today (SADI has no `cleaned_news` retention/purge job as of this writing) — the log exists to surface it if that changes |
 | DB write failure | See Section 12.1 DB Write Failure policy |
@@ -514,7 +514,7 @@ Defined as `ScoringConfig`: implementation.md §4.1.
 | BriefSummarySkill output fails schema validation | Fallback applied (§5.9); processing continues |
 | EventScoringSkill output fails schema validation (or an empty `adjustment_reason`) | Fallback applied (§5.9); processing continues |
 | Either Skill's LLM call fails (provider error, authentication) | Do not ACK; retried on redelivery — a fallback would persist a degraded result for an outage that's usually transient |
-| `LLMRateLimitException` | Pause entire Scoring Layer concurrent pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
+| `LLMRateLimitError` | Pause entire Scoring Layer concurrent pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
 | source:config unreachable | Do not ACK; retried on redelivery, same as a DB read failure — a default-weight fallback would persist degraded scores for an outage that's usually transient |
 | DB write failure | See Section 12.1 DB Write Failure policy |
 | RedisStreamClient unreachable | See Section 12.1 RedisStreamClient policy |
@@ -656,7 +656,7 @@ GET /health
 - `database`/`redis_stream`/`redis_state` all `ok` and `hk_stock_list` `ok`, but any `layers.*` is `error` → `200 degraded` (the only condition that produces `degraded` — a layer's consumer coroutine has crashed but not yet been auto-restarted by Coroutine Monitoring's `done_callback`, §12.1; self-healing and transient, so still `200`, not `503`)
 - Database or Redis unreachable, or `hk_stock_list` is `not_ready` → `503 unhealthy`
 
-**Each dependency check is time-bounded and runs concurrently.** An unresponsive DB or Redis (connection open but not answering) would otherwise hang the request past the orchestrator probe's own deadline, which then reads as an unexplained probe failure instead of a `503` naming the failed component. A check that exceeds the timeout reports `error`, the same as an unreachable one. The bound sits around the health checks only, not on the DB/Redis clients: a client-wide Redis socket timeout would cut off the consumers' blocking `XREADGROUP` reads (§2.3).
+**Each dependency check is time-bounded and runs concurrently.** An unresponsive DB or Redis (connection open but not answering) would otherwise hang the request past the orchestrator probe's own deadline, which then reads as an unexplained probe failure instead of a `503` naming the failed component. A check that exceeds the timeout reports `error`, the same as an unreachable one, and is abandoned rather than awaited: a cancelled driver call can itself block on the unresponsive server during cleanup (asyncpg sends a cancel request over a new connection and waits for the server to close it, with no timeout), so waiting for the cancellation to finish would bring the hang back. An abandoned check can still hold a pool connection, and the DB pool's graceful close waits for every connection to be released, so shutdown bounds that close and terminates the pool past the limit. The bound sits around the health checks only, not on the DB/Redis clients: a client-wide Redis socket timeout would cut off the consumers' blocking `XREADGROUP` reads (§2.3).
 
 > Post-MVP extension: add Dead Letter Stream backlog monitoring per layer to detect processing failures earlier.
 
@@ -694,7 +694,7 @@ Vertex AI (Gemini), `asia-east1`, via `google-genai` (raw calls) and Instructor 
 
 ### 8.2.1 Timeout Management
 
-LLM and SADI API call timeouts are both centralised in environment variables rather than scattered per call site. On timeout, both raise `LLMProviderException` (LLM) or propagate as a SADI API failure — existing error handling policies apply (§3.6, §12.1).
+LLM and SADI API call timeouts are both centralised in environment variables rather than scattered per call site. On timeout, both raise `LLMProviderError` (LLM) or propagate as a SADI API failure — existing error handling policies apply (§3.6, §12.1).
 
 ### 8.3 Standard Data Structures
 
@@ -710,14 +710,14 @@ All provider-specific exceptions are mapped to standard types. Skill layer handl
 
 | Exception | Retryable | Trigger |
 |---|---|---|
-| `LLMRateLimitException` | Yes | Provider rate limit hit |
-| `LLMProviderException` | Yes | Provider-side error (5xx, network timeout) |
-| `LLMAuthenticationException` | Yes (message-level; not self-healing) | Provider rejects the call as unauthenticated/unauthorized (401/403 — invalid/expired credentials, revoked service account, missing IAM role, API not enabled) |
-| `LLMSchemaViolationException` | No | Instructor internal retries exhausted; output still does not conform to schema |
+| `LLMRateLimitError` | Yes | Provider rate limit hit |
+| `LLMProviderError` | Yes | Provider-side error (5xx, network timeout) |
+| `LLMAuthenticationError` | Yes (message-level; not self-healing) | Provider rejects the call as unauthenticated/unauthorized (401/403 — invalid/expired credentials, revoked service account, missing IAM role, API not enabled) |
+| `LLMSchemaViolationError` | No | Instructor internal retries exhausted; output still does not conform to schema |
 
-> `LLMSchemaViolationException` occurs when Pydantic validators defined in the output schema (e.g. value range constraints) are repeatedly violated after Instructor's internal retries. Gemini's `response_schema` parameter prevents missing field and type errors at the API level; Pydantic validators are the second-layer protection for business logic constraints.
+> `LLMSchemaViolationError` occurs when Pydantic validators defined in the output schema (e.g. value range constraints) are repeatedly violated after Instructor's internal retries. Gemini's `response_schema` parameter prevents missing field and type errors at the API level; Pydantic validators are the second-layer protection for business logic constraints.
 
-> Handling mechanisms for `LLMRateLimitException` (Worker Pool backoff) and `LLMAuthenticationException` (CRITICAL escalation, since unlike a transient 5xx it fails identically until an operator intervenes) are covered once, in §12.1's Rate Limit Backoff and LLM Authentication Failure mechanisms — not repeated here. `BusinessValidationError` is a log-only event type (not an exception class), covered in §9.7/§9.8.
+> Handling mechanisms for `LLMRateLimitError` (Worker Pool backoff) and `LLMAuthenticationError` (CRITICAL escalation, since unlike a transient 5xx it fails identically until an operator intervenes) are covered once, in §12.1's Rate Limit Backoff and LLM Authentication Failure mechanisms — not repeated here. `BusinessValidationError` is a log-only event type (not an exception class), covered in §9.7/§9.8.
 
 ---
 
@@ -872,7 +872,7 @@ Input selection metadata is recorded in the `brief_summary_completed` log event 
 
 Source authority weights for the ordering above and for the fallback come from the Scoring Layer's source configuration (§1.5), read before the Skill starts and passed in (§5.3).
 
-**Fallback (LLMSchemaViolationException):** Apply §5.9 BriefSummarySkill fallback policy.
+**Fallback (LLMSchemaViolationError):** Apply §5.9 BriefSummarySkill fallback policy.
 
 ### 9.6 EventScoringSkill
 
@@ -895,13 +895,13 @@ key_numbers: <brief_summary.output.key_numbers>
 
 Output: `stock_impact_score` on a `[-5, +5]` scale (a 7-point reference table anchors the scale, from "existential threat" at -5 to "major positive" at +5), prioritizing forward-looking signals and explicit financial data over qualitative description, plus a ≤80-character `adjustment_reason` explaining the dominant signal. Full prompt text, few-shot examples, output schema, and business constraint validation table: implementation.md §8.4.
 
-**Fallback (LLMSchemaViolationException or empty adjustment_reason):** Apply §5.9 EventScoringSkill fallback policy.
+**Fallback (LLMSchemaViolationError or empty adjustment_reason):** Apply §5.9 EventScoringSkill fallback policy.
 
 ### 9.7 Skill Error Handling Summary
 
-Each Skill's `run()` catches all four exceptions itself and never lets any of them propagate — it always returns a normal, typed result describing what happened (implementation doc §8.3–§8.6 for the exact contract). The calling Layer (Entity Analysis or Scoring) branches on that result, never on a caught exception: `LLMRateLimitException`/`LLMProviderException` always mean "no ACK, redeliver" (plus a pool-level backoff for rate limits specifically); `LLMSchemaViolationException` means "apply the Skill's fallback and continue" wherever a fallback is defined, or the same "no ACK, redeliver" otherwise (EntityAnalysisSkill has no fallback — §5.9 defines one only for BriefSummarySkill/EventScoringSkill).
+Each Skill's `run()` catches all four exceptions itself and never lets any of them propagate — it always returns a normal, typed result describing what happened (implementation doc §8.3–§8.6 for the exact contract). The calling Layer (Entity Analysis or Scoring) branches on that result, never on a caught exception: `LLMRateLimitError`/`LLMProviderError` always mean "no ACK, redeliver" (plus a pool-level backoff for rate limits specifically); `LLMSchemaViolationError` means "apply the Skill's fallback and continue" wherever a fallback is defined, or the same "no ACK, redeliver" otherwise (EntityAnalysisSkill has no fallback — §5.9 defines one only for BriefSummarySkill/EventScoringSkill).
 
-| Skill | LLMRateLimitException | LLMProviderException | LLMSchemaViolationException |
+| Skill | LLMRateLimitError | LLMProviderError | LLMSchemaViolationError |
 |---|---|---|---|
 | EntityAnalysisSkill | Caught in `run()`; Entity Analysis Layer: backoff, no ACK, redelivery | Caught in `run()`; Entity Analysis Layer: no ACK, redelivery | Caught in `run()` — no fallback defined; Entity Analysis Layer: no ACK, redelivery |
 | BriefSummarySkill | Caught in `run()`; Scoring Layer: backoff, no ACK, redelivery | Caught in `run()`; Scoring Layer: no ACK, redelivery | Caught in `run()`; apply fallback; processing continues |
@@ -909,7 +909,7 @@ Each Skill's `run()` catches all four exceptions itself and never lets any of th
 
 > **Rationale:** EntityAnalysisSkill failures are unrecoverable within the Skill — no downstream processing is possible without valid entity data. BriefSummarySkill and EventScoringSkill have defined fallback policies that allow scoring to continue with degraded but usable output.
 
-> `LLMAuthenticationException` (§8.5) is caught in `run()` and classified identically to `LLMProviderException` in the table above for every Skill — no ACK, redelivery, no fallback — so it isn't broken out as its own column here. What distinguishes it is visibility, not message-level handling: `SkillBase.run()`'s shared `except` block, inherited by all three Skills (implementation doc §8.1), logs CRITICAL on it specifically, since it's the one thing in this table that will keep failing identically for every subsequent message across both Layers until an operator intervenes, rather than a one-off or self-resolving condition. See Section 12.1's LLM Authentication Failure mechanism.
+> `LLMAuthenticationError` (§8.5) is caught in `run()` and classified identically to `LLMProviderError` in the table above for every Skill — no ACK, redelivery, no fallback — so it isn't broken out as its own column here. What distinguishes it is visibility, not message-level handling: `SkillBase.run()`'s shared `except` block, inherited by all three Skills (implementation doc §8.1), logs CRITICAL on it specifically, since it's the one thing in this table that will keep failing identically for every subsequent message across both Layers until an operator intervenes, rather than a one-off or self-resolving condition. See Section 12.1's LLM Authentication Failure mechanism.
 
 ---
 
@@ -1010,7 +1010,7 @@ The versioned-replacement scheme (§6.5) needs a version counter, a pointer to t
 
 **Rate Limit Backoff**
 
-When any Skill's `run()` reports `failure_reason=LLMRateLimitException` (§9.7 — `LLMRateLimitException` is caught inside the Skill itself and never reaches the Layer as a raised exception), the receiving Layer sets a `rate_limit_until` deadline and every worker checks it before starting new work, sleeping if still within the backoff window.
+When any Skill's `run()` reports `failure_reason=LLMRateLimitError` (§9.7 — `LLMRateLimitError` is caught inside the Skill itself and never reaches the Layer as a raised exception), the receiving Layer sets a `rate_limit_until` deadline and every worker checks it before starting new work, sleeping if still within the backoff window.
 
 - Backoff is applied at the Layer level (Worker Pool), not the individual worker level — prevents concurrent workers from continuing to hit the API during the backoff window
 - Message is not ACKed during backoff; redelivered after backoff period ends
@@ -1019,7 +1019,7 @@ When any Skill's `run()` reports `failure_reason=LLMRateLimitException` (§9.7 �
 
 **LLM Authentication Failure**
 
-When `VertexAIAdapter` (§8) sees a 401/403 from the provider, it raises `LLMAuthenticationException` (§8.5) — no logging of its own; the Adapter's only job is translating the provider's response into one of its four typed exceptions. The calling Skill's `run()` catches it exactly like `LLMProviderException` (message-level: no ACK, no backoff), in the one `except` block of `SkillBase.run()` (implementation doc §8.1) that all three Skills inherit — Skill-side, not part of the LLM Adapter itself, and written once rather than per Skill. What's different from every other exception in §8.5 is that this one is not a one-off or self-resolving condition — it means the configured credentials/IAM are broken, so it will fail identically for every subsequent LLM call, across both the Entity Analysis and Scoring Layers, until an operator fixes it. Per-message handling alone (buried in per-message INFO-level completion logs, §9.8) would not surface that quickly enough — that `except` block additionally logs CRITICAL specifically for this exception type, in place of the ERROR-level log every other exception type gets (normal classification — `LlmErrorEntry`, `failure_reason` — still applies).
+When `VertexAIAdapter` (§8) sees a 401/403 from the provider, it raises `LLMAuthenticationError` (§8.5) — no logging of its own; the Adapter's only job is translating the provider's response into one of its four typed exceptions. The calling Skill's `run()` catches it exactly like `LLMProviderError` (message-level: no ACK, no backoff), in the one `except` block of `SkillBase.run()` (implementation doc §8.1) that all three Skills inherit — Skill-side, not part of the LLM Adapter itself, and written once rather than per Skill. What's different from every other exception in §8.5 is that this one is not a one-off or self-resolving condition — it means the configured credentials/IAM are broken, so it will fail identically for every subsequent LLM call, across both the Entity Analysis and Scoring Layers, until an operator fixes it. Per-message handling alone (buried in per-message INFO-level completion logs, §9.8) would not surface that quickly enough — that `except` block additionally logs CRITICAL specifically for this exception type, in place of the ERROR-level log every other exception type gets (normal classification — `LlmErrorEntry`, `failure_reason` — still applies).
 
 - Logged once per occurrence, from `SkillBase.run()`'s shared `except` block (inherited by all three Skills) rather than duplicated per Skill or living as a side effect of the Adapter call
 - Rate-limiting/deduping this CRITICAL log across a sustained outage (so a broken credential doesn't produce one CRITICAL per message) is deliberately deferred — not implemented in this pass
@@ -1114,10 +1114,15 @@ Each layer consumer coroutine is started as an `asyncio.Task` in `main.py`. A `d
 ```
 On Task exit:
 ├── Normal shutdown → no action
+├── Exception while the service is shutting down
+│   → log ERROR with exception detail
+│   → no restart
 └── Unexpected exit (exception)
     → log CRITICAL with exception detail
     → recreate Task (auto-restart)
 ```
+
+A layer Task cancelled at shutdown can still end with an exception, e.g. Aggregation's final flush failing because the DB is already unreachable. Restarting it then would create a Task that shutdown never cancels, running past the lifespan against closed clients, so the monitor restarts only while the service is running.
 
 This lightweight mechanism handles coroutine crash recovery without requiring hang detection — the `XREADGROUP BLOCK` pattern prevents coroutines from hanging silently.
 

@@ -21,7 +21,7 @@ This document does not introduce new design — every ticket below implements so
 - **Every process-wide resource follows the same `create_X()` / `get_X()` singleton pattern** (impl.md §5.1) once more than one ticket needs to reach it. A resource used by exactly one ticket doesn't need this pattern yet.
 - **A ticket creates its own package directory** the moment it adds the first file into it — no separate scaffolding ticket pre-creates subpackages for work that hasn't started.
 - **A class built "minimal" stays minimal until a real need grows it.** Several classes below (`DatabaseClient`, `RedisStreamClient`, `RedisStateClient`) expose only the one or two methods their first consumer actually calls, not their full eventual method set from `impl.md`. The ticket that first needs another method adds it to the existing class at that point.
-- **Test layout (PM note, not in impl.md):** mirror SADI's convention — `tests/<module_path>/test_<file>.py` under the service root, pytest. A ticket with a live-dependency risk (an external API whose real response shape could drift) owns its own "Integration testing" note rather than deferring all live checks to one end-of-project ticket.
+- **Test layout (PM note, not in impl.md):** `tests/app/<module_path>/<file>.py` under the service root (mirroring `app/<module_path>/<file>.py`), named after the module it tests, with tests named `<function>_<case>` (pytest is configured to collect them, `pyproject.toml`). Integration tests follow the same layout under `tests/integration/app/`. A ticket with a live-dependency risk (an external API whose real response shape could drift) owns its own "Integration testing" note rather than deferring all live checks to one end-of-project ticket.
 - **SAPI is tested and deployed independently of other MWP services.** In integration passes, anything another MWP service provides (SADI's API and its `stream:raw_news_cleaned` messages, Admin's API) is mocked; SAPI's own infra (Postgres, Redis) is real, and third-party APIs whose real behaviour is the ticket's risk (Vertex AI, HKEXnews) are called live. No implementation ticket depends on another MWP service being built or deployed. Post-Release Tuning Validation tickets are the exception — a production-like volume run, measured on real traffic by definition.
 - **Status** tracks each ticket's own lifecycle, independent of implementation progress: `Designing` (default — scope/boundaries here may still change), `Designed` (scope finalized and reviewed, ready to create in the tracker), `Created` (an actual ticket now exists in the tracker for this work).
 
@@ -35,7 +35,8 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** nothing
 **Scope:** Implement `GET /v1/health` (impl.md §15.2, api.md §3.2) with real `database`/`redis_stream`/`redis_state` checks. Build only the slice of each piece this needs — not each class's full eventual shape:
 - `app/config.py`: just the `DatabaseConfig`/`RedisConfig` fields pool creation and connection need, plus `HealthConfig` (§4.1) — none of the retry/reconnect fields, nothing uses those yet.
-- `app/common/error_codes.py`/`exceptions.py`: `SAPIException`/`ServiceUnavailableException` and the one catalog entry its default needs (§15.1).
+- `app/common/errors.py`: `ErrorType`, `SAPIError`/`ServiceUnavailableError` (§15.1).
+- `app/logger.py`: `configure_logging()`/`get_logger()` (§4.3).
 - `app/db/connection.py`: `DatabaseClient`, `fetch_one()` only (§5.1) — no writes, retry, or transactions.
 - `app/redis/stream_client.py`/`state_client.py`: `ping()` only (§6.1/§6.2).
 - `app/api/schemas.py`: `HealthResponse`'s full shape, since it's a fixed external contract — but `hk_stock_list`/`layers` are hardcoded to their honest failure states here, since nothing real exists yet to check either.
@@ -46,19 +47,19 @@ This document does not introduce new design — every ticket below implements so
 - Hardcoded `hk_stock_list`/`layers` fields always report their honest failure state, never a fabricated "ok".
 - Unit-tested against mocked asyncpg/redis.
 - A live Postgres/Redis integration pass: connectivity, and a stopped *or paused* Postgres/Redis reported as `error` within `HEALTH_CHECK_TIMEOUT_S`, the three checks running concurrently.
-**Docs:** impl.md §3.5, §5.1, §6.1/§6.2, §15.1, §15.2; api.md §3.2.
-**Explicitly deferred:** `hk_stock_list`'s real check (next ticket); `layers.*` (needs real consumer Tasks, Phase 1+); `DatabaseClient`'s write/retry methods; the Redis clients' full method sets; `AppConfig`'s remaining sub-configs; domain models; LLM adapter; Skill base; `WorkerPool`; `NewsClient`/`AdminClient`; Docker/compose; migrations; `.env.example`.
+**Docs:** impl.md §3.5, §4.3, §5.1, §6.1/§6.2, §15.1, §15.2; api.md §3.2.
+**Explicitly deferred:** `hk_stock_list`'s real check (next ticket); `layers.*` (needs real consumer Tasks, Phase 1+); `DatabaseClient`'s write/retry methods and its `config` constructor parameter; the Redis clients' full method sets; `AppConfig`'s remaining sub-configs; domain models; LLM adapter; Skill base; `WorkerPool`; `NewsClient`/`AdminClient`; Docker/compose; migrations; `.env.example`.
 
 ---
 
 ### Startup & Health: Fetch & Cache HK Stock List (S)
 
 **Status:** Created
-**Depends on:** Health Check: `GET /v1/health` (for `SAPIException`/`ServiceUnavailableException`, `app/logger.py`, `app/api/schemas.py`/`routes/health.py`, `app/main.py`)
+**Depends on:** Health Check: `GET /v1/health` (for `SAPIError`/`ServiceUnavailableError`, `app/logger.py`, `app/api/schemas.py`/`routes/health.py`, `app/main.py`)
 **Scope:** Implement SAPI's eager startup HK Stock List load and wire its readiness into the health check (impl.md §4.2, §15.2, §16).
 - `app/config.py`: `HttpConfig` (§4.1) — the one common outbound-call timeout, deliberately decoupled from `LLMConfig`'s own timeout (different SDK, different latency profile).
 - `app/common/http_client.py`: the shared `httpx` client singleton (§4.2).
-- `app/common/error_codes.py`/`exceptions.py`: `ParseException` and the two new catalog entries this ticket raises (§15.1).
+- `app/common/errors.py`: `ParseError`, and the upstream override on `ServiceUnavailableError` (§4.2, §15.1).
 - `app/common/hk_stock_list.py`: `Stock`, `HKStockListCache`, `refresh_hk_stock_list()`, `get_hk_stock_list_cache()` (§4.2) exactly as specified — fetch/filter/cache-rebind, resource-vs-code exception split. `get_hk_stock_list_cache()`'s first real caller is the health route below, not `lookup_stock` (Stock Resolution: `lookup_stock`).
 - `app/main.py`/`app/api/routes/health.py`: wire the startup load and the health check's real `hk_stock_list` field per §16/§15.2 — this one failure must never crash startup, unlike the mandatory DB/Redis connects from the previous ticket.
 **Acceptance criteria** (per impl.md §4.2/§15.2):
@@ -80,7 +81,7 @@ This document does not introduce new design — every ticket below implements so
 **Scope:** Expose `refresh_hk_stock_list()` as `POST /v1/admin/hk-stock-list-sync` (api.md §3.4, impl.md §15.5) — a thin wrapper, no new business logic.
 - `HKStockListSyncResponse` schema (§3.5).
 - The route itself, registered via `APIRouter` + `app.include_router()` from `app/main.py`.
-- Exception handlers for `ServiceUnavailableException`/`ParseException`, registered directly in `app/main.py` rather than the route module — decorating `app` from the route file would create a circular import (`app/main.py` already imports the route's router).
+- Exception handlers for `ServiceUnavailableError`/`ParseError`, registered directly in `app/main.py` rather than the route module — decorating `app` from the route file would create a circular import (`app/main.py` already imports the route's router).
 **Acceptance criteria** (per api.md §3.4):
 - Success returns `entries_loaded` matching `refresh_hk_stock_list()`'s own return value.
 - Both documented failure modes map to their correct HTTP status/`error_code`, and leave the existing cache untouched.
@@ -94,7 +95,7 @@ This document does not introduce new design — every ticket below implements so
 ### Entity Analysis: Consume Cleaned News & Fetch Article (M)
 
 **Status:** Created
-**Depends on:** Startup & Health: Fetch & Cache HK Stock List (for `get_http_client()`/`HttpConfig`, `SAPIException`/`ServiceUnavailableException`, `app/logger.py`)
+**Depends on:** Startup & Health: Fetch & Cache HK Stock List (for `get_http_client()`/`HttpConfig`, `SAPIError`/`ServiceUnavailableError`, `app/logger.py`)
 **Scope:** Consume `stream:raw_news_cleaned` and fetch each article from SADI — no LLM analysis or persistence yet (impl.md §6.1, §9.1; this ticket implements a deliberately narrow subset of §11.2).
 - `app/config.py`: `RedisConfig.reconnect_interval_s` (needed now — §12.1's Reconnect behavior lives at the consumer loop's own call site) and a minimal `EntityAnalysisConfig` — just the fields a bare read-and-fetch loop needs, not the ones backing `WorkerPool`/reclaim/the LLM skill.
 - `app/redis/stream_client.py`: the stream/group constants, `StreamMessage`, `create_group_if_not_exists()`/`read_from()`/`ack()` (§6.1) — not `publish()`/`autoclaim()`, nothing publishes or reclaims yet.
@@ -191,19 +192,19 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** Spike: Entity Analysis LLM Skill (for pinned SDK versions and any §7/§8.2 fixes); Stock Resolution: `lookup_stock`; Entity Analysis: HK Stock List Readiness Gate (for `CleanedNewsConsumer._process_one()`'s current shape)
 **Scope:** Run `EntityAnalysisSkill` on each fetched article and act on its result — no persistence or publishing yet (impl.md §7, §8.1, §8.2, §11.1 steps 1–2 and 4–6, up to building `EntityEvent`s).
 - `app/config.py`: `LLMConfig` minus `rate_limit_backoff_s`; `EntityAnalysisConfig` gains `name_match_min_overlap_ratio`/`max_fc_rounds`/`max_fc_retries_per_entity`.
-- `app/llm/`: `adapter.py` types/interface (including `GenerationConfig`, passed on every call), `exceptions.py`, `VertexAIAdapter` + `create_llm_adapter()`/`get_llm_adapter()` (§7.1–§7.3), built against the spike's pinned SDK versions.
+- `app/llm/`: `adapter.py` types/interface (including `GenerationConfig`, passed on every call), `errors.py`, `VertexAIAdapter` + `create_llm_adapter()`/`get_llm_adapter()` (§7.1–§7.3), built against the spike's pinned SDK versions.
 - `app/models/`: `enums.py` (§3.1), `versioned_metadata.py` (§3.2), `AnalysisOutcome`/`EntityEvent` in `entity_event.py` (§11.1).
 - `app/skills/`: `skill_base.py` (§8.1), `entity_analysis_skill.py` (§8.2) — FC loop calling `lookup_stock()`, `LOOKUP_STOCK_TOOL`, verbatim system prompt, business-constraint validation, dedup backstop.
 - `app/entity_analysis/entity_analysis_service.py`: `EntityAnalysisService` + singleton (§11.1), constructed with `NewsClient` only; `find_entity_events()` runs steps 1–2 and 4–6 and logs `entity_analysis_completed` without `entity_event_ids` (added by the persistence ticket).
-- `CleanedNewsConsumer._process_one()`: after the readiness gate, calls the Service instead of `NewsClient` directly, inside `except LLMRateLimitException`/`except LLMException`/`except Exception` (§11.2) — no ACK on any; only the catch-all logs `entity_analysis_process_one_crashed`.
+- `CleanedNewsConsumer._process_one()`: after the readiness gate, calls the Service instead of `NewsClient` directly, inside `except LLMRateLimitError`/`except LLMError`/`except Exception` (§11.2) — no ACK on any; only the catch-all logs `entity_analysis_process_one_crashed`.
 - Wire `create_llm_adapter()`/`close()` and `create_entity_analysis_service()` into `app/main.py`'s lifespan (§16).
 **Acceptance criteria** (per impl.md §8.1/§8.2/§11.1/§11.4):
 - FC loop: stops at `MAX_FC_ROUNDS` with `max_rounds_reached`; `instruction` and `UnverifiedEntity` only once `MAX_FC_RETRIES_PER_ENTITY` is hit; unverified `stock_code`s dropped; duplicate `stock_code`s keep the first.
 - Every row of §8.2's Business Constraint Validation table applied and logged without setting `failure_reason`.
 - A verified `stock_code` missing from the cache at §11.1 step 6 is dropped with `entity_stock_no_longer_listed`; the other items proceed.
-- `SkillBase.run()`: all four LLM exceptions → `failure_reason=type(err)`; only `LLMAuthenticationException` logs CRITICAL; anything else propagates uncaught.
+- `SkillBase.run()`: all four LLM exceptions → `failure_reason=type(err)`; only `LLMAuthenticationError` logs CRITICAL; anything else propagates uncaught.
 - Every Adapter call from `EntityAnalysisSkill` passes its `_GENERATION_CONFIG` (temperature 0, max output tokens 8192, §8's table), and `VertexAIAdapter` applies it to the request.
-- Consumer: success, `entities=[]`, and 404 ACK; every `LLMException` and any unanticipated exception leave the message un-ACKed and the loop keeps going.
+- Consumer: success, `entities=[]`, and 404 ACK; every `LLMError` and any unanticipated exception leave the message un-ACKed and the loop keeps going.
 - Unit-tested with a fake `LLMAdapter` and a seeded `HKStockListCache`.
 - Integration pass against live Vertex AI with the LLM spike's article set.
 - The integration cases from Entity Analysis: Consume Cleaned News & Fetch Article for `404`, `503`, timeout and unreachable SADI re-run through `EntityAnalysisService`: the same ACK/un-ACK results, with a SADI failure now also logging ERROR `entity_analysis_process_one_crashed`.
@@ -218,7 +219,7 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** Entity Analysis: LLM Entity Extraction (for `EntityAnalysisService`, `EntityEvent`/`AnalysisOutcome`); Entity Analysis: HK Stock List Readiness Gate
 **Scope:** Persist each article's verified `EntityEvent`s and publish them to `stream:entity_event_completed`, and republish instead of re-analysing an article that was already persisted — completing `find_entity_events()` (impl.md §11.1 steps 3 and 7–9; design rationale: design.md §3.4).
 - `app/config.py`: `DatabaseConfig.max_retry`/`retry_base_wait_ms`.
-- `app/db/`: `DatabaseClient.transaction()` (with its `execute_returning()`) and `fetch_all()` (§5.1); `_db_write_with_retry()` (§5.2); `exceptions.py` (§5.3). Not `DatabaseClient.execute()` — nothing here needs it.
+- `app/db/`: `DatabaseClient.transaction()` (with its `execute_returning()`) and `fetch_all()` (§5.1); the `config` constructor parameter `_db_write_with_retry()` reads, passed by `create_db_client()` (§5.1); `_db_write_with_retry()` (§5.2); `errors.py` (§5.3). Not `DatabaseClient.execute()` — nothing here needs it.
 - `alembic/`: Alembic setup and `001_create_entity_events.py` (§17), against SAPI's own `sapi` database on the shared Postgres instance — not SADI's `sadi`, so the two services' `alembic_version` tables never collide. Local setup per impl.md §1 (step 6).
 - `app/persistent/entity_event_repository.py`: `EntityEventRepository` + singleton; `persist_entities()` (one transaction per article) and `fetch_entity_event_ids_by_source_url()` (§10.1). Not `_row_to_entity_event()` — nothing here reads a full row back.
 - `app/redis/stream_client.py`: `publish()` with §6.1's reconnect behaviour; payload `entity_event_id` + `v="1"` (design.md §2.3).
@@ -230,7 +231,7 @@ This document does not introduce new design — every ticket below implements so
 - Each inserted row is published once (`entity_event_id`, `v="1"`); `entities=[]` writes nothing, publishes nothing, still ACKs.
 - An article whose rows already exist skips the Skill entirely (no LLM call), republishes every existing `entity_event_id`, logs `entity_analysis_republished`, and ACKs.
 - The message is ACKed only after every insert and publish has completed (§6.1's `ack()` rule).
-- Transient asyncpg errors retry with backoff up to `max_retry`; exhaustion raises `ServiceUnavailableException`, reaching the consumer's catch-all with no ACK.
+- Transient asyncpg errors retry with backoff up to `max_retry`; exhaustion raises `ServiceUnavailableError`, reaching the consumer's catch-all with no ACK.
 - A Redis `ConnectionError` on publish triggers warn/sleep/retry.
 - Unit-tested against mocked asyncpg/redis.
 - Integration pass against real Postgres and Redis with a faked LLM adapter: migration upgrade/downgrade, one article producing rows and stream messages, and a redelivery of that article producing republished messages and no new rows.
@@ -275,12 +276,12 @@ This document does not introduce new design — every ticket below implements so
 **Scope:** Process articles concurrently, bounded by `ENTITY_ANALYSIS_MAX_CONCURRENT`, and pause the whole layer for `RATE_LIMIT_BACKOFF_S` when Vertex AI rate-limits (impl.md §11.3; design.md §3.3, §12.1 Rate Limit Backoff).
 - `app/config.py`: `EntityAnalysisConfig.max_concurrent`, `LLMConfig.rate_limit_backoff_s`.
 - `app/entity_analysis/worker_pool.py`: `WorkerPool` — `dispatch()` and `trigger_backoff()` (§11.3).
-- `CleanedNewsConsumer`: takes a `WorkerPool` in its constructor (constructed in `app/main.py`, §16 — a layer-owned collaborator, not a singleton); both loops dispatch through it; `_process_one()`'s `except LLMRateLimitException` calls `trigger_backoff()`.
+- `CleanedNewsConsumer`: takes a `WorkerPool` in its constructor (constructed in `app/main.py`, §16 — a layer-owned collaborator, not a singleton); both loops dispatch through it; `_process_one()`'s `except LLMRateLimitError` calls `trigger_backoff()`.
 **Acceptance criteria** (per impl.md §11.2/§11.3):
 - No more than `ENTITY_ANALYSIS_MAX_CONCURRENT` articles are processed at once.
 - After `trigger_backoff()`, no new work starts until `RATE_LIMIT_BACKOFF_S` has elapsed — including a dispatch already waiting on the semaphore when the backoff fires; work already running is not interrupted.
 - Each loop gathers its batch's dispatches and reads again only once all have returned (§11.3).
-- An `LLMRateLimitException` from any one article triggers the layer-wide backoff and leaves that message un-ACKed.
+- An `LLMRateLimitError` from any one article triggers the layer-wide backoff and leaves that message un-ACKed.
 - Unit-tested with fake coroutines and a controllable clock.
 - Integration pass against live Vertex AI at the configured concurrency.
 - The integration cases from Entity Analysis: Reclaim, Dead Letter & Schema-Version Check re-run with both loops dispatching through `WorkerPool`, and the `HTTP 429` case from Entity Analysis: LLM Entity Extraction re-run with the backoff in force: the same results, except that a rate-limited article now delays the next article's start by `RATE_LIMIT_BACKOFF_S`.
@@ -522,7 +523,7 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** Startup & Health: Fetch & Cache HK Stock List (for the shared `httpx` client); Aggregation: Consume & Merge into Active Events (for `RedisStateClient.hset()`/`expire()`)
 **Scope:** Read each source's authority weight and the active-source count from `source:config`, refreshing it from Admin on a cold key, with tier-default fallbacks (impl.md §9.2, §13.5; design.md §1.5).
 - `app/config.py`: `ScoringConfig.source_config_ttl_s`/`admin_api_url`/`total_active_sources_default`.
-- `app/clients/exceptions.py`: `AdminClientException`.
+- `app/clients/errors.py`: `AdminClientError`.
 - `app/clients/admin_client.py`: `AdminClient.fetch_sources()` + `create_admin_client()`/`get_admin_client()` (§9.2).
 - `app/redis/state_client.py`: `hmget()`/`hlen()` (§6.2) — not `exists()`, which nothing needs.
 - `app/scoring/rule_score.py`: `get_source_weights()`, `count_active_sources()`, `_fallback_weights()`, `_SOURCE_TIER`/`_DEFAULT_TIER_WEIGHTS` (§13.5).
@@ -530,7 +531,7 @@ This document does not introduce new design — every ticket below implements so
 **Acceptance criteria** (per impl.md §9.2, §13.5):
 - A warm `source:config` is served with a single `HMGET`, without calling Admin.
 - A cold key — or one that expires between calls — returns nothing from `HMGET`, so Admin is called once, every source is cached with `SOURCE_CONFIG_TTL_S`, and the requested weights are served; it never returns an empty result while Admin is reachable.
-- Admin failing (`AdminClientException`) or returning an empty list falls back to P1/P2/P3 tier weights, caches nothing, and (empty list) logs `source_config_empty_from_admin`; an unrecognised `source_name` weighs 0.0.
+- Admin failing (`AdminClientError`) or returning an empty list falls back to P1/P2/P3 tier weights, caches nothing, and (empty list) logs `source_config_empty_from_admin`; an unrecognised `source_name` weighs 0.0.
 - Any other exception (e.g. a malformed response) propagates rather than being treated as an Admin outage.
 - `count_active_sources()` never calls Admin: `HLEN` when warm, `TOTAL_ACTIVE_SOURCES_DEFAULT` when cold.
 - A state-Redis failure propagates from `get_source_weights()` and `count_active_sources()` — no fallback weights, no Admin call — so the caller doesn't ACK and the message is retried (impl.md §13.6).
@@ -552,7 +553,7 @@ This document does not introduce new design — every ticket below implements so
 **Acceptance criteria** (per impl.md §8.3):
 - Input construction: at most 3 articles per source (latest kept); ordered by `source_weights` descending, then latest `published_at`; entries that would exceed 200 characters dropped whole; `input_summary` records counts and both truncation flags.
 - Business constraints: `summary_short` ≤30, `summary_full` ≤150, `key_numbers` ≤3 — truncated and logged, not failed.
-- `LLMSchemaViolationException` → fallback (highest-weight constituent's `headline`, ties by latest `published_at`; `summary_full = summary_short`; `key_numbers = []`), `skill_log.fallback=True`, `brief_summary_fallback` logged, `failure_reason=None`.
+- `LLMSchemaViolationError` → fallback (highest-weight constituent's `headline`, ties by latest `published_at`; `summary_full = summary_short`; `key_numbers = []`), `skill_log.fallback=True`, `brief_summary_fallback` logged, `failure_reason=None`.
 - Rate-limit/provider/auth failures → `failure_reason=type(err)`, `output=None`.
 - Every call passes `_GENERATION_CONFIG`.
 - Unit-tested with a fake `LLMAdapter`.
@@ -571,7 +572,7 @@ This document does not introduce new design — every ticket below implements so
 - `app/skills/event_scoring_skill.py`: `EventLLMScoringInput`, `EventLLMScoringResult`, `EventLLMScoringSkillLog`, `SCORING_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0, 2048), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
 **Acceptance criteria** (per impl.md §8.4):
 - `stock_impact_score` clipped to `[-5, +5]` and `adjustment_reason` truncated to 80, both logged.
-- An empty `adjustment_reason`, or `LLMSchemaViolationException`, → fallback (`stock_impact_score=0`, `adjustment_reason=""`), `skill_log.fallback=True` with the right `fallback_reason`, `event_scoring_fallback` logged, `failure_reason=None`.
+- An empty `adjustment_reason`, or `LLMSchemaViolationError`, → fallback (`stock_impact_score=0`, `adjustment_reason=""`), `skill_log.fallback=True` with the right `fallback_reason`, `event_scoring_fallback` logged, `failure_reason=None`.
 - `input_from_fallback` is recorded in the skill log, not used in the prompt.
 - Rate-limit/provider/auth failures → `failure_reason=type(err)`, `output=None`.
 - Unit-tested with a fake `LLMAdapter`.
@@ -641,7 +642,7 @@ This document does not introduce new design — every ticket below implements so
 **Scope:** Score Events concurrently, bounded by `SCORING_MAX_CONCURRENT`, and pause the layer for `RATE_LIMIT_BACKOFF_S` on a Vertex AI rate limit (impl.md §11.3 reused, §13.2; design.md §12.1).
 - `app/config.py`: `ScoringConfig.max_concurrent`.
 - `app/main.py`: a second `WorkerPool` instance for Scoring (§16).
-- `ScoringConsumer`: takes the pool; both loops gather their batch's dispatches; `except LLMRateLimitException` calls `trigger_backoff()`.
+- `ScoringConsumer`: takes the pool; both loops gather their batch's dispatches; `except LLMRateLimitError` calls `trigger_backoff()`.
 **Acceptance criteria** (per impl.md §11.3, §13.2):
 - No more than `SCORING_MAX_CONCURRENT` Events are scored at once, independent of Entity Analysis's pool.
 - A rate limit from any Event pauses new Scoring work for `RATE_LIMIT_BACKOFF_S` without pausing Entity Analysis; the message stays un-ACKed.
@@ -724,7 +725,7 @@ This document does not introduce new design — every ticket below implements so
 - `incr_version_counter()` only ever increases, across restarts.
 - `get_current_version()`/`get_current_pointer()` return `None` before the first build.
 - `get_current_pointer()` returns the version and its `last_updated` from one `MGET` — never a version paired with another build's timestamp.
-- A Redis connection or timeout failure on any read raises `ServiceUnavailableException`, not a raw `redis` exception.
+- A Redis connection or timeout failure on any read raises `ServiceUnavailableError`, not a raw `redis` exception.
 - Unit-tested against mocked Redis.
 - Integration pass against real Redis: atomic switch, old version gone, counter persistence.
 **Docs:** impl.md §6.2, §10.4, §15.1; design.md §6.5, §11.4.
@@ -863,8 +864,8 @@ This document does not introduce new design — every ticket below implements so
 **Scope:** Serve the Morning Brief from the current cache version, as built — no re-scoring per request (impl.md §15.3, §15.4, §3.5; api.md §3.3; design.md §6.3, §7).
 - `app/config.py`: `CacheConfig.top_k_default`.
 - `app/api/schemas.py`: `MorningBriefQuery`, `SourceListEntry`, `EventDetail`, `RuleScoreDetail`, `LLMScoreDetail`, `ScoreDetail`, `ScoredEventRecord`, `MorningBriefResponse` (§3.5).
-- `app/common/error_codes.py`/`exceptions.py`: `MorningBriefCacheUnavailableException` (`SAPI-5001`) and the `MALFORMED_REQUEST`/`VALIDATION_FAILED`/`INTERNAL_ERROR` catalog entries (§15.1, §15.4).
-- `app/main.py`: exception handlers for `RequestValidationError` (400, `COMMON-4000`/`4001`), `MorningBriefCacheUnavailableException` (503) and the general `Exception` catch-all (500 `COMMON-5000`) (§15.1).
+- `app/common/errors.py`: `MorningBriefCacheUnavailableError` (`SAPI-5001`), and the `COMMON-4000`/`COMMON-4001`/`COMMON-5000` codes the exception handlers return (§15.1, §15.4).
+- `app/main.py`: exception handlers for `RequestValidationError` (400, `COMMON-4000`/`4001`), `MorningBriefCacheUnavailableError` (503) and the general `Exception` catch-all (500 `COMMON-5000`) (§15.1).
 - `app/api/routes/morning_brief.py`: `get_morning_brief()` (§15.3), reading records through `CacheReader.get_records()`.
 **Acceptance criteria** (per impl.md §15.3, api.md §3.3):
 - The same cache version always returns the same Events in the same order and with the same scores — the route reads, it never recomputes recency.
