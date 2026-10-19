@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "SIM", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Test files are named after the module they test (tests/api/routes/health.py) and tests after
+# the function they test (get_health_<case>), so collect every public function; helpers in test
+# files start with "_", and code under test is imported as a module, never as a bare function.
+python_files = ["*.py"]
+python_functions = ["[!_]*"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

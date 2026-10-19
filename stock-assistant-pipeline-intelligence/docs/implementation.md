@@ -42,6 +42,14 @@
 - `uv` package manager (`pip install uv`)
 - A Google Cloud project with the Vertex AI API enabled, and either a service account key or `gcloud auth application-default login` for local dev
 
+### Tooling
+
+Configured in `pyproject.toml`; test-only dependencies are pinned in `requirements-test.txt`.
+
+- `pytest` + `pytest-asyncio` — unit tests (`asyncio_mode = "auto"`)
+- `ruff` — linting and formatting
+- `mypy` — static type checking, `strict` for `app/`
+
 ### Steps
 
 ```bash
@@ -129,15 +137,15 @@ sapi/
 │   ├── llm/
 │   │   ├── adapter.py                   # LLMAdapter ABC; standard data structures
 │   │   ├── vertex_adapter.py            # Vertex AI implementation: generate_raw (google-genai SDK), generate_structured (Instructor)
-│   │   └── exceptions.py                # LLMException base + LLMRateLimitException / LLMProviderException / LLMAuthenticationException / LLMSchemaViolationException
+│   │   └── errors.py                    # LLMError base + LLMRateLimitError / LLMProviderError / LLMAuthenticationError / LLMSchemaViolationError
 │   ├── clients/
-│   │   ├── exceptions.py                # NewsClientException, AdminClientException — both SAPIException subclasses (§9)
+│   │   ├── errors.py                    # NewsClientError, AdminClientError — both SAPIError subclasses (§9)
 │   │   ├── news_client.py              # httpx client: fetch cleaned article content from SADI (Entity Analysis Layer input)
 │   │   └── admin_client.py              # httpx client: fetch source authority config from Admin (§1.5)
 │   ├── db/
 │   │   ├── connection.py                # asyncpg connection pool + DatabaseClient
 │   │   ├── utils.py                     # _db_write_with_retry() unified write utility (system-design.md §12.1)
-│   │   └── exceptions.py                # UniqueConstraintException / DatabaseException (driver-agnostic)
+│   │   └── errors.py                    # UniqueConstraintError / DatabaseError (driver-agnostic)
 │   ├── redis/
 │   │   ├── stream_client.py             # RedisStreamClient — messaging + reconnect logic; stream name constants
 │   │   └── state_client.py              # RedisStateClient — thin generic Redis primitives (get/set/hash/scan/multi_exec); no business logic
@@ -154,14 +162,14 @@ sapi/
 │   │   ├── event_score.py               # EventScore dataclass + RuleScore (compute_rule_score()'s own return type, reused directly) + LLMScore (Skill's own output type, reused directly)
 │   │   └── event_entity_map.py          # EventEntityMap dataclass
 │   ├── common/
-│   │   ├── error_codes.py               # ErrorCode base + CommonErrorCode / SAPIErrorCode catalogs
-│   │   ├── exceptions.py                # SAPIException base + NotFoundException / ServiceUnavailableException / ...
+│   │   ├── error_codes.py               # Every error code string, as commented constants (§15.1)
+│   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ...
 │   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2)
 │   │   ├── stock.py                     # Stock dataclass — cross-module shape shared by lookup_stock.py, hk_stock_list.py's HKStockListCache, and EntityAnalysisSkill (§4.2)
 │   │   ├── lookup_stock.py              # lookup_stock tool: exact code + fuzzy name matching, both against the in-process HKStockListCache (§4.2)
 │   │   ├── hk_stock_list.py          # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; startup load + sync handler, no Redis (§4.2.1)
 │   │   └── supervised.py                # run_supervised() — leak-free concurrent-coroutine supervision, used by every layer's start() (§6.1)
-│   ├── logger.py                        # Unified system logger; structlog; stdout JSON output
+│   ├── logger.py                        # Unified system logger; structlog; stdout JSON output (§4.3)
 │   ├── config.py                        # App config: env var loading
 │   └── main.py                          # Service entry point (lifespan): eager HK Stock List load; 4 layer Tasks + done_callback monitoring
 ├── alembic/
@@ -435,6 +443,7 @@ Loads all environment variables into a single `AppConfig` object. All other modu
 class DatabaseConfig:
     url: str                # env: DATABASE_URL
     pool_size: int           # env: DB_POOL_SIZE (default 10)
+    close_timeout_s: int     # env: DB_CLOSE_TIMEOUT_S (default 10) — bound on close() (§5.1)
     max_retry: int           # env: DB_WRITE_MAX_RETRY
     retry_base_wait_ms: int  # env: DB_RETRY_BASE_WAIT_MS
 ```
@@ -588,7 +597,7 @@ class AppConfig:
 ```
 Purpose : Read environment variables; construct and return a validated AppConfig.
 Called  : Once at service startup in app/main.py lifespan.
-Raises  : ValueError if a required env var is missing.
+Raises  : SAPIError (app.common.errors, §15.1) if a required env var is missing.
 ```
 
 Implementation notes:
@@ -596,7 +605,7 @@ Implementation notes:
 - Build each sub-config from its respective env var group (tables above), then compose into `AppConfig`
 - `consumer_name` on all four sub-configs: `os.environ.get("HOSTNAME", "<layer fallback>")` (see the note above)
 - `ScoringConfig.event_type_score` is the other field built from more than a single env var — 8 separate reads (`EVENT_TYPE_WEIGHT_EARNINGS`/`_MA`/`_REGULATORY`/`_BUYBACK`/`_MANAGEMENT_CHANGE`/`_DIVIDEND`/`_ANALYST_RATING`/`_GENERAL`, defaults 9.0/8.5/8.0/7.0/7.0/6.0/5.0/4.0), each becoming one `EventTypeScore(event_type=..., score=...)` entry in the list, in `EventTypeEnum` order (§3.1)
-- Store the loaded `AppConfig` as a module-level singleton so routes can import it
+- Store the loaded `AppConfig` as a module-level singleton so routes can import it; `get_config()` raises `ServiceUnavailableError` if called before `load_config()`, like every `get_X()` (§5.1)
 
 ```python
 # Usage in other modules:
@@ -644,7 +653,7 @@ _http_client: Optional[httpx.AsyncClient] = None
 
 def get_http_client() -> httpx.AsyncClient:
     if _http_client is None:
-        raise ServiceUnavailableException("get_http_client() called before create_http_client() initialized it")
+        raise ServiceUnavailableError("http client is not initialized")
     return _http_client
 
 def create_http_client(timeout_s: int) -> httpx.AsyncClient:
@@ -674,7 +683,7 @@ _hk_stock_list_cache: Optional[HKStockListCache] = None
 
 def get_hk_stock_list_cache() -> HKStockListCache:
     if _hk_stock_list_cache is None:
-        raise ServiceUnavailableException("get_hk_stock_list_cache() called before refresh_hk_stock_list() initialized it")
+        raise ServiceUnavailableError("get_hk_stock_list_cache() called before refresh_hk_stock_list() initialized it")
     return _hk_stock_list_cache
 ```
 
@@ -753,19 +762,18 @@ def lookup_stock(name_or_code, min_overlap_ratio) -> Optional[Stock]:
 
 `name_or_code` in the log line identifies which entity triggered a slow call. `logger` is the shared structlog logger (`app/logger.py`).
 
-#### Exception: `ParseException`
+#### Exception: `ParseError`
 
 ```python
-class ParseException(SAPIException):
+class ParseError(SAPIError):
     """Fetch succeeded but the response couldn't be parsed: a code/schema issue, not availability.
-    Takes error_code as a constructor argument (like ServiceUnavailableException, §15.1) so any
-    parsing domain can reuse it."""
-    def __init__(self, detail: str, error_code: ErrorCode):
-        super().__init__(detail)
-        self.error_code = error_code
+    Another parsing domain reuses it by passing its own error_code (§15.1)."""
+    error_type = ErrorType.PARSE
+    error_code = error_codes.HK_STOCK_LIST_PARSE_ERROR
+    message = "Upstream response could not be parsed"
 ```
 
-Lives in `app/common/hk_stock_list.py` next to its one raise site; `ServiceUnavailableException`/`NotFoundException` stay in `app/common/exceptions.py` because many modules raise them.
+Lives in `app/common/hk_stock_list.py` next to its one raise site; `ServiceUnavailableError`/`NotFoundError` stay in `app/common/errors.py` because many modules raise them.
 
 #### Function: `_fetch_and_filter_hk_stock_list(http_client: httpx.AsyncClient) -> dict[str, Stock]`
 
@@ -776,9 +784,9 @@ Purpose : Fetch HKEXnews's bilingual JSON endpoints (system-design.md §9.2.1), 
 Sources : https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json
           https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_c.json
 Raises  : Every failure is translated into one of two exceptions:
-            - ServiceUnavailableException (COMMON-5002, HTTP 503): any httpx.HTTPError
+            - ServiceUnavailableError (COMMON-5002, HTTP 503): any httpx.HTTPError
               (HKEXnews unreachable, slow, or non-2xx).
-            - ParseException (SAPI-5002, HTTP 500): any exception while parsing a successful
+            - ParseError (SAPI-5002, HTTP 500): any exception while parsing a successful
               response (schema change, mismatched bilingual files, changed "List of
               Securities" format). Deliberately `except Exception`.
 ```
@@ -797,7 +805,10 @@ async def _fetch_and_filter_hk_stock_list(http_client: httpx.AsyncClient) -> dic
     except httpx.HTTPError as exc:
         # Resource issue: HKEXnews unreachable/erroring. COMMON-5002 (upstream unreachable), not the
         # COMMON-5001 default (§15.1).
-        raise ServiceUnavailableException("HKEXnews unreachable", error_code=CommonErrorCode.UPSTREAM_UNAVAILABLE) from exc
+        raise ServiceUnavailableError(
+            "HKEXnews unreachable", error_type=ErrorType.NETWORK, error_code=error_codes.UPSTREAM_UNAVAILABLE,
+            message="Upstream unavailable",
+        ) from exc
 
     try:
         en_entries, zh_entries = en_resp.json(), zh_resp.json()
@@ -807,10 +818,7 @@ async def _fetch_and_filter_hk_stock_list(http_client: httpx.AsyncClient) -> dic
     except Exception as exc:
         # Code issue: fetch succeeded but the response shape was wrong. Deliberately `except Exception`:
         # nothing escapes untranslated.
-        raise ParseException(
-            f"HK Stock List response shape mismatch: {exc}",
-            error_code=SAPIErrorCode.HK_STOCK_LIST_PARSE_ERROR,
-        ) from exc
+        raise ParseError(f"HK Stock List response shape mismatch: {exc}") from exc
 
     return result
 ```
@@ -856,6 +864,29 @@ async def refresh_hk_stock_list() -> int:
 
 Zero-argument (§5.1's pattern): it reaches `get_http_client()` itself, so `main.py`'s lifespan and the route handler call it identically.
 
+### 4.3 Logging — `app/logger.py`
+
+Every module logs through structlog: one JSON object per line on stdout, filtered at `INFO`.
+
+#### Function: `configure_logging() -> None`
+
+```
+Purpose : Configure structlog once, at import of app/main.py. Each record carries
+          `event`, `level`, an ISO-8601 UTC `timestamp`, and — when logged with
+          exc_info — a structured `exception` traceback.
+```
+
+#### Function: `get_logger(name: str) -> structlog.typing.FilteringBoundLogger`
+
+```
+Purpose : Return a logger bound with `module=<name>`; callers pass their own __name__
+          and keep it at module level (`logger = get_logger(__name__)`). The key is
+          `module`, not `logger`: structlog's get_logger() reserves `logger` for its
+          own argument.
+```
+
+Call sites log an event name plus keyword fields, e.g. `logger.warning("health_check_failed", component="database", exc_info=True)`.
+
 ---
 
 ## 5. Database Layer — `app/db/`
@@ -868,7 +899,7 @@ Exposes a `DatabaseClient` class encapsulating the `asyncpg` pool and retry logi
 
 **Module-level singleton.** This is the shape of every process-wide resource in SAPI (`DatabaseClient`, `RedisStreamClient`/`RedisStateClient` §6, `LLMAdapter` §7.3, `HKStockListCache` §4.2, `EventAggregationStore` §12.5, `CacheStore` §10.4, `NewsClient`/`AdminClient` §9, the repositories §10) and of each layer's `Service` (§11.1/§12.1/§13.1/§14.1): `create_X()` constructs and registers it once, and consumers call `get_X()` directly, like `get_config()`. `main.py` (§16) decides construction order where data dependencies exist. Skills and `WorkerPool` instances are layer-owned: constructed in `main.py` and passed to their layer's `Consumer` (§16).
 
-Every `get_X()` raises `ServiceUnavailableException` (`app/common/exceptions.py`) if called before its `create_X()` counterpart has run — reusing the same exception type a genuinely unreachable DB/Redis raises (§5.2, §15.1), since both mean "this resource is not currently usable" and a caller has no way to (or need to) tell the two apart.
+Every `get_X()` raises `ServiceUnavailableError` (`app/common/errors.py`) if called before its `create_X()` counterpart has run — reusing the same exception type a genuinely unreachable DB/Redis raises (§5.2, §15.1), since both mean "this resource is not currently usable" and a caller has no way to (or need to) tell the two apart.
 
 #### Class: `DatabaseClient`
 
@@ -883,7 +914,7 @@ class DatabaseClient:
 
 ```
 Purpose : Return the process's one DatabaseClient instance.
-Raises  : ServiceUnavailableException if called before create_db_client() has
+Raises  : ServiceUnavailableError if called before create_db_client() has
           run — should only happen if something ran ahead of app/main.py's
           lifespan startup, or a test forgot to initialize/override it.
 ```
@@ -893,7 +924,7 @@ _db_client: Optional[DatabaseClient] = None
 
 def get_db_client() -> DatabaseClient:
     if _db_client is None:
-        raise ServiceUnavailableException("get_db_client() called before create_db_client() initialized it")
+        raise ServiceUnavailableError("database client is not initialized")
     return _db_client
 ```
 
@@ -909,15 +940,15 @@ Purpose : Execute a write query (INSERT / UPDATE / UPSERT) with transient-failur
           this for all single-statement writes.
 Params  : query — SQL string with positional placeholders ($1, $2, ...)
           *args — query parameter values in positional order
-Raises  : UniqueConstraintException (app.db.exceptions) on a unique-constraint
-          violation, DatabaseException (app.db.exceptions) on other data-integrity
-          failures, or ServiceUnavailableException (app.common.exceptions) on
+Raises  : UniqueConstraintError (app.db.errors) on a unique-constraint
+          violation, DatabaseError (app.db.errors) on other data-integrity
+          failures, or ServiceUnavailableError (app.common.errors) on
           a connection failure / after all retries exhausted.
 ```
 
-Retry classification and exception translation are identical to SADI's `DatabaseClient.execute()` (backoff `wait_ms = config.retry_base_wait_ms × 2^(attempt-1)`, max 3 attempts; `UniqueViolationError → UniqueConstraintException` with no retry; connection failures → `ServiceUnavailableException`); see SADI's doc §5.1. Only this module imports `asyncpg`.
+Retry classification and exception translation are identical to SADI's `DatabaseClient.execute()` (backoff `wait_ms = config.retry_base_wait_ms × 2^(attempt-1)`, max 3 attempts; `UniqueViolationError → UniqueConstraintError` with no retry; connection failures → `ServiceUnavailableError`); see SADI's doc §5.1. Only this module imports `asyncpg`.
 
-> **Unique-constraint violations are expected** (system-design.md §12.1): a duplicate `(source_url, stock_code)` in `entity_events` or `(event_id, entity_event_id)` in `event_entity_map` is an idempotent no-op. These writes use `INSERT ... ON CONFLICT ... DO NOTHING`, so they never raise `UniqueConstraintException`.
+> **Unique-constraint violations are expected** (system-design.md §12.1): a duplicate `(source_url, stock_code)` in `entity_events` or `(event_id, entity_event_id)` in `event_entity_map` is an idempotent no-op. These writes use `INSERT ... ON CONFLICT ... DO NOTHING`, so they never raise `UniqueConstraintError`.
 
 ---
 
@@ -942,7 +973,7 @@ Raises  : Same as execute() above.
 ```
 Purpose : Execute a SELECT query and return the first matching row, or None if not found.
           No retry logic — reads are safe to re-issue by the caller if needed.
-Raises  : DatabaseException or ServiceUnavailableException (same translation as
+Raises  : DatabaseError or ServiceUnavailableError (same translation as
           execute(), minus the retry loop).
 ```
 
@@ -1006,11 +1037,14 @@ async def create_db_client(config: DatabaseConfig) -> DatabaseClient:
     return _db_client
 ```
 
-#### Method: `close() -> None`
+#### Method: `close(timeout_s: float) -> None`
 
 ```
-Purpose : Gracefully close the underlying connection pool.
-Called  : In the FastAPI lifespan shutdown handler, via get_db_client().close().
+Purpose : Gracefully close the underlying connection pool, bounded by timeout_s
+          (config.db.close_timeout_s): asyncio.wait_for(pool.close(), timeout_s). On timeout
+          asyncpg terminates the pool itself; close() logs WARNING db_pool_close_timed_out
+          and returns (system-design.md §7.1).
+Called  : In the FastAPI lifespan shutdown, registered on its exit stack (§16).
 ```
 
 ### 5.2 `app/db/utils.py` — `_db_write_with_retry()`
@@ -1029,39 +1063,48 @@ Params  : conn_or_pool — asyncpg.Pool or asyncpg.Connection
           query, args  — the statement to execute
           returning    — if True, return the first row (or None on a
                          no-op ON CONFLICT DO NOTHING); if False, return None
-Raises  : UniqueConstraintException / DatabaseException / ServiceUnavailableException
-          (app.db.exceptions) — same classification as SADI's DatabaseClient.execute()
+Raises  : UniqueConstraintError / DatabaseError / ServiceUnavailableError
+          (app.db.errors) — same classification as SADI's DatabaseClient.execute()
 ```
 
-Retry/backoff formula and asyncpg exception classification: identical to SADI's `DatabaseClient.execute()` — see `stock-assistant-data-ingestion/docs/implementation.md` §5.1 for the full table (`TooManyConnectionsError`/`ConnectionDoesNotExistError` retried; `UniqueViolationError`/`DataError`/`NotNullViolationError` not retried; `PostgresConnectionError`/`InterfaceError` → `ServiceUnavailableException`; any other `PostgresError` → `DatabaseException` as a safety net).
+Retry/backoff formula and asyncpg exception classification: identical to SADI's `DatabaseClient.execute()` — see `stock-assistant-data-ingestion/docs/implementation.md` §5.1 for the full table (`TooManyConnectionsError`/`ConnectionDoesNotExistError` retried; `UniqueViolationError`/`DataError`/`NotNullViolationError` not retried; `PostgresConnectionError`/`InterfaceError` → `ServiceUnavailableError`; any other `PostgresError` → `DatabaseError` as a safety net).
 
-### 5.3 `app/db/exceptions.py`
+### 5.3 `app/db/errors.py`
 
 ```python
-from app.common.exceptions import SAPIException   # §15.1
+from app.common.errors import SAPIError   # §15.1
 
-class UniqueConstraintException(SAPIException):
+class UniqueConstraintError(SAPIError):
     """Raised on a unique-constraint violation not already absorbed by ON CONFLICT DO NOTHING."""
+    error_type = ErrorType.STORAGE
+    error_code = error_codes.INTERNAL_ERROR
+
     def __init__(self, constraint_name: str):
+        super().__init__(f"unique constraint violated: {constraint_name}")
         self.constraint_name = constraint_name
 
-class DatabaseException(SAPIException):
+class DatabaseError(SAPIError):
     """Raised on any other data-integrity failure."""
+    error_type = ErrorType.STORAGE
+    error_code = error_codes.INTERNAL_ERROR
 ```
 
-Both subclass `SAPIException` (§15.1) so a catch-all `except Exception` can't swallow them as unanticipated bugs.
+Both subclass `SAPIError` (§15.1) so a catch-all `except Exception` can't swallow them as unanticipated bugs.
 
-`ServiceUnavailableException` lives in `app/common/exceptions.py` (§15.1) because it is also raised outside the DB layer; every infra `get_X()` reuses it (§5.1).
+`ServiceUnavailableError` lives in `app/common/errors.py` (§15.1) because it is also raised outside the DB layer; every infra `get_X()` reuses it (§5.1).
 
 ### 5.4 Dependency injection in routes
 
 No `app/api/dependencies.py` wrapper needed for this — `get_db_client()` (above) takes no arguments, so it's directly usable as a FastAPI route dependency:
 
+Routes declare every dependency as `Annotated[T, Depends(...)]`, never as a `= Depends(...)` default.
+
 ```python
+from typing import Annotated
 from fastapi import Depends
 from app.db.connection import get_db_client, DatabaseClient
 
-async def get_cleaned_news(cleaned_id: UUID, db: DatabaseClient = Depends(get_db_client)):
+async def get_cleaned_news(cleaned_id: UUID, db: Annotated[DatabaseClient, Depends(get_db_client)]):
     row = await db.fetch_one("SELECT ... WHERE cleaned_id = $1", cleaned_id)
 ```
 
@@ -1135,7 +1178,7 @@ class ReclaimedMessage(StreamMessage):
 
 #### Function: `get_redis_stream_client() -> RedisStreamClient`
 
-Same shape as `get_db_client()` (§5.1): raises `ServiceUnavailableException` if called before `create_stream_client()` has run.
+Same shape as `get_db_client()` (§5.1): raises `ServiceUnavailableError` if called before `create_stream_client()` has run.
 
 #### Function: `create_stream_client(redis_url: str) -> RedisStreamClient`
 
@@ -1402,7 +1445,7 @@ class LLMAdapter(ABC):
         Single LLM call returning the raw response, used for EntityAnalysisSkill's Function
         Calling loop (§8.2). `tools` is required. The returned LLMResponse carries
         input_tokens/output_tokens/latency_ms, measured here (§7.3).
-        Raises: LLMRateLimitException, LLMProviderException, LLMAuthenticationException.
+        Raises: LLMRateLimitError, LLMProviderError, LLMAuthenticationError.
         """
         ...
 
@@ -1412,8 +1455,8 @@ class LLMAdapter(ABC):
         """
         Single LLM call with Instructor-enforced schema validation, used by all three Skills.
         Returns the validated output plus the per-call metrics and instructor_retries.
-        Raises: LLMRateLimitException, LLMProviderException, LLMAuthenticationException,
-        LLMSchemaViolationException.
+        Raises: LLMRateLimitError, LLMProviderError, LLMAuthenticationError,
+        LLMSchemaViolationError.
         """
         ...
 
@@ -1423,27 +1466,27 @@ class LLMAdapter(ABC):
         ...
 ```
 
-### 7.2 `app/llm/exceptions.py`
+### 7.2 `app/llm/errors.py`
 
 Plain signaling exceptions with no attached data. `VertexAIAdapter` (§7.3) raises them, and every Skill's `run()` (§8.1) catches all four internally.
 
 ```python
-from app.common.exceptions import SAPIException   # §15.1
+from app.common.errors import SAPIError   # §15.1
 
-class LLMException(SAPIException):
+class LLMError(SAPIError):
     """Common base for the four typed exceptions below."""
 
-class LLMRateLimitException(LLMException):
+class LLMRateLimitError(LLMError):
     """Provider rate limit hit. Retryable — triggers Worker Pool backoff (system-design.md §12.1)."""
 
-class LLMProviderException(LLMException):
+class LLMProviderError(LLMError):
     """Provider-side error: 5xx, network timeout, or LLM_API_TIMEOUT_S exceeded. Retryable."""
 
-class LLMAuthenticationException(LLMException):
+class LLMAuthenticationError(LLMError):
     """Provider rejected the call as unauthenticated/unauthorized (401/403). Retryable at the
     message level but not self-healing; SkillBase.run() (§8.1) logs CRITICAL."""
 
-class LLMSchemaViolationException(LLMException):
+class LLMSchemaViolationError(LLMError):
     """Instructor's internal retries (INSTRUCTOR_MAX_RETRIES) exhausted; output still
     does not conform to the Pydantic schema's business-logic validators. Not retryable
     at this layer — the calling Skill applies its own fallback policy (§5.9, §8.4–8.5)."""
@@ -1470,7 +1513,7 @@ _llm_adapter: Optional[LLMAdapter] = None
 
 def get_llm_adapter() -> LLMAdapter:
     if _llm_adapter is None:
-        raise ServiceUnavailableException("get_llm_adapter() called before create_llm_adapter() initialized it")
+        raise ServiceUnavailableError("LLM adapter is not initialized")
     return _llm_adapter
 
 def create_llm_adapter(config: LLMConfig) -> LLMAdapter:
@@ -1492,9 +1535,9 @@ Purpose : Translate messages/tools to google-genai Content/FunctionDeclaration s
           Skill's LlmCallMetric (§8.1).
 Timeout : config.api_timeout_s (LLM_API_TIMEOUT_S) wraps the call —
           asyncio.wait_for or the SDK's own request timeout param.
-Raises  : LLMRateLimitException on a 429 from the provider.
-          LLMAuthenticationException on a 401/403 from the provider.
-          LLMProviderException on any other 5xx, network error, or timeout —
+Raises  : LLMRateLimitError on a 429 from the provider.
+          LLMAuthenticationError on a 401/403 from the provider.
+          LLMProviderError on any other 5xx, network error, or timeout —
           i.e. the catch-all for anything not otherwise classified above,
           so nothing from this call ever escapes as an unclassified exception.
 ```
@@ -1510,13 +1553,13 @@ Purpose : One generate_content call through the Instructor-wrapped client, with
           addition to Gemini's schema-level enforcement (system-design.md §8.5).
 Timeout : Same config.api_timeout_s wraps each individual call, including
           Instructor-triggered retries.
-Raises  : LLMRateLimitException, LLMAuthenticationException, LLMProviderException — same
+Raises  : LLMRateLimitError, LLMAuthenticationError, LLMProviderError — same
           mapping as generate_raw.
-          LLMSchemaViolationException once Instructor's internal retries are
+          LLMSchemaViolationError once Instructor's internal retries are
           exhausted and the output still fails Pydantic validation.
 ```
 
-Each call contributes one `llm_calls[]` entry (system-design.md §9.8) to the Skill's log. The Adapter returns the measurements; the Skill adds `call_index`/`purpose` (§8.2–§8.4). `LLMAuthenticationException`'s CRITICAL alert lives in the Skill (§8.1).
+Each call contributes one `llm_calls[]` entry (system-design.md §9.8) to the Skill's log. The Adapter returns the measurements; the Skill adds `call_index`/`purpose` (§8.2–§8.4). `LLMAuthenticationError`'s CRITICAL alert lives in the Skill (§8.1).
 
 #### Method: `close() -> None`
 
@@ -1546,11 +1589,11 @@ Everything shared across Skills lives in this one file: `SkillInput`, `SkillResu
 
 `LlmCallMetric`/`LlmErrorEntry` are the element types of `SkillBase._llm_calls`/`_llm_errors`, shared by all three completion logs (§8.2–§8.4, system-design.md §9.8).
 
-Each Skill instance is constructed fresh per `run()` call (§11.1, §13.1), so `input` is stored on `self._input`. `SkillBase.run()` is a template method: `try: return await llm_process()`, `except` the four typed exceptions (§7.2): log (CRITICAL for `LLMAuthenticationException`, ERROR otherwise), append an `LlmErrorEntry`, then `build_fail_result(err)`. `llm_process()` returns the final `SkillResult` directly on success. A subclass `__init__` must call `super().__init__(input)`.
+Each Skill instance is constructed fresh per `run()` call (§11.1, §13.1), so `input` is stored on `self._input`. `SkillBase.run()` is a template method: `try: return await llm_process()`, `except` the four typed exceptions (§7.2): log (CRITICAL for `LLMAuthenticationError`, ERROR otherwise), append an `LlmErrorEntry`, then `build_fail_result(err)`. `llm_process()` returns the final `SkillResult` directly on success. A subclass `__init__` must call `super().__init__(input)`.
 
-`failure_reason` is `type(err)`. Callers (`EntityAnalysisService` §11.1, `ScoringService` §13.1) only distinguish `LLMRateLimitException` (triggers `WorkerPool.trigger_backoff()`) from everything else (no ACK).
+`failure_reason` is `type(err)`. Callers (`EntityAnalysisService` §11.1, `ScoringService` §13.1) only distinguish `LLMRateLimitError` (triggers `WorkerPool.trigger_backoff()`) from everything else (no ACK).
 
-> **`LLMAuthenticationException` is its own type** because it isn't self-healing: every call fails until an operator fixes the credentials, so the shared `except` block pages immediately on it. Deduping the CRITICAL log across a sustained outage is deferred.
+> **`LLMAuthenticationError` is its own type** because it isn't self-healing: every call fails until an operator fixes the credentials, so the shared `except` block pages immediately on it. Deduping the CRITICAL log across a sustained outage is deferred.
 
 ```python
 @dataclass
@@ -1572,7 +1615,7 @@ class LlmCallMetric:
 @dataclass
 class LlmErrorEntry:
     call_index: int
-    error_type: str           # "LLMRateLimitException" | "LLMProviderException" | "LLMAuthenticationException" | "LLMSchemaViolationException" | "BusinessValidationException"
+    error_type: str           # "LLMRateLimitError" | "LLMProviderError" | "LLMAuthenticationError" | "LLMSchemaViolationError" | "BusinessValidationError"
     error_detail: str
     retried: bool
 
@@ -1586,8 +1629,8 @@ class SkillBase(ABC):
     async def run(self) -> SkillResult:
         try:
             return await self.llm_process()
-        except LLMException as err:
-            if isinstance(err, LLMAuthenticationException):
+        except LLMError as err:
+            if isinstance(err, LLMAuthenticationError):
                 logger.critical("llm_authentication_failed", skill=type(self).__name__,
                                  error_detail=str(err))
             else:
@@ -1897,7 +1940,7 @@ seen_stock_codes = set()
 deduped = []
 for e in output.output_items:
     if e.stock_code in seen_stock_codes:
-        log BusinessValidationException (duplicate stock_code, dropped)  # does not set failure_reason — same
+        log BusinessValidationError (duplicate stock_code, dropped)  # does not set failure_reason — same
         continue                                                          # non-fatal treatment as every other
     seen_stock_codes.add(e.stock_code)                                   # row in the table below
     deduped.append(e)
@@ -1961,12 +2004,12 @@ def build_fail_result(self, err: Exception) -> EntityAnalysisResult:
 
 | Field | Constraint | On violation |
 |---|---|---|
-| `sentiment_score` | [0.0, 1.0] | Clip to boundary; log `BusinessValidationException` |
-| `headline` | ≤20 chars | Truncate; log `BusinessValidationException` |
-| `entity_summary` | ≤100 chars | Truncate; log `BusinessValidationException` |
-| `event_type_secondary` | must differ from `event_type_primary` | Set to `null`; log `BusinessValidationException` |
+| `sentiment_score` | [0.0, 1.0] | Clip to boundary; log `BusinessValidationError` |
+| `headline` | ≤20 chars | Truncate; log `BusinessValidationError` |
+| `entity_summary` | ≤100 chars | Truncate; log `BusinessValidationError` |
+| `event_type_secondary` | must differ from `event_type_primary` | Set to `null`; log `BusinessValidationError` |
 | `entities[].stock_code` | must be in `verified_stocks` | Filtered out by the loop's design — not a truncation case |
-| `entities[].stock_code` | no duplicates within one article | Keep the first occurrence, drop the rest; log `BusinessValidationException` |
+| `entities[].stock_code` | no duplicates within one article | Keep the first occurrence, drop the rest; log `BusinessValidationError` |
 
 Error handling (which exceptions get caught where, and what `EntityAnalysisService` does with each `failure_reason`) is covered once, in §8.5's cross-Skill table and §11.2's flowchart callouts — not repeated here.
 
@@ -2027,8 +2070,8 @@ class BriefSummaryResult(SkillResult):   # base: app/skills/skill_base.py, §8.1
 
     output: Optional[BriefSummary]   # None only when failure_reason is set
     skill_log: BriefSummarySkillLog   # always populated, every outcome (below)
-    failure_reason: Optional[type[Exception]] = None   # LLMRateLimitException, LLMProviderException,
-                                                         # or LLMAuthenticationException; None on
+    failure_reason: Optional[type[Exception]] = None   # LLMRateLimitError, LLMProviderError,
+                                                         # or LLMAuthenticationError; None on
                                                          # success or fallback (§8.1)
 ```
 
@@ -2046,7 +2089,7 @@ class BriefSummarySkill(SkillBase):   # base: app/skills/skill_base.py, §8.1
 
 #### `llm_process()`
 
-Only `LLMSchemaViolationException` is caught here, to run this Skill's own fallback (below) instead of failing — `LLMRateLimitException`/`LLMProviderException`/`LLMAuthenticationException` are left to propagate; `SkillBase.run()` (§8.1) catches those and builds the same classification/logging every Skill gets.
+Only `LLMSchemaViolationError` is caught here, to run this Skill's own fallback (below) instead of failing — `LLMRateLimitError`/`LLMProviderError`/`LLMAuthenticationError` are left to propagate; `SkillBase.run()` (§8.1) catches those and builds the same classification/logging every Skill gets.
 
 ```
 try:
@@ -2055,8 +2098,8 @@ try:
     output = structured.output
     apply Business Constraint Validation (table below) to output
     fallback, fallback_reason = False, None
-except LLMSchemaViolationException as err:
-    append LlmErrorEntry(call_index=len(self._llm_calls) + 1, error_type="LLMSchemaViolationException",
+except LLMSchemaViolationError as err:
+    append LlmErrorEntry(call_index=len(self._llm_calls) + 1, error_type="LLMSchemaViolationError",
                           error_detail=str(err), retried=False) to self._llm_errors
     output = fallback_output()                            # Fallback, below — reads self._input
     fallback, fallback_reason = True, "schema_violation"
@@ -2132,9 +2175,9 @@ Instructor's validation enforces only `BriefSummary`'s field types; the length/c
 
 | Field | Constraint | On violation |
 |---|---|---|
-| `summary_short` | ≤30 chars | Truncate to 30 chars; log `BusinessValidationException` |
-| `summary_full` | ≤150 chars | Truncate to 150 chars; log `BusinessValidationException` |
-| `key_numbers` | Max 3 items | Retain first 3; discard remainder; log `BusinessValidationException` |
+| `summary_short` | ≤30 chars | Truncate to 30 chars; log `BusinessValidationError` |
+| `summary_full` | ≤150 chars | Truncate to 150 chars; log `BusinessValidationError` |
+| `key_numbers` | Max 3 items | Retain first 3; discard remainder; log `BusinessValidationError` |
 
 Applied to the Instructor-validated `BriefSummary` right after `generate_structured()` returns.
 
@@ -2216,8 +2259,8 @@ class EventLLMScoringResult(SkillResult):   # base: app/skills/skill_base.py, §
 
     output: Optional[LLMScore]   # None only when failure_reason is set
     skill_log: EventLLMScoringSkillLog   # always populated, every outcome (below)
-    failure_reason: Optional[type[Exception]] = None   # LLMRateLimitException, LLMProviderException,
-                                                         # or LLMAuthenticationException; None on
+    failure_reason: Optional[type[Exception]] = None   # LLMRateLimitError, LLMProviderError,
+                                                         # or LLMAuthenticationError; None on
                                                          # success or fallback (§8.1)
 ```
 
@@ -2235,7 +2278,7 @@ class EventLLMScoringSkill(SkillBase):   # base: app/skills/skill_base.py, §8.1
 
 #### `llm_process()`
 
-Two distinct triggers reach this Skill's own fallback (below), both handled here rather than in `SkillBase.run()`: `LLMSchemaViolationException` (caught, like `BriefSummarySkill`, §8.3), and a non-error case — `adjustment_reason` coming back empty, which Instructor's type-only validation doesn't catch. `LLMRateLimitException`/`LLMProviderException`/`LLMAuthenticationException` are left to propagate to `SkillBase.run()`.
+Two distinct triggers reach this Skill's own fallback (below), both handled here rather than in `SkillBase.run()`: `LLMSchemaViolationError` (caught, like `BriefSummarySkill`, §8.3), and a non-error case — `adjustment_reason` coming back empty, which Instructor's type-only validation doesn't catch. `LLMRateLimitError`/`LLMProviderError`/`LLMAuthenticationError` are left to propagate to `SkillBase.run()`.
 
 ```
 try:
@@ -2250,8 +2293,8 @@ try:
         log warning event_scoring_fallback
     else:
         fallback, fallback_reason = False, None
-except LLMSchemaViolationException as err:
-    append LlmErrorEntry(call_index=len(self._llm_calls) + 1, error_type="LLMSchemaViolationException",
+except LLMSchemaViolationError as err:
+    append LlmErrorEntry(call_index=len(self._llm_calls) + 1, error_type="LLMSchemaViolationError",
                           error_detail=str(err), retried=False) to self._llm_errors
     output = fallback_output()                            # Fallback, below
     fallback, fallback_reason = True, "schema_violation"
@@ -2307,8 +2350,8 @@ class EventLLMScoringSkillLog:
 
 | Field | Constraint | On violation |
 |---|---|---|
-| `stock_impact_score` | [-5.0, +5.0] | Clip to boundary; log `BusinessValidationException` |
-| `adjustment_reason` | ≤80 chars | Truncate; log `BusinessValidationException` |
+| `stock_impact_score` | [-5.0, +5.0] | Clip to boundary; log `BusinessValidationError` |
+| `adjustment_reason` | ≤80 chars | Truncate; log `BusinessValidationError` |
 | `adjustment_reason` | non-empty | Trigger fallback (below); log warning |
 
 The clip/truncate rows are applied to the Instructor-validated `LLMScore` right after `generate_structured()` returns. The third row is this Skill's fallback trigger (see `llm_process()`).
@@ -2331,13 +2374,13 @@ return LLMScore(stock_impact_score, adjustment_reason)
 
 All three Skills catch the four exceptions internally and return a typed result (`EntityAnalysisResult`/`BriefSummaryResult`/`EventLLMScoringResult`, §8.2–§8.4), each subclassing `SkillResult` (§8.1). `EntityAnalysisResult` carries `skill_log`/`failure_reason` directly; the other two also wrap their Instructor-validated output in an `output` field. Callers inspect `failure_reason`/`fallback`, never a `try`/`except` around the call.
 
-| Skill | `LLMRateLimitException` | `LLMProviderException` / `LLMAuthenticationException` | `LLMSchemaViolationException` |
+| Skill | `LLMRateLimitError` | `LLMProviderError` / `LLMAuthenticationError` | `LLMSchemaViolationError` |
 |---|---|---|---|
-| EntityAnalysisSkill | `failure_reason=LLMRateLimitException`, `output=None`; caller: backoff, no ACK | `failure_reason=type(err)`, `output=None`; caller: no ACK | `failure_reason=LLMSchemaViolationException`, `output=None` (no fallback exists, system-design.md §9.7); caller: no ACK |
-| BriefSummarySkill | `failure_reason=LLMRateLimitException`, `output=None`; caller: backoff, no ACK | `failure_reason=type(err)`, `output=None`; caller: no ACK | Fallback applied; `output` set, `failure_reason=None`; continues |
-| EventLLMScoringSkill | `failure_reason=LLMRateLimitException`, `output=None`; caller: backoff, no ACK | `failure_reason=type(err)`, `output=None`; caller: no ACK | Fallback applied; `output` set, `failure_reason=None`; continues |
+| EntityAnalysisSkill | `failure_reason=LLMRateLimitError`, `output=None`; caller: backoff, no ACK | `failure_reason=type(err)`, `output=None`; caller: no ACK | `failure_reason=LLMSchemaViolationError`, `output=None` (no fallback exists, system-design.md §9.7); caller: no ACK |
+| BriefSummarySkill | `failure_reason=LLMRateLimitError`, `output=None`; caller: backoff, no ACK | `failure_reason=type(err)`, `output=None`; caller: no ACK | Fallback applied; `output` set, `failure_reason=None`; continues |
+| EventLLMScoringSkill | `failure_reason=LLMRateLimitError`, `output=None`; caller: backoff, no ACK | `failure_reason=type(err)`, `output=None`; caller: no ACK | Fallback applied; `output` set, `failure_reason=None`; continues |
 
-`LLMAuthenticationException` shares the `LLMProviderException` column because callers treat them identically (no ACK, no backoff); `failure_reason` still holds the actual type. It is a distinct type because `SkillBase.run()` logs CRITICAL on it (§8.1).
+`LLMAuthenticationError` shares the `LLMProviderError` column because callers treat them identically (no ACK, no backoff); `failure_reason` still holds the actual type. It is a distinct type because `SkillBase.run()` logs CRITICAL on it (§8.1).
 
 ### 8.6 Skill Completion Log Events
 
@@ -2349,19 +2392,19 @@ Each Skill builds a structured completion-log record into its result on every in
 
 Outbound HTTP clients to SADI (`NewsClient`) and Admin (`AdminClient`), using the module-level singleton + getter shape (§5.1).
 
-#### `app/clients/exceptions.py`
+#### `app/clients/errors.py`
 
 ```python
-from app.common.exceptions import SAPIException   # §15.1
+from app.common.errors import SAPIError   # §15.1
 
-class NewsClientException(SAPIException):
+class NewsClientError(SAPIError):
     """Wraps a network failure or non-404 error status from a NewsClient call."""
 
-class AdminClientException(SAPIException):
+class AdminClientError(SAPIError):
     """Wraps a network failure or non-2xx error status from an AdminClient call."""
 ```
 
-Neither client lets a raw `httpx` exception escape: each catches `httpx.HTTPError` at its call site and re-raises the wrapped `SAPIException` subclass, so callers never import `httpx`.
+Neither client lets a raw `httpx` exception escape: each catches `httpx.HTTPError` at its call site and re-raises the wrapped `SAPIError` subclass, so callers never import `httpx`.
 
 ### 9.1 `app/clients/news_client.py` — `NewsClient`
 
@@ -2373,7 +2416,7 @@ class NewsClient:
         """
         GET {base_url}/v1/cleaned_news/{cleaned_id} (docs/api.md §2.4).
         Returns None on HTTP 404 (COMMON-4004) — not an error, see system-design.md §3.6.
-        Raises NewsClientException (app.clients.exceptions) on network failure
+        Raises NewsClientError (app.clients.errors) on network failure
         or any other non-404 error status — the caller's error table (§11.4)
         treats this as a generic "SADI API failure".
         """
@@ -2401,7 +2444,7 @@ _news_client: Optional[NewsClient] = None
 
 def get_news_client() -> NewsClient:
     if _news_client is None:
-        raise ServiceUnavailableException("get_news_client() called before create_news_client() initialized it")
+        raise ServiceUnavailableError("news client is not initialized")
     return _news_client
 
 def create_news_client(http_client: httpx.AsyncClient, base_url: str) -> NewsClient:
@@ -2421,7 +2464,7 @@ class AdminClient:
     async def fetch_sources(self) -> list[dict]:
         """GET {base_url}/v1/sources (docs/api.md §4.3). Returns
         [{"source_name": ..., "authority_weight": ...}, ...] for all active sources.
-        Raises AdminClientException (app.clients.exceptions) on network failure
+        Raises AdminClientError (app.clients.errors) on network failure
         or a non-2xx response — never a raw httpx exception."""
 ```
 
@@ -2432,7 +2475,7 @@ _admin_client: Optional[AdminClient] = None
 
 def get_admin_client() -> AdminClient:
     if _admin_client is None:
-        raise ServiceUnavailableException("get_admin_client() called before create_admin_client() initialized it")
+        raise ServiceUnavailableError("admin client is not initialized")
     return _admin_client
 
 def create_admin_client(http_client: httpx.AsyncClient, base_url: str) -> AdminClient:
@@ -2464,7 +2507,7 @@ _entity_event_repository: Optional[EntityEventRepository] = None
 
 def get_entity_event_repository() -> EntityEventRepository:
     if _entity_event_repository is None:
-        raise ServiceUnavailableException("get_entity_event_repository() called before create_entity_event_repository() initialized it")
+        raise ServiceUnavailableError("entity event repository is not initialized")
     return _entity_event_repository
 
 def create_entity_event_repository() -> EntityEventRepository:
@@ -2632,7 +2675,7 @@ _event_repository: Optional[EventRepository] = None
 
 def get_event_repository() -> EventRepository:
     if _event_repository is None:
-        raise ServiceUnavailableException("get_event_repository() called before create_event_repository() initialized it")
+        raise ServiceUnavailableError("event repository is not initialized")
     return _event_repository
 
 def create_event_repository() -> EventRepository:
@@ -2836,7 +2879,7 @@ _event_score_repository: Optional[EventScoreRepository] = None
 
 def get_event_score_repository() -> EventScoreRepository:
     if _event_score_repository is None:
-        raise ServiceUnavailableException("get_event_score_repository() called before create_event_score_repository() initialized it")
+        raise ServiceUnavailableError("event score repository is not initialized")
     return _event_score_repository
 
 def create_event_score_repository() -> EventScoreRepository:
@@ -3012,7 +3055,7 @@ class CacheStore:
         return int(raw) if raw is not None else None
 
     async def _read(self, key: str) -> Optional[str]:
-        """GET, with Redis connection failures translated to ServiceUnavailableException
+        """GET, with Redis connection failures translated to ServiceUnavailableError
         (§15.1) — so GET /v1/morning-brief answers 503 COMMON-5001 (api.md §3.3), not a
         500 from an untranslated redis exception. Same translation DatabaseClient applies
         to asyncpg (§5.2). The single-key read methods go through it; get_current_pointer()
@@ -3020,7 +3063,7 @@ class CacheStore:
         try:
             return await self._state_client.get(key)
         except (redis.ConnectionError, redis.TimeoutError) as err:
-            raise ServiceUnavailableException(f"Redis unreachable reading {key}: {err}") from err
+            raise ServiceUnavailableError(f"Redis unreachable reading {key}: {err}") from err
 
     async def incr_version_counter(self) -> int:
         """Atomic INCR morning_brief:version_counter; returns the new version number."""
@@ -3055,7 +3098,7 @@ class CacheStore:
         try:
             version_raw, updated_raw = await self._state_client.mget([_CURRENT_VERSION_KEY, _LAST_UPDATED_KEY])
         except (redis.ConnectionError, redis.TimeoutError) as err:
-            raise ServiceUnavailableException(f"Redis unreachable reading the cache pointer: {err}") from err
+            raise ServiceUnavailableError(f"Redis unreachable reading the cache pointer: {err}") from err
         if version_raw is None:
             return None
         return CachePointer(version=int(version_raw), last_updated=datetime.fromisoformat(updated_raw))
@@ -3080,7 +3123,7 @@ _cache_store: Optional[CacheStore] = None
 
 def get_cache_store() -> CacheStore:
     if _cache_store is None:
-        raise ServiceUnavailableException("get_cache_store() called before create_cache_store() initialized it")
+        raise ServiceUnavailableError("cache store is not initialized")
     return _cache_store
 
 def create_cache_store() -> CacheStore:
@@ -3097,9 +3140,9 @@ def create_cache_store() -> CacheStore:
 
 ### 11.1 `app/entity_analysis/entity_analysis_service.py` — `EntityAnalysisService`
 
-`EntityAnalysisService` is pure business logic: `find_entity_events()` only. `CleanedNewsConsumer` (§11.2) owns consumption of `stream:raw_news_cleaned` (consumer/reclaim loops, dedup guard, `WorkerPool` dispatch, ACK/backoff/dead-letter) and reacts to how `find_entity_events()` returns: normally (ACK); `LLMRateLimitException` (no ACK, backoff); any other `LLMException` (no ACK, already logged); anything else (no ACK, unanticipated bug, logged ERROR, §11.2).
+`EntityAnalysisService` is pure business logic: `find_entity_events()` only. `CleanedNewsConsumer` (§11.2) owns consumption of `stream:raw_news_cleaned` (consumer/reclaim loops, dedup guard, `WorkerPool` dispatch, ACK/backoff/dead-letter) and reacts to how `find_entity_events()` returns: normally (ACK); `LLMRateLimitError` (no ACK, backoff); any other `LLMError` (no ACK, already logged); anything else (no ACK, unanticipated bug, logged ERROR, §11.2).
 
-Failures are exceptions rather than a status value because `find_entity_events()` can't enumerate every failure. Each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason()`), so the consumer distinguishes `LLMRateLimitException` (needs `trigger_backoff()`) from other `LLMException`s (already logged). A non-`LLMException` (SADI fetch failure, DB write failure) is an unanticipated bug.
+Failures are exceptions rather than a status value because `find_entity_events()` can't enumerate every failure. Each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason()`), so the consumer distinguishes `LLMRateLimitError` (needs `trigger_backoff()`) from other `LLMError`s (already logged). A non-`LLMError` (SADI fetch failure, DB write failure) is an unanticipated bug.
 
 #### Class: `EntityAnalysisService`
 
@@ -3122,7 +3165,7 @@ _entity_analysis_service: Optional[EntityAnalysisService] = None
 
 def get_entity_analysis_service() -> EntityAnalysisService:
     if _entity_analysis_service is None:
-        raise ServiceUnavailableException("get_entity_analysis_service() called before create_entity_analysis_service() initialized it")
+        raise ServiceUnavailableError("entity analysis service is not initialized")
     return _entity_analysis_service
 
 def create_entity_analysis_service(config: EntityAnalysisConfig) -> EntityAnalysisService:
@@ -3159,7 +3202,7 @@ Purpose :
 
 > **`entity_events=[]` is a valid, ACKed outcome** (system-design.md §3.6) — no HK-listed entity mentioned in an article is not an error. `self._repo.persist_entities()` writes zero rows in this case; nothing is published to `stream:entity_event_completed`; `find_entity_events()` still returns normally (an empty list) and the article is still ACKed.
 
-> **`entity_skill.run()` only ever raises something outside `LLMException`.** `SkillBase.run()`'s one `except` clause (§8.1) — `except LLMException` — catches all four typed LLM failures and converts them to `result.failure_reason` instead of raising. Anything else escaping `llm_process()` is an unanticipated bug, and propagates straight out of `run()` uncaught, the same as a SADI fetch or DB write failure (§11.4).
+> **`entity_skill.run()` only ever raises something outside `LLMError`.** `SkillBase.run()`'s one `except` clause (§8.1) — `except LLMError` — catches all four typed LLM failures and converts them to `result.failure_reason` instead of raising. Anything else escaping `llm_process()` is an unanticipated bug, and propagates straight out of `run()` uncaught, the same as a SADI fetch or DB write failure (§11.4).
 
 > **Row-per-entity.** The `(source_url, stock_code)` unique index (§17) depends on `output_items` never carrying two items for one `stock_code`. The LLM is told not to (system-design.md §9.4 Edge Case Rule 6), and `EntityAnalysisSkill`'s Business Constraint Validation (§8.2) drops duplicates before any `EntityEvent` is built.
 
@@ -3272,14 +3315,14 @@ flowchart TD
     E -->|No| G[Add to Set — no await between\nthis check and this insert]
     G --> H[service.find_entity_events cleaned_id\nEntityAnalysisService — see above]
     H -->|Returns normally\nsuccess or SADI 404| Q[Remove from Set\nACK]
-    H -->|Raises LLMRateLimitException| L[worker_pool.trigger_backoff\nRemove from Set\nDo not ACK]
-    H -->|Raises LLMProviderException, LLMAuthenticationException,\nor LLMSchemaViolationException| M[Remove from Set\nDo not ACK]
+    H -->|Raises LLMRateLimitError| L[worker_pool.trigger_backoff\nRemove from Set\nDo not ACK]
+    H -->|Raises LLMProviderError, LLMAuthenticationError,\nor LLMSchemaViolationError| M[Remove from Set\nDo not ACK]
     F & Q & L & M & S --> C
 ```
 
 > **`hk_stock_list_not_ready` gate:** checked before the in-flight Set and before `EntityAnalysisService`, as a synchronous side-effect-free read. Messages are **not ACKed**: an empty list would make every entity `found=false` and produce a permanently-wrong empty result. The reclaim loop (§6.1) redelivers after `STREAM_CLAIM_TIMEOUT_MS`.
 
-> **`_process_one()` wraps everything from the Set-insert onward in `try`/`except LLMRateLimitException`/`except LLMException`/`except Exception`** (in that order, since `LLMRateLimitException` subclasses `LLMException`). `except LLMException` covers `LLMProviderException`/`LLMAuthenticationException`/`LLMSchemaViolationException`, re-raised as themselves by `find_entity_events()`. Only the last is unanticipated: log ERROR `entity_analysis_process_one_crashed` with `exc_info`, remove `cleaned_id` from `processing_cleaned_ids` in a `finally`, leave the message unACKed, and don't re-raise. The first two skip the ERROR log because `find_entity_events()` already logged `entity_analysis_completed`. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
+> **`_process_one()` wraps everything from the Set-insert onward in `try`/`except LLMRateLimitError`/`except LLMError`/`except Exception`** (in that order, since `LLMRateLimitError` subclasses `LLMError`). `except LLMError` covers `LLMProviderError`/`LLMAuthenticationError`/`LLMSchemaViolationError`, re-raised as themselves by `find_entity_events()`. Only the last is unanticipated: log ERROR `entity_analysis_process_one_crashed` with `exc_info`, remove `cleaned_id` from `processing_cleaned_ids` in a `finally`, leave the message unACKed, and don't re-raise. The first two skip the ERROR log because `find_entity_events()` already logged `entity_analysis_completed`. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
 
 ```
 Purpose : The single entry point for dispatching one message, from either _consumer_loop()
@@ -3335,7 +3378,7 @@ class WorkerPool:
         """Set self._rate_limit_until = now() + rate_limit_backoff_s, then log WARNING
         rate_limit_backoff_started with layer and backoff_until (UTC ISO 8601) —
         system-design.md §12.1. Called by the layer's Consumer when its Service call
-        raises LLMRateLimitException (§11.2's _process_one())."""
+        raises LLMRateLimitError (§11.2's _process_one())."""
 ```
 
 Backoff is pool-level (system-design.md §12.1). `dispatch()` checks `self._rate_limit_until` *after* acquiring the semaphore, in a loop, so a caller already waiting on the semaphore still waits out the backoff, and a `trigger_backoff()` that extends the deadline mid-sleep is honoured. Work already running is not interrupted.
@@ -3350,13 +3393,13 @@ The same `WorkerPool` class is used, as independent instances, by Entity Analysi
 
 | Scenario | Where handled |
 |---|---|
-| LLM API call failure (`LLMProviderException`/`LLMAuthenticationException`) | Caught inside `SkillBase.run()` (§8.1, inherited by `EntityAnalysisSkill`) → `result.failure_reason=type(err)`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` from `result.skill_log` with `entity_event_ids=[]` (nothing was persisted) and re-raises the original exception directly (`raise result.failure_reason()`); `CleanedNewsConsumer` does not ACK. `LLMAuthenticationException` additionally triggers a CRITICAL alert, inlined in `run()`'s `except` block (§8.1) |
-| LLM schema violation | Same, `result.failure_reason=LLMSchemaViolationException` (no fallback exists for this Skill, system-design.md §9.7) — never raised, same logging/outcome/no-ACK treatment |
-| `LLMRateLimitException` | Caught inside `run()` → `result.failure_reason=LLMRateLimitException`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` and re-raises `LLMRateLimitException` itself; `CleanedNewsConsumer` calls `WorkerPool.trigger_backoff()`, does not ACK |
+| LLM API call failure (`LLMProviderError`/`LLMAuthenticationError`) | Caught inside `SkillBase.run()` (§8.1, inherited by `EntityAnalysisSkill`) → `result.failure_reason=type(err)`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` from `result.skill_log` with `entity_event_ids=[]` (nothing was persisted) and re-raises the original exception directly (`raise result.failure_reason()`); `CleanedNewsConsumer` does not ACK. `LLMAuthenticationError` additionally triggers a CRITICAL alert, inlined in `run()`'s `except` block (§8.1) |
+| LLM schema violation | Same, `result.failure_reason=LLMSchemaViolationError` (no fallback exists for this Skill, system-design.md §9.7) — never raised, same logging/outcome/no-ACK treatment |
+| `LLMRateLimitError` | Caught inside `run()` → `result.failure_reason=LLMRateLimitError`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` and re-raises `LLMRateLimitError` itself; `CleanedNewsConsumer` calls `WorkerPool.trigger_backoff()`, does not ACK |
 | All entities filtered out | Valid `output_items=[]`; no row written, nothing published, `find_entity_events()` returns normally, `CleanedNewsConsumer` ACKs |
 | `cleaned_id` missing from SADI | `NewsClient.fetch_cleaned_news()` returns `None`; `EntityAnalysisService.find_entity_events()` logs warning, returns normally (not an error, system-design.md §3.6); `CleanedNewsConsumer` ACKs (retry can't help) |
-| DB write failure | `DatabaseClient.execute_returning()` raises `ServiceUnavailableException` after retries exhausted; `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method) |
-| SADI API failure | `NewsClient` raises `NewsClientException` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method, same as a DB write failure above) |
+| DB write failure | `DatabaseClient.execute_returning()` raises `ServiceUnavailableError` after retries exhausted; `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method) |
+| SADI API failure | `NewsClient` raises `NewsClientError` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method, same as a DB write failure above) |
 | `RedisStreamClient` unreachable | Handled inside `read_from()`/`publish()` per §6.1's reconnect behaviour |
 | HK Stock List not ready (`len(get_hk_stock_list_cache()) == 0`) | `CleanedNewsConsumer._process_one()`'s first check, before the in-flight Set and before `EntityAnalysisService` is called at all (§11.1); log warning `hk_stock_list_not_ready`; no ACK — never reaches `news_client.fetch_cleaned_news()` or `entity_skill.run()` at all, so no entity ever gets a permanently-wrong empty-result outcome from this cause |
 
@@ -3526,7 +3569,7 @@ _aggregation_service: Optional[AggregationService] = None
 
 def get_aggregation_service() -> AggregationService:
     if _aggregation_service is None:
-        raise ServiceUnavailableException("get_aggregation_service() called before create_aggregation_service() initialized it")
+        raise ServiceUnavailableError("aggregation service is not initialized")
     return _aggregation_service
 
 def create_aggregation_service(config: AggConfig) -> AggregationService:
@@ -3876,7 +3919,7 @@ _event_aggregation_store: Optional[EventAggregationStore] = None
 
 def get_event_aggregation_store() -> EventAggregationStore:
     if _event_aggregation_store is None:
-        raise ServiceUnavailableException("get_event_aggregation_store() called before create_event_aggregation_store() initialized it")
+        raise ServiceUnavailableError("event aggregation store is not initialized")
     return _event_aggregation_store
 
 def create_event_aggregation_store() -> EventAggregationStore:
@@ -3902,9 +3945,9 @@ def create_event_aggregation_store() -> EventAggregationStore:
 
 ### 13.1 `app/scoring/scoring_service.py` — `ScoringService`
 
-`ScoringService` is pure business logic: `score_event()` only. `ScoringConsumer` (§13.2) owns `stream:event_aggregated` consumption and reacts to how `score_event()` returns: normally (ACK, scored or stale alike, §13.4); `LLMRateLimitException` (no ACK, backoff); any other `LLMException` (no ACK, already anticipated); anything else (no ACK, unanticipated bug, §13.2).
+`ScoringService` is pure business logic: `score_event()` only. `ScoringConsumer` (§13.2) owns `stream:event_aggregated` consumption and reacts to how `score_event()` returns: normally (ACK, scored or stale alike, §13.4); `LLMRateLimitError` (no ACK, backoff); any other `LLMError` (no ACK, already anticipated); anything else (no ACK, unanticipated bug, §13.2).
 
-Exceptions rather than a status value, as in `find_entity_events()` (§11.1): each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason()`), and `ScoringConsumer` distinguishes `LLMRateLimitException` from other `LLMException`s (already logged via `brief_summary_completed`/`event_scoring_completed`). Staleness (§13.4) is a normal return, since the consumer treats it like success.
+Exceptions rather than a status value, as in `find_entity_events()` (§11.1): each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason()`), and `ScoringConsumer` distinguishes `LLMRateLimitError` from other `LLMError`s (already logged via `brief_summary_completed`/`event_scoring_completed`). Staleness (§13.4) is a normal return, since the consumer treats it like success.
 
 #### `EventScore` — `app/models/event_score.py`
 
@@ -3993,7 +4036,7 @@ _scoring_service: Optional[ScoringService] = None
 
 def get_scoring_service() -> ScoringService:
     if _scoring_service is None:
-        raise ServiceUnavailableException("get_scoring_service() called before create_scoring_service() initialized it")
+        raise ServiceUnavailableError("scoring service is not initialized")
     return _scoring_service
 
 def create_scoring_service(config: ScoringConfig) -> ScoringService:
@@ -4095,7 +4138,7 @@ Purpose : 1. event = await self._event_repo.fetch_event(event_id) (§10.2).
           EntityAnalysisService/CleanedNewsConsumer (§11.1/§11.2).
 ```
 
-`LLMSchemaViolationException` never triggers a `raise` for either Skill — both have a defined fallback for it, caught in their own `llm_process()` (§8.3–§8.4), so that case is indistinguishable from success at this layer (`result.output` is set, `result.failure_reason` is `None`, `result.skill_log.fallback` is `True`) and steps 3/7 above don't trigger.
+`LLMSchemaViolationError` never triggers a `raise` for either Skill — both have a defined fallback for it, caught in their own `llm_process()` (§8.3–§8.4), so that case is indistinguishable from success at this layer (`result.output` is set, `result.failure_reason` is `None`, `result.skill_log.fallback` is `True`) and steps 3/7 above don't trigger.
 
 ### 13.2 `app/scoring/scoring_consumer.py` — `ScoringConsumer`
 
@@ -4148,14 +4191,14 @@ flowchart TD
     GATE -->|No| ADD[Add to _in_process Set — no await\nbetween this check and this insert]
     ADD --> B[service.score_event event_id\nScoringService — see above]
     B -->|Returns normally\nscored or stale| P[Remove from _in_process\nACK]
-    B -->|Raises LLMRateLimitException| H1[worker_pool.trigger_backoff\nRemove from _in_process\nDo not ACK]
-    B -->|Raises LLMProviderException, LLMAuthenticationException,\nor LLMSchemaViolationException| H2[Remove from _in_process\nDo not ACK]
+    B -->|Raises LLMRateLimitError| H1[worker_pool.trigger_backoff\nRemove from _in_process\nDo not ACK]
+    B -->|Raises LLMProviderError, LLMAuthenticationError,\nor LLMSchemaViolationError| H2[Remove from _in_process\nDo not ACK]
     SKIP & P & H1 & H2 --> A
 ```
 
 > **Neither Skill's `run()` raises:** `score_event()` branches on `result.failure_reason`. `result.skill_log` is always populated, and `ScoringService` logs it as-is (both Skills take `event.event_id` directly, unlike `EntityAnalysisSkill`, §8.2).
 
-> **`_process_one()` uses the same three-tier `try`/`except` as `CleanedNewsConsumer` (§11.2)**, from the `_in_process` Set-insert onward: `LLMRateLimitException` (backoff), `LLMException` (no extra log; `score_event()` already logged `brief_summary_completed`/`event_scoring_completed`), and `Exception` (log ERROR `scoring_process_one_crashed` with `exc_info`, remove `event_id` from `_in_process` in a `finally`, leave unACKed, don't re-raise). A repeating failure dead-letters at `delivery_count >= SCORING_MAX_RETRY` → `stream:scoring_dead_letter` (§6.1).
+> **`_process_one()` uses the same three-tier `try`/`except` as `CleanedNewsConsumer` (§11.2)**, from the `_in_process` Set-insert onward: `LLMRateLimitError` (backoff), `LLMError` (no extra log; `score_event()` already logged `brief_summary_completed`/`event_scoring_completed`), and `Exception` (log ERROR `scoring_process_one_crashed` with `exc_info`, remove `event_id` from `_in_process` in a `finally`, leave unACKed, don't re-raise). A repeating failure dead-letters at `delivery_count >= SCORING_MAX_RETRY` → `stream:scoring_dead_letter` (§6.1).
 
 #### `_reclaim_loop()` (§6.1's Reclaim and Dead Letter pattern, applied here)
 
@@ -4284,7 +4327,7 @@ Owns the `source:config` key, built on `RedisStateClient`'s generic primitives; 
 Two independent functions: `source_weights` is scoped to this Event's sources, `total_active_sources` is a global count. `get_source_weights()` calls `AdminClient` on a cold miss; `count_active_sources()` only reads Redis and falls back to its config value, since a full Admin refresh just for a count isn't worth the round-trip.
 
 ```python
-from app.clients.exceptions import AdminClientException   # §9
+from app.clients.errors import AdminClientError   # §9
 
 _SOURCE_CONFIG_KEY = "source:config"
 _DEFAULT_TIER_WEIGHTS = {"P1": 9.0, "P2": 6.0, "P3": 4.0}   # fallback only — see below
@@ -4322,7 +4365,7 @@ async def get_source_weights(config: ScoringConfig, source_names: list[str]) -> 
 
     try:
         sources = await admin_client.fetch_sources()
-    except AdminClientException:
+    except AdminClientError:
         return _fallback_weights(source_names)
     if not sources:
         logger.warning("source_config_empty_from_admin")
@@ -4342,7 +4385,7 @@ async def count_active_sources(config: ScoringConfig) -> int:
     return total if total > 0 else config.total_active_sources_default
 ```
 
-`except AdminClientException`, not `except Exception`, so an unrelated bug (e.g. a `KeyError` from a malformed response) isn't treated as an outage.
+`except AdminClientError`, not `except Exception`, so an unrelated bug (e.g. a `KeyError` from a malformed response) isn't treated as an outage.
 
 > `_admin_tier_for(name)` is used only by the dual-failure fallback branch above; Admin's `data_sources` table (admin-tad.md §4.1) remains the source of truth for tiers.
 
@@ -4352,9 +4395,9 @@ async def count_active_sources(config: ScoringConfig) -> int:
 |---|---|
 | DB read failure | `EventRepository.fetch_event()`/`EntityEventRepository.fetch_entity_events_for_event()` (§10.2/§10.1) raise inside `ScoringService.score_event()`; propagates uncaught to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK |
 | Event row not found | `fetch_event()` returns `None` — `stream:event_aggregated` is only published after `persist_events()` commits (§12.1), so this means the row is gone, and no redelivery can fix it. `score_event()` logs `scoring_event_missing` (warning) and returns; ACKed the same as success (§13.2) |
-| BriefSummarySkill: `LLMSchemaViolationException` | Fallback applied inside the Skill (§8.3) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
-| EventLLMScoringSkill: `LLMSchemaViolationException` | Fallback applied inside the Skill (§8.4) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
-| Either Skill: `LLMRateLimitException`/`LLMProviderException`/`LLMAuthenticationException` | Caught inside `SkillBase.run()` (§8.1, inherited by both Skills) → `result.failure_reason=type(err)` (the caught exception's own class), never raised by `run()` itself; `ScoringService.score_event()` logs the Skill's completion event from `result.skill_log` and re-raises `result.failure_reason()` directly, same as `find_entity_events()` (§11.1); `ScoringConsumer` calls `WorkerPool.trigger_backoff()` only for `LLMRateLimitException`, removes from `_in_process`, does not ACK either way. `LLMAuthenticationException` additionally triggers a CRITICAL alert, inlined in `SkillBase.run()`'s `except` block |
+| BriefSummarySkill: `LLMSchemaViolationError` | Fallback applied inside the Skill (§8.3) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
+| EventLLMScoringSkill: `LLMSchemaViolationError` | Fallback applied inside the Skill (§8.4) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
+| Either Skill: `LLMRateLimitError`/`LLMProviderError`/`LLMAuthenticationError` | Caught inside `SkillBase.run()` (§8.1, inherited by both Skills) → `result.failure_reason=type(err)` (the caught exception's own class), never raised by `run()` itself; `ScoringService.score_event()` logs the Skill's completion event from `result.skill_log` and re-raises `result.failure_reason()` directly, same as `find_entity_events()` (§11.1); `ScoringConsumer` calls `WorkerPool.trigger_backoff()` only for `LLMRateLimitError`, removes from `_in_process`, does not ACK either way. `LLMAuthenticationError` additionally triggers a CRITICAL alert, inlined in `SkillBase.run()`'s `except` block |
 | `source:config` unreachable | The Redis error propagates from `get_source_weights()`/`count_active_sources()` (§13.5) — no fallback weights, no Admin call — to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK (rationale: system-design.md §5.11) |
 | DB write failure | `_db_write_with_retry()` exhausts retries inside `EventRepository.update_brief_summary()`/`EventScoreRepository.persist_score_if_not_stale()` (§10.2/§10.3), raises; propagates uncaught to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK |
 | `RedisStreamClient` unreachable | Per §6.1 |
@@ -4578,7 +4621,7 @@ _cache_service: Optional[CacheService] = None
 
 def get_cache_service() -> CacheService:
     if _cache_service is None:
-        raise ServiceUnavailableException("get_cache_service() called before create_cache_service() initialized it")
+        raise ServiceUnavailableError("cache service is not initialized")
     return _cache_service
 
 def create_cache_service(config: CacheConfig) -> CacheService:
@@ -4846,84 +4889,89 @@ The endpoint is a second caller of `build_new_version()` alongside `CacheConsume
 ### 15.1 `app/api/main.py` — FastAPI App Factory
 
 ```python
+API_VERSION = "v1"
+
 def create_app() -> FastAPI:
     app = FastAPI(title="SAPI", version="1.0.0")
-    app.include_router(health_router, prefix="/v1")
-    app.include_router(morning_brief_router, prefix="/v1")
-    app.include_router(hk_stock_list_sync_router, prefix="/v1")
-    app.include_router(morning_brief_refresh_router, prefix="/v1")   # route path /admin/morning-brief-refresh (§15.7)
+    app.include_router(health_router, prefix=f"/{API_VERSION}")
+    app.include_router(morning_brief_router, prefix=f"/{API_VERSION}")
+    app.include_router(hk_stock_list_sync_router, prefix=f"/{API_VERSION}")
+    app.include_router(morning_brief_refresh_router, prefix=f"/{API_VERSION}")   # route path /admin/morning-brief-refresh (§15.7)
     return app
 ```
 
-#### `app/common/error_codes.py` — Error Code Catalog
+#### `app/common/error_codes.py` — Error Codes
 
-Same structure as SADI's (`stock-assistant-data-ingestion/docs/implementation.md` §8.5b); codes from `docs/api.md`'s Appendix registry:
+Every error code SAPI returns, as one commented constant each, in `docs/api.md` §1.2's `{SERVICE_PREFIX}-{CODE}` format (registry: `docs/api.md` Appendix). Error classes and the exception handlers reference these, never literals. Each ticket adds the constants it first uses.
+
+```python
+INTERNAL_ERROR = "COMMON-5000"             # Unexpected failure inside SAPI
+SERVICE_UNAVAILABLE = "COMMON-5001"        # Database or Redis unreachable, or not initialized yet
+UPSTREAM_UNAVAILABLE = "COMMON-5002"       # SADI, Admin or HKEXnews unreachable
+MALFORMED_REQUEST = "COMMON-4000"          # Request body is not valid JSON
+VALIDATION_FAILED = "COMMON-4001"          # Request fields failed validation
+NOT_FOUND = "COMMON-4004"                  # Requested resource does not exist
+CACHE_UNAVAILABLE = "SAPI-5001"            # Morning Brief cache has no current version
+HK_STOCK_LIST_PARSE_ERROR = "SAPI-5002"    # HKEXnews responded, but the response could not be parsed
+```
+
+#### `app/common/errors.py` — Errors
+
+Every error SAPI raises is a `SAPIError` with five fields. `error_type`, `error_code` (one of the constants above), `message` (short public summary) and `log_level` have per-class defaults; `dev_message` (technical description of this occurrence) is given at every raise site, which may also override any default for that occurrence, as §4.2's unreachable-HKEXnews case does.
 
 ```python
 import logging
-from dataclasses import dataclass
+from enum import StrEnum
 
-@dataclass(frozen=True)
-class ErrorCode:
-    """Base error code record. One frozen instance per distinct code."""
-    error_type: str    # "COMMON" | "SAPI"
-    error_code: str    # Unique identifier, e.g. "SAPI-5001"
-    dev_message: str   # Static technical description, for debugging
-    message: str       # Short, generic, public-facing summary
-    log_level: int = logging.WARNING
+class ErrorType(StrEnum):
+    """Failure category of an error."""
+    REQUEST = "REQUEST"
+    INTERNAL = "INTERNAL"
+    STORAGE = "STORAGE"
+    NETWORK = "NETWORK"
+    PARSE = "PARSE"
 
+class SAPIError(Exception):
+    """Base for every error SAPI raises, so a catch-all `except Exception` (§11.2/§13.2, the
+    general handler below) never mistakes one for an unanticipated bug."""
+    error_type: ErrorType = ErrorType.INTERNAL
+    error_code: str = error_codes.INTERNAL_ERROR
+    message: str = "Internal server error"
+    log_level: int = logging.ERROR
 
-class CommonErrorCode:
-    """COMMON-4xxx / COMMON-5xxx — shared HTTP error responses."""
-    MALFORMED_REQUEST     = ErrorCode("COMMON", "COMMON-4000", ...)
-    VALIDATION_FAILED     = ErrorCode("COMMON", "COMMON-4001", ...)
-    NOT_FOUND             = ErrorCode("COMMON", "COMMON-4004", ...)
-    INTERNAL_ERROR        = ErrorCode("COMMON", "COMMON-5000", ..., log_level=logging.ERROR)
-    SERVICE_UNAVAILABLE   = ErrorCode("COMMON", "COMMON-5001", ..., log_level=logging.ERROR)   # DB/Redis unreachable
-    UPSTREAM_UNAVAILABLE  = ErrorCode("COMMON", "COMMON-5002", ..., log_level=logging.ERROR)   # SADI/Admin/HKEXnews unreachable
+    def __init__(self, dev_message: str, *, error_type: ErrorType | None = None,
+                 error_code: str | None = None, message: str | None = None,
+                 log_level: int | None = None):
+        super().__init__(dev_message)
+        self.dev_message = dev_message
+        # each override given replaces the class default for this occurrence only
 
+class NotFoundError(SAPIError):
+    error_type = ErrorType.REQUEST
+    error_code = error_codes.NOT_FOUND
+    message = "Resource not found"
+    log_level = logging.WARNING
 
-class SAPIErrorCode:
-    """SAPI-5xxx — SAPI-specific codes."""
-    CACHE_UNAVAILABLE        = ErrorCode("SAPI", "SAPI-5001", ..., log_level=logging.ERROR)
-    HK_STOCK_LIST_PARSE_ERROR = ErrorCode("SAPI", "SAPI-5002", ..., log_level=logging.ERROR)
-```
-
-> `CommonErrorCode`/`SAPIErrorCode` are namespace classes holding constants — not exception classes, never raised/caught (same rule SADI's catalog states, §8.5b).
-
-#### `app/common/exceptions.py` — Base Exceptions
-
-Only exceptions that reach the API exception handler (table below) carry an `error_code`, the line SADI draws (§8.5). `UniqueConstraintException`/`DatabaseException` (§5.3), the `LLMException` family (§7.2), and `NewsClientException`/`AdminClientException` (§9) are caught internally and carry none.
-
-```python
-class SAPIException(Exception):
-    """Base for every custom exception in this doc, so a catch-all `except Exception`
-    (§11.2/§13.2, the general handler below) never mistakes one for an unanticipated bug."""
-
-class NotFoundException(SAPIException):
-    error_code = CommonErrorCode.NOT_FOUND   # COMMON-4004
-
-class ServiceUnavailableException(SAPIException):
+class ServiceUnavailableError(SAPIError):
     """Used by every get_X() accessor's "called before create_X()" case (§5.1) and an
-    unreachable DB/Redis (§5.2); defaults to COMMON-5001. An unreachable upstream
-    (SADI/Admin/HKEXnews, e.g. §4.2) passes error_code explicitly, as ParseException (§4.2) does."""
-    def __init__(self, detail: str, error_code: ErrorCode = CommonErrorCode.SERVICE_UNAVAILABLE):
-        super().__init__(detail)
-        self.error_code = error_code
+    unreachable DB/Redis (§5.2). An unreachable upstream (SADI/Admin/HKEXnews, e.g. §4.2)
+    overrides error_type=NETWORK, error_code=error_codes.UPSTREAM_UNAVAILABLE."""
+    error_code = error_codes.SERVICE_UNAVAILABLE
+    message = "Service unavailable"
 ```
 
-**Exception handlers** follow SADI's pattern (`stock-assistant-data-ingestion/docs/implementation.md` §7.1): each reads `exc.error_code.error_code`/`.dev_message`/`.log_level` off the exception, except `RequestValidationError` (third-party) and the general `Exception` catch-all.
+**Exception handlers** follow SADI's pattern (`stock-assistant-data-ingestion/docs/implementation.md` §7.1): each reads `exc.error_code`/`.message`/`.dev_message`/`.log_level` off the exception, except `RequestValidationError` (third-party) and the general `Exception` catch-all.
 
 | Exception | Response |
 |---|---|
 | `RequestValidationError` (Pydantic) | HTTP 400; field failure → `COMMON-4001` with `detail.errors`; malformed JSON (`type == "json_invalid"`) → `COMMON-4000` |
-| `NotFoundException` | HTTP 404, `COMMON-4004` |
-| `ServiceUnavailableException` | HTTP 503, `exc.error_code.error_code` — `COMMON-5001` by default, `COMMON-5002` at the one call site that passes it explicitly (§4.2) |
-| `MorningBriefCacheUnavailableException` | HTTP 503, `SAPI-5001` (§15.3 below) |
-| `ParseException` | HTTP 500, `SAPI-5002` (§4.2 — HKEXnews response fetched ok but couldn't be parsed; a code/schema issue, not an availability one, so it gets its own code rather than folding into `COMMON-5000` below) |
+| `NotFoundError` | HTTP 404, `COMMON-4004` |
+| `ServiceUnavailableError` | HTTP 503, `exc.error_code` — `COMMON-5001` by default, `COMMON-5002` where §4.2 overrides it |
+| `MorningBriefCacheUnavailableError` | HTTP 503, `SAPI-5001` (§15.3 below) |
+| `ParseError` | HTTP 500, `SAPI-5002` (§4.2 — HKEXnews response fetched ok but couldn't be parsed; a code/schema issue, not an availability one, so it gets its own code rather than folding into `COMMON-5000` below) |
 | General `Exception` | HTTP 500, `COMMON-5000` |
 
-See SADI's implementation doc §8.5b and §7.1 for the full `message`/`dev_message`/`detail` usage rule and logging-exactly-once policy, both of which apply here unchanged (SAPI has no authentication in MVP either, and is only ever called by other internal MWP services).
+See SADI's implementation doc §8.5b and §7.1 for the full `message`/`detail` usage rule and logging-exactly-once policy, both of which apply here unchanged (SAPI has no authentication in MVP either, and is only ever called by other internal MWP services).
 
 ### 15.2 `app/api/routes/health.py` — `GET /v1/health`
 
@@ -4940,10 +4988,13 @@ Returns : HTTP 200 (healthy or degraded) or HTTP 503 (unhealthy)
 database     = ok  if `SELECT 1` succeeds, else error
 redis_stream = ok  if RedisStreamClient.ping() (§6.1) succeeds, else error
 redis_state  = ok  if RedisStateClient.ping() (§6.2) succeeds, else error
-    — the three run concurrently (asyncio.gather), each wrapped in
-    asyncio.wait_for(..., timeout=get_config().health.check_timeout_s) (§4.1);
-    any exception, including asyncio.TimeoutError, → that field = error, logged at
-    WARNING. Worst-case latency is one timeout, not three (system-design.md §7.1).
+    — the three run concurrently (asyncio.gather), each as its own Task bounded by
+    asyncio.wait({task}, timeout=get_config().health.check_timeout_s) (§4.1). On
+    timeout the Task is cancelled and abandoned, not awaited (system-design.md §7.1):
+    a module-level set holds it until its cleanup finishes, and a done callback
+    retrieves its result so asyncio never reports it as unhandled. A timeout or any
+    exception → that field = error, logged at WARNING. Worst-case latency is one
+    timeout, not three (system-design.md §7.1).
 hk_stock_list = ok if len(hk_stock_list_cache) > 0, else not_ready   # §4.2 — in-process, no
     Redis; hk_stock_list_cache injected via Depends(get_hk_stock_list_cache),
     imported directly from app.common.hk_stock_list (§4.2), not §15.6
@@ -4962,7 +5013,7 @@ status = healthy   (HTTP 200) otherwise
 
 ### 15.3 `app/api/routes/morning_brief.py` — `GET /v1/morning-brief`
 
-#### Handler: `get_morning_brief(query: MorningBriefQuery = Depends(), cache_store: CacheStore = Depends(get_cache_store), cache_reader: CacheReader = Depends(get_cache_reader)) -> MorningBriefResponse`
+#### Handler: `get_morning_brief(query: Annotated[MorningBriefQuery, Depends()], cache_store: Annotated[CacheStore, Depends(get_cache_store)], cache_reader: Annotated[CacheReader, Depends(get_cache_reader)]) -> MorningBriefResponse`
 
 `get_cache_store` is `app.persistent.cache_store.get_cache_store` (§10.4) and `get_cache_reader` is `app.cache.cache_reader.get_cache_reader` (§14.8), both imported directly.
 
@@ -4993,12 +5044,12 @@ async def get_morning_brief(stocks: str, k: Optional[int], cache_store: CacheSto
             # SAPI-5001, HTTP 503. Distinct from a built cache that just has no
             # events matching this query, which is a plain 200 with an empty
             # events array (see §15.4 note below).
-            raise MorningBriefCacheUnavailableException()
+            raise MorningBriefCacheUnavailableError()
         cached = await cache_reader.get_records(pointer.version)   # §14.8 — parsed at most once per version
         if cached is not None:
             break
     else:
-        raise ServiceUnavailableException("cache version kept disappearing between reads")   # 503 COMMON-5001
+        raise ServiceUnavailableError("cache version kept disappearing between reads")   # 503 COMMON-5001
 
     records = cached   # already ranked by the build (§14.3) — read-only, shared by every request (§14.8)
 
@@ -5019,11 +5070,13 @@ async def get_morning_brief(stocks: str, k: Optional[int], cache_store: CacheSto
 
 > **`SAPI-5001` vs. the empty-cache response.** `pointer is None` (no cache version has ever been built) is the sole `SAPI-5001` trigger; a built cache with zero matching Events after `NOISE_FILTER_THRESHOLD` filtering is a plain `200` with a non-null `cache_version`/`last_updated` and an empty `events` array — `cache_version`/`last_updated` are never null on a `200` response. system-design.md §7.4 and `docs/api.md` §3.3 match this.
 
-### 15.4 `app/common/exceptions.py` addition
+### 15.4 `app/common/errors.py` addition
 
 ```python
-class MorningBriefCacheUnavailableException(SAPIException):
-    error_code = SAPIErrorCode.CACHE_UNAVAILABLE   # SAPI-5001
+class MorningBriefCacheUnavailableError(SAPIError):
+    error_type = ErrorType.STORAGE
+    error_code = error_codes.CACHE_UNAVAILABLE
+    message = "Morning brief cache unavailable"
 ```
 
 ### 15.5 `app/api/routes/hk_stock_list_sync.py` — `POST /v1/admin/hk-stock-list-sync`
@@ -5036,8 +5089,8 @@ Purpose : Synchronously call §4.2's refresh_hk_stock_list() and return entries_
           get_http_client()/get_hk_stock_list_cache(), so this handler needs no Depends(). It
           is the same function app/main.py's startup calls (§16).
 Returns : HTTP 200 HKStockListSyncResponse
-Errors  : HTTP 503 COMMON-5002 (ServiceUnavailableException) if HKEXnews is unreachable;
-          HTTP 500 SAPI-5002 (ParseException) if its response shape didn't match (§4.2,
+Errors  : HTTP 503 COMMON-5002 (ServiceUnavailableError) if HKEXnews is unreachable;
+          HTTP 500 SAPI-5002 (ParseError) if its response shape didn't match (§4.2,
           §15.1). The existing cache is untouched on either.
 ```
 
@@ -5059,7 +5112,7 @@ def get_layer_tasks(request: Request) -> dict[str, asyncio.Task]:
 
 ### 15.7 `app/api/routes/morning_brief_refresh.py` — `POST /v1/admin/morning-brief-refresh`
 
-#### Handler: `post_morning_brief_refresh(cache_service: CacheService = Depends(get_cache_service)) -> MorningBriefRefreshResponse`
+#### Handler: `post_morning_brief_refresh(cache_service: Annotated[CacheService, Depends(get_cache_service)]) -> MorningBriefRefreshResponse`
 
 ```
 Purpose : The daily refresh (§14.9, api.md §3.5): version = await
@@ -5067,9 +5120,9 @@ Purpose : The daily refresh (§14.9, api.md §3.5): version = await
           writes a new version with recency as of now. Synchronous, so Admin's job sees
           the real outcome.
 Returns : HTTP 200 MorningBriefRefreshResponse(status="success", cache_version=version)
-Errors  : HTTP 503 COMMON-5001 (ServiceUnavailableException) if Redis or the DB is
+Errors  : HTTP 503 COMMON-5001 (ServiceUnavailableError) if Redis or the DB is
           unreachable — nothing written, the previous version keeps serving. Redis/DB
-          errors already arrive as ServiceUnavailableException (§5.2, §10.4); the
+          errors already arrive as ServiceUnavailableError (§5.2, §10.4); the
           existing handler (§15.1) maps them.
 ```
 
@@ -5080,11 +5133,12 @@ Errors  : HTTP 503 COMMON-5001 (ServiceUnavailableException) if Redis or the DB 
 Mostly a sequence of `create_X()` registration calls (§5.1, §6.1, §6.2, §7.3, §9, §10, §12.5, §4.2, §11.1, §12.1, §13.1, §14.1). `main.py` decides construction order where data dependencies exist (e.g. `http_client` before `NewsClient`); each Service pulls its infra via `get_X()` and each `Consumer` pulls its Service the same way. `main.py` explicitly constructs only the `WorkerPool` instances (Entity Analysis and Scoring, §11.3), passed to their Consumers. Skills are never constructed here: each Service builds a fresh instance per call (§11.1, §13.1, §8.1).
 
 ```python
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI
-import asyncio, logging
+import asyncio
 
 from app.config import load_config
+from app.logger import configure_logging, get_logger
 from app.db.connection import create_db_client
 from app.redis.stream_client import create_stream_client
 from app.redis.state_client import create_state_client
@@ -5111,106 +5165,119 @@ from app.cache.cache_service import create_cache_service
 from app.cache.cache_consumer import CacheConsumer
 from app.api.main import create_app
 
-logger = logging.getLogger(__name__)
+configure_logging()   # §4.3
+logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ─────────────────────────────────────────────────────────────
-    # Each create_X() constructs its resource and registers it as that module's singleton (§5.1).
-    # Order matters only where a data dependency exists (e.g. http_client before create_news_client()).
-    config = load_config()
+    async with AsyncExitStack() as resources:
+        # ── Startup ─────────────────────────────────────────────────────────────
+        # Every resource registers its own close on the exit stack as soon as it exists. Shutdown runs
+        # them in reverse registration order, and a failed startup closes whatever was already opened.
+        # Each create_X() constructs its resource and registers it as that module's singleton (§5.1).
+        # Order matters only where a data dependency exists (e.g. http_client before create_news_client()).
+        config = load_config()
 
-    db = await create_db_client(config.db)
-    redis_stream = await create_stream_client(config.redis.stream_url)
-    redis_state = await create_state_client(config.redis.state_url)
-    http_client = create_http_client(config.http.timeout_s)
+        db = await create_db_client(config.db)
+        resources.push_async_callback(db.close, config.db.close_timeout_s)
+        redis_stream = await create_stream_client(config.redis.stream_url)
+        resources.push_async_callback(redis_stream.close)
+        redis_state = await create_state_client(config.redis.state_url)
+        resources.push_async_callback(redis_state.close)
+        http_client = create_http_client(config.http.timeout_s)
+        resources.push_async_callback(http_client.aclose)
 
-    llm_adapter = create_llm_adapter(config.llm)
-    news_client = create_news_client(http_client, config.entity_analysis.sadi_api_url)
-    admin_client = create_admin_client(http_client, config.scoring.admin_api_url)
-    entity_event_repository = create_entity_event_repository()
-    event_repository = create_event_repository()
-    event_score_repository = create_event_score_repository()
-    event_aggregation_store = create_event_aggregation_store()
-    cache_store = create_cache_store()
-    create_cache_reader()   # §14.8 — after cache_store, which it reads through
+        llm_adapter = create_llm_adapter(config.llm)
+        resources.push_async_callback(llm_adapter.close)
+        news_client = create_news_client(http_client, config.entity_analysis.sadi_api_url)
+        admin_client = create_admin_client(http_client, config.scoring.admin_api_url)
+        entity_event_repository = create_entity_event_repository()
+        event_repository = create_event_repository()
+        event_score_repository = create_event_score_repository()
+        event_aggregation_store = create_event_aggregation_store()
+        cache_store = create_cache_store()
+        create_cache_reader()   # §14.8 — after cache_store, which it reads through
 
-    # Eager, BLOCKING HK Stock List load before any layer Task starts (system-design.md §9.2.1).
-    # If it raises, startup continues with the empty fallback cache refresh_hk_stock_list()
-    # installs (§4.2); GET /health reports 503 until a later sync succeeds.
-    try:
-        await refresh_hk_stock_list()
-    except Exception:
-        logger.critical("hk_stock_list_startup_load_failed", exc_info=True)
+        # Eager, BLOCKING HK Stock List load before any layer Task starts (system-design.md §9.2.1).
+        # If it raises, startup continues with the empty fallback cache refresh_hk_stock_list()
+        # installs (§4.2); GET /health reports 503 until a later sync succeeds.
+        try:
+            await refresh_hk_stock_list()
+        except Exception:
+            logger.critical("hk_stock_list_startup_load_failed", exc_info=True)
 
-    # WorkerPools are layer-owned collaborators, constructed here and passed to their Consumer.
-    # Skills are never constructed here.
+        # WorkerPools are layer-owned collaborators, constructed here and passed to their Consumer.
+        # Skills are never constructed here.
 
-    entity_analysis_worker_pool = WorkerPool("entity_analysis", config.entity_analysis.max_concurrent, config.llm.rate_limit_backoff_s)
-    scoring_worker_pool = WorkerPool("scoring", config.scoring.max_concurrent, config.llm.rate_limit_backoff_s)
+        entity_analysis_worker_pool = WorkerPool("entity_analysis", config.entity_analysis.max_concurrent, config.llm.rate_limit_backoff_s)
+        scoring_worker_pool = WorkerPool("scoring", config.scoring.max_concurrent, config.llm.rate_limit_backoff_s)
 
-    # Each Service takes only its config and pulls its infra via get_X(); each Consumer pulls its
-    # Service via get_X_service() (§5.1).
-    create_entity_analysis_service(config.entity_analysis)
-    cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis)
-    aggregation_service = create_aggregation_service(config.agg)
-    agg_consumer = AggregationConsumer(config.agg)
-    create_scoring_service(config.scoring)
-    scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring)
-    cache_service = create_cache_service(config.cache)
+        # Each Service takes only its config and pulls its infra via get_X(); each Consumer pulls its
+        # Service via get_X_service() (§5.1).
+        create_entity_analysis_service(config.entity_analysis)
+        cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis)
+        aggregation_service = create_aggregation_service(config.agg)
+        resources.push_async_callback(aggregation_service.close)   # group Tasks outlive the layer Task (§12.1)
+        agg_consumer = AggregationConsumer(config.agg)
+        create_scoring_service(config.scoring)
+        scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring)
+        cache_service = create_cache_service(config.cache)
 
-    # Eager, BLOCKING initial cache build before CacheConsumer's Task exists (both write through the
-    # serial-writer path, §14.5). This is its one catch site (§14.1): on failure, startup continues
-    # with current_version unbuilt, and the first build_new_version() does the full build instead.
-    try:
-        await cache_service.build_initial_version()
-    except Exception:
-        logger.critical("cache_startup_build_failed", exc_info=True)
+        # Eager, BLOCKING initial cache build before CacheConsumer's Task exists (both write through the
+        # serial-writer path, §14.5). This is its one catch site (§14.1): on failure, startup continues
+        # with current_version unbuilt, and the first build_new_version() does the full build instead.
+        try:
+            await cache_service.build_initial_version()
+        except Exception:
+            logger.critical("cache_startup_build_failed", exc_info=True)
 
-    cache_consumer = CacheConsumer(config.cache)
+        cache_consumer = CacheConsumer(config.cache)
 
-    # app.state holds only layer_tasks (§15.6).
-    layer_tasks: dict[str, asyncio.Task] = {}
+        # app.state holds only layer_tasks (§15.6).
+        layer_tasks: dict[str, asyncio.Task] = {}
+        shutting_down = False
 
-    # Launch each layer as a monitored Task (system-design.md §12.1 Coroutine Monitoring). start() uses
-    # run_supervised() (§6.1), so when _on_done fires both of the layer's coroutines have stopped and
-    # the restart can't race a live sibling.
-    def _make_monitored(name: str, coro_factory):
-        task = asyncio.create_task(coro_factory())
-        def _on_done(t: asyncio.Task):
-            if t.cancelled():
-                return
-            exc = t.exception()
-            if exc is not None:
+        # Launch each layer as a monitored Task (system-design.md §12.1 Coroutine Monitoring). start() uses
+        # run_supervised() (§6.1), so when _on_done fires both of the layer's coroutines have stopped and
+        # the restart can't race a live sibling.
+        def _make_monitored(name: str, coro_factory):
+            task = asyncio.create_task(coro_factory())
+            def _on_done(t: asyncio.Task):
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is None:
+                    return
+                if shutting_down:   # no restart during shutdown (system-design.md §12.1)
+                    logger.error("layer_task_failed_during_shutdown", layer=name, exc_info=exc)
+                    return
                 logger.critical("layer_task_crashed", layer=name, exc_info=exc)
                 layer_tasks[name] = _make_monitored(name, coro_factory)  # auto-restart
-        task.add_done_callback(_on_done)
-        return task
+            task.add_done_callback(_on_done)
+            return task
 
-    layer_tasks["entity_analysis"] = _make_monitored("entity_analysis", cleaned_news_consumer.start)
-    layer_tasks["aggregation"] = _make_monitored("aggregation", agg_consumer.start)
-    layer_tasks["scoring"] = _make_monitored("scoring", scoring_consumer.start)
-    layer_tasks["cache"] = _make_monitored("cache", cache_consumer.start)
-    app.state.layer_tasks = layer_tasks
+        layer_tasks["entity_analysis"] = _make_monitored("entity_analysis", cleaned_news_consumer.start)
+        layer_tasks["aggregation"] = _make_monitored("aggregation", agg_consumer.start)
+        layer_tasks["scoring"] = _make_monitored("scoring", scoring_consumer.start)
+        layer_tasks["cache"] = _make_monitored("cache", cache_consumer.start)
+        app.state.layer_tasks = layer_tasks
 
-    yield  # Service is running here
+        async def _cancel_layer_tasks() -> None:
+            nonlocal shutting_down
+            shutting_down = True
+            for task in layer_tasks.values():
+                task.cancel()
+            await asyncio.gather(*layer_tasks.values(), return_exceptions=True)
 
-    # ── Shutdown ────────────────────────────────────────────────────────────
-    for task in layer_tasks.values():
-        task.cancel()
-    await asyncio.gather(*layer_tasks.values(), return_exceptions=True)
-    await aggregation_service.close()   # group Tasks outlive the layer Task (§12.1)
-    await llm_adapter.close()
-    await http_client.aclose()
-    await redis_stream.close()
-    await redis_state.close()
-    await db.close()
+        resources.push_async_callback(_cancel_layer_tasks)   # registered last, so it runs first
+
+        yield  # Service is running here; leaving the block runs every registered close
 
 app = create_app()
 app.router.lifespan_context = lifespan
 ```
 
-> **Aggregation's final flush:** `AggregationConsumer.start()`'s `try/finally` (§12.2) flushes when the Task is cancelled; `main.py` needs only `task.cancel()` + `gather()`.
+> **Aggregation's final flush:** `AggregationConsumer.start()`'s `try/finally` (§12.2) flushes when the Task is cancelled; `_cancel_layer_tasks()` needs only `task.cancel()` + `gather()`.
 
 > **Routes** reach infra via each owning module's `get_X()` as a `Depends()` target (§5.4, §15.3), and never touch `app.state` directly except for `get_layer_tasks` (§15.6).
 
