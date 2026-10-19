@@ -24,3 +24,7 @@ python_files = ["*.py"]
 python_functions = ["[!_]*"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: needs Docker (real Postgres/Redis containers). Skipped by default; opt in with `pytest -m live`.",
+]
+addopts = "-m 'not live'"

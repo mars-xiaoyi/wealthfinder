@@ -47,6 +47,7 @@
 Configured in `pyproject.toml`; test-only dependencies are pinned in `requirements-test.txt`.
 
 - `pytest` + `pytest-asyncio` — unit tests (`asyncio_mode = "auto"`)
+- `pytest-timeout` — bounds the Docker-backed integration tests (marker `live`, skipped by default; run with `pytest -m live`, which starts its own Postgres and Redis containers through the docker CLI)
 - `ruff` — linting and formatting
 - `mypy` — static type checking, `strict` for `app/`
 
