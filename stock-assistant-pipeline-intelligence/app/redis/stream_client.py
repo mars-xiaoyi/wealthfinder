@@ -1,5 +1,6 @@
 import redis.asyncio
 
+from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 
 
@@ -30,7 +31,9 @@ def get_redis_stream_client() -> RedisStreamClient:
     Raises ServiceUnavailableError if called before create_stream_client() has run.
     """
     if _redis_stream_client is None:
-        raise ServiceUnavailableError("redis stream client is not initialized")
+        raise ServiceUnavailableError(
+            "redis stream client is not initialized", category=ErrorCategory.REDIS
+        )
     return _redis_stream_client
 
 

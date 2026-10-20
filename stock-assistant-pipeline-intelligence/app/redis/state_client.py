@@ -1,5 +1,6 @@
 import redis.asyncio
 
+from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 
 
@@ -30,7 +31,9 @@ def get_redis_state_client() -> RedisStateClient:
     Raises ServiceUnavailableError if called before create_state_client() has run.
     """
     if _redis_state_client is None:
-        raise ServiceUnavailableError("redis state client is not initialized")
+        raise ServiceUnavailableError(
+            "redis state client is not initialized", category=ErrorCategory.REDIS
+        )
     return _redis_state_client
 
 

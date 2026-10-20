@@ -4,6 +4,10 @@ asyncpg==0.30.0
 # Redis
 redis==5.2.1
 
+# HTTP client and HK Stock List parsing
+httpx==0.28.1
+openpyxl==3.1.5
+
 # Logging
 structlog==26.1.0
 

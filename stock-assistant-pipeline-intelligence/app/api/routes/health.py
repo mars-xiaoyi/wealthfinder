@@ -1,8 +1,8 @@
 import asyncio
 from collections.abc import Coroutine
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Response, status
 
 from app.api.schemas import (
     ComponentStatus,
@@ -11,19 +11,19 @@ from app.api.schemas import (
     HKStockListStatus,
     LayerStatus,
 )
-from app.config import AppConfig, get_config
-from app.db.connection import DatabaseClient, get_db_client
+from app.common.hk_stock_list import get_hk_stock_list_cache
+from app.config import get_config
+from app.db.connection import get_db_client
 from app.logger import get_logger
-from app.redis.state_client import RedisStateClient, get_redis_state_client
-from app.redis.stream_client import RedisStreamClient, get_redis_stream_client
+from app.redis.state_client import get_redis_state_client
+from app.redis.stream_client import get_redis_stream_client
 
 logger = get_logger(__name__)
 
 router = APIRouter()
 
-# The HK Stock List cache and the layer Tasks don't exist yet, so these report their
-# honest failure state rather than a fabricated "ok".
-_HK_STOCK_LIST_STATUS = HKStockListStatus.NOT_READY
+# The layer Tasks don't exist yet, so they report their honest failure state rather than a
+# fabricated "ok".
 _LAYER_STATUS = LayerStatus(
     entity_analysis=ComponentStatus.ERROR,
     aggregation=ComponentStatus.ERROR,
@@ -113,25 +113,24 @@ def _overall_status(
     response_model=HealthResponse,
     responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": HealthResponse}},
 )
-async def get_health(
-    response: Response,
-    config: Annotated[AppConfig, Depends(get_config)],
-    db: Annotated[DatabaseClient, Depends(get_db_client)],
-    redis_stream: Annotated[RedisStreamClient, Depends(get_redis_stream_client)],
-    redis_state: Annotated[RedisStateClient, Depends(get_redis_state_client)],
-) -> HealthResponse:
-    timeout_s = config.health.check_timeout_s
+async def get_health(response: Response) -> HealthResponse:
+    """response is FastAPI's injected Response, used only to set the 503 status code."""
+    timeout_s = get_config().health.check_timeout_s
     database_status, redis_stream_status, redis_state_status = await asyncio.gather(
-        _check("database", db.fetch_one("SELECT 1"), timeout_s),
-        _check("redis_stream", redis_stream.ping(), timeout_s),
-        _check("redis_state", redis_state.ping(), timeout_s),
+        _check("database", get_db_client().fetch_one("SELECT 1"), timeout_s),
+        _check("redis_stream", get_redis_stream_client().ping(), timeout_s),
+        _check("redis_state", get_redis_state_client().ping(), timeout_s),
+    )
+
+    hk_stock_list_status = (
+        HKStockListStatus.OK if len(get_hk_stock_list_cache()) > 0 else HKStockListStatus.NOT_READY
     )
 
     overall = _overall_status(
         database_status,
         redis_stream_status,
         redis_state_status,
-        _HK_STOCK_LIST_STATUS,
+        hk_stock_list_status,
         _LAYER_STATUS,
     )
     if overall is HealthStatus.UNHEALTHY:
@@ -142,6 +141,6 @@ async def get_health(
         database=database_status,
         redis_stream=redis_stream_status,
         redis_state=redis_state_status,
-        hk_stock_list=_HK_STOCK_LIST_STATUS,
+        hk_stock_list=hk_stock_list_status,
         layers=_LAYER_STATUS,
     )
