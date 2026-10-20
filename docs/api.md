@@ -67,8 +67,9 @@ Applicable across all services. Use `COMMON` prefix.
 | `COMMON-4004` | 404 | Resource not found |
 | `COMMON-4005` | 405 | Method not allowed |
 | `COMMON-5000` | 500 | Internal server error — unexpected condition |
-| `COMMON-5001` | 503 | Service unavailable — dependency unreachable (DB or Redis) |
-| `COMMON-5002` | 503 | Service unavailable — upstream service unreachable |
+| `COMMON-5001` | 503 | Service unavailable — tools or services this service controls (e.g. its DB or Redis) unreachable, or not initialized yet |
+| `COMMON-5002` | 503 | Service unavailable — third-party tools or outside services unavailable |
+| `COMMON-6000` | 500 | Structured or unstructured content cannot be parsed |
 
 ### 1.4 Validation Error Detail
 
@@ -481,7 +482,7 @@ Triggers a synchronous refresh of the HK Stock List cache used by `lookup_stock`
 | Error Code | HTTP Status | Trigger |
 |---|---|---|
 | `COMMON-5002` | 503 | HKEXnews JSON endpoints or the official "List of Securities" download unreachable/timed out/erroring — a resource/availability issue; existing cache left untouched |
-| `SAPI-5002` | 500 | Fetch succeeded, but the response could not be parsed into the expected shape (HKEXnews changed its schema, or a SAPI-side parsing bug) — a code issue, not an availability one; existing cache left untouched |
+| `COMMON-6000` | 500 | Fetch succeeded, but the response could not be parsed into the expected shape, or yielded zero equities (HKEX changed its files, or a SAPI-side parsing bug) — a code issue, not an availability one; existing cache left untouched |
 
 ---
 
@@ -607,7 +608,6 @@ No service-specific error codes defined in MVP.
 | Error Code | HTTP Status | Description |
 |---|---|---|
 | `SAPI-5001` | 503 | Morning Brief cache unavailable — pipeline has not completed a successful run |
-| `SAPI-5002` | 500 | HK Stock List response fetched but could not be parsed into the expected shape — a code/schema issue, not an availability one (see `COMMON-5002` for the resource-issue case) |
 
 ### ADMIN Error Codes
 
@@ -622,8 +622,9 @@ No service-specific error codes defined in MVP.
 | `COMMON-4004` | 404 | Resource not found |
 | `COMMON-4005` | 405 | Method not allowed |
 | `COMMON-5000` | 500 | Internal server error |
-| `COMMON-5001` | 503 | Service unavailable — DB or Redis unreachable |
-| `COMMON-5002` | 503 | Service unavailable — upstream service unreachable |
+| `COMMON-5001` | 503 | Service unavailable — tools or services this service controls unreachable, or not initialized yet |
+| `COMMON-5002` | 503 | Service unavailable — third-party tools or outside services unavailable |
+| `COMMON-6000` | 500 | Content cannot be parsed |
 
 ---
 

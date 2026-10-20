@@ -297,8 +297,8 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `run_supervised()`, so a restart never races a leftover sibling loop)
 **Scope:** Auto-restart the Entity Analysis layer's Task when it crashes, and report its real liveness in `GET /v1/health` (impl.md §16 Coroutine Monitoring, §15.2, §15.6; design.md §12.1).
-- `app/main.py`: `_make_monitored()` with its `done_callback` (CRITICAL `layer_task_crashed`, then restart), `layer_tasks` on `app.state`, and cancel-and-gather of every layer Task at shutdown (§16). Only `"entity_analysis"` is registered; each later layer adds its own line.
-- `app/api/dependencies.py`: `get_layer_tasks` (§15.6).
+- `app/main.py`: `_make_monitored()` with its `done_callback` (CRITICAL `layer_task_crashed`, then restart), `register_layer_tasks(layer_tasks)`, and cancel-and-gather of every layer Task at shutdown (§16). Only `"entity_analysis"` is registered; each later layer adds its own line.
+- `app/layer_tasks.py`: `register_layer_tasks()`/`get_layer_tasks()` (§15.6).
 - `app/api/routes/health.py`: `layers.entity_analysis` reflects whether its Task is running; `degraded` is derived per §15.2. The other three `layers.*` fields stay hardcoded to their failure state until their layers exist.
 **Acceptance criteria** (per impl.md §15.2/§16; api.md §3.2):
 - A crash in `CleanedNewsConsumer.start()` logs `layer_task_crashed` at CRITICAL and starts a new Task on the same consumer instance.
@@ -863,7 +863,7 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** Cache: Recency & Merge (for `CacheRecord`); Cache: Versioned Cache Store (for `CacheStore`); Cache: Build Cache from Scores (for `CacheReader`)
 **Scope:** Serve the Morning Brief from the current cache version, as built — no re-scoring per request (impl.md §15.3, §15.4, §3.5; api.md §3.3; design.md §6.3, §7).
 - `app/config.py`: `CacheConfig.top_k_default`.
-- `app/api/schemas.py`: `MorningBriefQuery`, `SourceListEntry`, `EventDetail`, `RuleScoreDetail`, `LLMScoreDetail`, `ScoreDetail`, `ScoredEventRecord`, `MorningBriefResponse` (§3.5).
+- `app/api/schemas.py`: `SourceListEntry`, `EventDetail`, `RuleScoreDetail`, `LLMScoreDetail`, `ScoreDetail`, `ScoredEventRecord`, `MorningBriefResponse` (§3.5).
 - `app/common/errors.py`: `MorningBriefCacheUnavailableError` (`SAPI-5001`), and the `COMMON-4000`/`COMMON-4001`/`COMMON-5000` codes the exception handlers return (§15.1, §15.4).
 - `app/main.py`: exception handlers for `RequestValidationError` (400, `COMMON-4000`/`4001`), `MorningBriefCacheUnavailableError` (503) and the general `Exception` catch-all (500 `COMMON-5000`) (§15.1).
 - `app/api/routes/morning_brief.py`: `get_morning_brief()` (§15.3), reading records through `CacheReader.get_records()`.

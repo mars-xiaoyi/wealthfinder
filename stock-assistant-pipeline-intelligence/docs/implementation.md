@@ -133,7 +133,6 @@ sapi/
 │   │   │   ├── hk_stock_list_sync.py # POST /v1/admin/hk-stock-list-sync (delegates to common/hk_stock_list.py)
 │   │   │   └── morning_brief_refresh.py # POST /v1/admin/morning-brief-refresh — daily cache refresh, called by Admin (§15.7)
 │   │   ├── schemas.py                   # Pydantic request/response schemas
-│   │   ├── dependencies.py              # FastAPI Depends() helper: get_layer_tasks only — every infra getter is Depends()-compatible directly from its owning module
 │   │   └── main.py                      # FastAPI app factory
 │   ├── llm/
 │   │   ├── adapter.py                   # LLMAdapter ABC; standard data structures
@@ -164,12 +163,14 @@ sapi/
 │   │   └── event_entity_map.py          # EventEntityMap dataclass
 │   ├── common/
 │   │   ├── error_codes.py               # Every error code string, as commented constants (§15.1)
-│   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ...
+│   │   ├── error_categories.py          # ErrorCategory — the part of SAPI an error was raised from (§15.1)
+│   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ParseError / ...
 │   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2)
 │   │   ├── stock.py                     # Stock dataclass — cross-module shape shared by lookup_stock.py, hk_stock_list.py's HKStockListCache, and EntityAnalysisSkill (§4.2)
 │   │   ├── lookup_stock.py              # lookup_stock tool: exact code + fuzzy name matching, both against the in-process HKStockListCache (§4.2)
 │   │   ├── hk_stock_list.py          # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; startup load + sync handler, no Redis (§4.2.1)
 │   │   └── supervised.py                # run_supervised() — leak-free concurrent-coroutine supervision, used by every layer's start() (§6.1)
+│   ├── layer_tasks.py                   # register_layer_tasks()/get_layer_tasks() — the four layer Tasks, for GET /health's liveness check (§15.6)
 │   ├── logger.py                        # Unified system logger; structlog; stdout JSON output (§4.3)
 │   ├── config.py                        # App config: env var loading
 │   └── main.py                          # Service entry point (lifespan): eager HK Stock List load; 4 layer Tasks + done_callback monitoring
@@ -355,10 +356,6 @@ class HealthResponse(BaseModel):
     layers: LayerStatus
 
 # ── GET /v1/morning-brief ──────────────────────────────────────────────────────
-
-class MorningBriefQuery(BaseModel):
-    stocks: str = Field(..., min_length=1)      # comma-separated, split by the route handler
-    k: Optional[int] = Field(default=None, ge=1, le=50)   # omitted → CacheConfig.top_k_default (TOP_K_DEFAULT), applied by the route (§15.3)
 
 class SourceListEntry(BaseModel):
     source_name: str
@@ -654,7 +651,7 @@ _http_client: Optional[httpx.AsyncClient] = None
 
 def get_http_client() -> httpx.AsyncClient:
     if _http_client is None:
-        raise ServiceUnavailableError("http client is not initialized")
+        raise ServiceUnavailableError("http client is not initialized", category=ErrorCategory.COMMON)
     return _http_client
 
 def create_http_client(timeout_s: int) -> httpx.AsyncClient:
@@ -684,7 +681,10 @@ _hk_stock_list_cache: Optional[HKStockListCache] = None
 
 def get_hk_stock_list_cache() -> HKStockListCache:
     if _hk_stock_list_cache is None:
-        raise ServiceUnavailableError("get_hk_stock_list_cache() called before refresh_hk_stock_list() initialized it")
+        raise ServiceUnavailableError(
+            "get_hk_stock_list_cache() called before refresh_hk_stock_list() initialized it",
+            category=ErrorCategory.STOCK_LIST,
+        )
     return _hk_stock_list_cache
 ```
 
@@ -763,65 +763,119 @@ def lookup_stock(name_or_code, min_overlap_ratio) -> Optional[Stock]:
 
 `name_or_code` in the log line identifies which entity triggered a slow call. `logger` is the shared structlog logger (`app/logger.py`).
 
-#### Exception: `ParseError`
+#### Sources
 
 ```python
-class ParseError(SAPIError):
-    """Fetch succeeded but the response couldn't be parsed: a code/schema issue, not availability.
-    Another parsing domain reuses it by passing its own error_code (§15.1)."""
-    error_type = ErrorType.PARSE
-    error_code = error_codes.HK_STOCK_LIST_PARSE_ERROR
-    message = "Upstream response could not be parsed"
+_ACTIVESTOCK_EN_URL = "https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json"
+_ACTIVESTOCK_ZH_URL = "https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_c.json"
+_LIST_OF_SECURITIES_URL = (
+    "https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx"
+)
 ```
 
-Lives in `app/common/hk_stock_list.py` next to its one raise site; `ServiceUnavailableError`/`NotFoundError` stay in `app/common/errors.py` because many modules raise them.
+Parsing the spreadsheet needs `openpyxl` (runtime dependency, alongside `httpx`).
+
+#### Parsing — `_parse_hk_stock_list(en_content, zh_content, securities_content) -> dict[str, Stock]`
+
+Synchronous and side-effect free; `_fetch_and_filter_hk_stock_list()` (below) runs it in `asyncio.to_thread` (~0.4 s of CPU, which would otherwise block the event loop every layer and route shares, §16).
+
+```python
+_STOCK_CODE_HEADER = "Stock Code"
+_CATEGORY_HEADER = "Category"
+_EQUITY_CATEGORY = "Equity"
+
+def _parse_names(content: bytes) -> dict[str, str]:
+    """{stock_code: name} from one activestock JSON file."""
+    return {entry["c"]: entry["n"] for entry in json.loads(content)}
+
+def _parse_equity_codes(content: bytes) -> set[str]:
+    workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+    try:
+        sheet = workbook.worksheets[0]
+        sheet.reset_dimensions()   # read-only mode trusts the file's recorded size, which HKEX's
+                                   # file understates: without this, only ~8 of ~17,300 rows come back
+        rows = sheet.iter_rows(values_only=True)
+        for row in rows:           # title rows come first; columns are located by header name
+            if _STOCK_CODE_HEADER in row and _CATEGORY_HEADER in row:
+                code_col = row.index(_STOCK_CODE_HEADER)
+                category_col = row.index(_CATEGORY_HEADER)
+                break
+        else:
+            raise ParseError("List of Securities header row not found", category=ErrorCategory.STOCK_LIST)
+        return {str(row[code_col]) for row in rows if row[category_col] == _EQUITY_CATEGORY}
+    finally:
+        workbook.close()
+
+def _parse_hk_stock_list(en_content: bytes, zh_content: bytes, securities_content: bytes) -> dict[str, Stock]:
+    """Join the two name files by stock code; keep equities only."""
+    en_names = _parse_names(en_content)
+    zh_names = _parse_names(zh_content)
+    entries: dict[str, Stock] = {}
+    for code in _parse_equity_codes(securities_content):
+        if code not in en_names and code not in zh_names:
+            continue                                       # an equity in neither file is skipped
+        entries[code] = Stock(
+            stock_code=code, exchange="HKEX",
+            company_name_zh=zh_names.get(code, ""),        # a name missing from one file is ""
+            company_name_en=en_names.get(code, ""),
+        )
+    return entries
+```
 
 #### Function: `_fetch_and_filter_hk_stock_list(http_client: httpx.AsyncClient) -> dict[str, Stock]`
 
 ```
-Purpose : Fetch HKEXnews's bilingual JSON endpoints (system-design.md §9.2.1), match entries by
-          stock code across both files, filter to Category=Equity via the official "List of
-          Securities" download, and return {native_code: Stock(...)}.
-Sources : https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json
-          https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_c.json
-Raises  : Every failure is translated into one of two exceptions:
+Purpose : Fetch the three sources above and return {native_code: Stock(...)} for equities only.
+Raises  : Every failure is translated into one of two exceptions, both category=STOCK_LIST:
             - ServiceUnavailableError (COMMON-5002, HTTP 503): any httpx.HTTPError
-              (HKEXnews unreachable, slow, or non-2xx).
-            - ParseError (SAPI-5002, HTTP 500): any exception while parsing a successful
-              response (schema change, mismatched bilingual files, changed "List of
-              Securities" format). Deliberately `except Exception`.
+              (HKEX unreachable, slow, or non-2xx), after _get()'s connection retries.
+            - ParseError (COMMON-6000, HTTP 500): any exception while parsing a successful
+              response (schema change, changed "List of Securities" format). Deliberately
+              `except Exception`.
 ```
 
-Private; pure fetch+filter with no cache side effects, so it is testable with a mock `http_client`. `refresh_hk_stock_list()` (below) is its only caller.
+Private; pure fetch+filter with no cache side effects, so it is testable with a mock `http_client`. `refresh_hk_stock_list()` (below) is its only caller. Each GET goes through `_get()`, which retries a failed connection (rationale: system-design.md §9.2.1):
 
 ```python
+_CONNECT_RETRY_WAITS_S = (1, 2)   # one wait before each retry: 3 attempts in all
+
+async def _get(http_client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """Retries httpx.ConnectError only. A timeout or non-2xx is raised at once: retrying a slow
+    HKEX would multiply HTTP_TIMEOUT_S."""
+    for attempt, wait_s in enumerate(_CONNECT_RETRY_WAITS_S, start=1):
+        try:
+            return await http_client.get(url)
+        except httpx.ConnectError:
+            logger.warning("hkex_connect_retry", url=url, attempt=attempt, wait_s=wait_s)
+            await asyncio.sleep(wait_s)
+    return await http_client.get(url)
+
 async def _fetch_and_filter_hk_stock_list(http_client: httpx.AsyncClient) -> dict[str, Stock]:
     try:
-        en_resp = await http_client.get(_ACTIVESTOCK_EN_URL)
+        en_resp = await _get(http_client, _ACTIVESTOCK_EN_URL)
         en_resp.raise_for_status()
-        zh_resp = await http_client.get(_ACTIVESTOCK_ZH_URL)
+        zh_resp = await _get(http_client, _ACTIVESTOCK_ZH_URL)
         zh_resp.raise_for_status()
-        securities_resp = await http_client.get(_LIST_OF_SECURITIES_URL)
+        securities_resp = await _get(http_client, _LIST_OF_SECURITIES_URL)
         securities_resp.raise_for_status()
     except httpx.HTTPError as exc:
-        # Resource issue: HKEXnews unreachable/erroring. COMMON-5002 (upstream unreachable), not the
-        # COMMON-5001 default (§15.1).
-        raise ServiceUnavailableError(
-            "HKEXnews unreachable", error_type=ErrorType.NETWORK, error_code=error_codes.UPSTREAM_UNAVAILABLE,
-            message="Upstream unavailable",
+        # Resource issue: COMMON-5002 (upstream unreachable), not the COMMON-5001 default (§15.1).
+        raise ServiceUnavailableError.upstream_unavailable(
+            f"HKEXnews unreachable: {exc!r}", category=ErrorCategory.STOCK_LIST
         ) from exc
 
     try:
-        en_entries, zh_entries = en_resp.json(), zh_resp.json()
-        equity_codes = _parse_equity_codes(securities_resp)   # Category == "Equity" only
-        # ... match en_entries/zh_entries index-for-index by "c", filter to
-        # equity_codes, build the {native_code: Stock(...)} result ...
+        return await asyncio.to_thread(
+            _parse_hk_stock_list, en_resp.content, zh_resp.content, securities_resp.content
+        )
+    except ParseError:
+        raise                       # already translated (header row not found)
     except Exception as exc:
         # Code issue: fetch succeeded but the response shape was wrong. Deliberately `except Exception`:
         # nothing escapes untranslated.
-        raise ParseError(f"HK Stock List response shape mismatch: {exc}") from exc
-
-    return result
+        raise ParseError(
+            f"HK Stock List response shape mismatch: {exc!r}", category=ErrorCategory.STOCK_LIST
+        ) from exc
 ```
 
 #### Function: `refresh_hk_stock_list() -> int`
@@ -835,10 +889,14 @@ Purpose : Fetch the HK Stock List from HKEXnews and load it into the process-wid
 On fetch failure : Any exception installs an empty HKStockListCache({}) if none is registered
           yet, then re-raises, so get_hk_stock_list_cache() stays usable and GET /health
           reports not_ready until a later call succeeds. An existing cache is left untouched.
-Raises  : Whichever exception _fetch_and_filter_hk_stock_list() raised (§4.2). app/main.py's
-          startup logs hk_stock_list_startup_load_failed and continues (§16); the sync route
-          lets it propagate as HTTP 503 COMMON-5002 or HTTP 500 SAPI-5002 (§15.1). While the
-          cache is empty, CleanedNewsConsumer holds messages unACKed (§11.2/§11.4).
+          A fetch that yields zero equities is a failure too (ParseError): HKEX always lists
+          equities, so zero means a changed cell value (e.g. a renamed category), and loading
+          it would wipe a loaded cache.
+Raises  : Whichever exception _fetch_and_filter_hk_stock_list() raised (§4.2), or the
+          zero-equities ParseError. app/main.py's startup logs hk_stock_list_startup_load_failed
+          and continues (§16); the sync route lets it propagate as HTTP 503 COMMON-5002 or
+          HTTP 500 COMMON-6000 (§15.1). While the cache is empty, CleanedNewsConsumer holds
+          messages unACKed (§11.2/§11.4).
 Returns : entries_loaded count (len(new_entries)) on success.
 ```
 
@@ -847,6 +905,8 @@ async def refresh_hk_stock_list() -> int:
     global _hk_stock_list_cache
     try:
         new_entries = await _fetch_and_filter_hk_stock_list(get_http_client())
+        if not new_entries:
+            raise ParseError("HK Stock List parsed to zero equities", category=ErrorCategory.STOCK_LIST)
         if _hk_stock_list_cache is None:
             _hk_stock_list_cache = HKStockListCache(new_entries)
         else:
@@ -887,6 +947,10 @@ Purpose : Return a logger bound with `module=<name>`; callers pass their own __n
 ```
 
 Call sites log an event name plus keyword fields, e.g. `logger.warning("health_check_failed", component="database", exc_info=True)`.
+
+#### Processor: `add_sapi_error_fields(logger, method_name, event_dict) -> EventDict`
+
+Runs in `configure_logging()`'s chain just before `dict_tracebacks` (which replaces `exc_info`). When a record's `exc_info` is a `SAPIError` (§15.1) — given as `True` (the exception being handled), the exception itself, or a `sys.exc_info()` tuple — it adds the error's `category` and `error_code` to the record, so every exception-logging call carries them without the call site passing them. Any other exception is logged unchanged.
 
 ---
 
@@ -929,7 +993,7 @@ def get_db_client() -> DatabaseClient:
     return _db_client
 ```
 
-Used directly — `from app.db.connection import get_db_client` — by any module that needs DB access, including as a FastAPI route dependency (`Depends(get_db_client)`, §15.6): the function takes no arguments, so it's usable both ways with no wrapper needed.
+Used directly — `from app.db.connection import get_db_client` — by any module that needs DB access, routes included (§5.4).
 
 ---
 
@@ -1094,24 +1158,18 @@ Both subclass `SAPIError` (§15.1) so a catch-all `except Exception` can't swall
 
 `ServiceUnavailableError` lives in `app/common/errors.py` (§15.1) because it is also raised outside the DB layer; every infra `get_X()` reuses it (§5.1).
 
-### 5.4 Dependency injection in routes
+### 5.4 Infra access in routes
 
-No `app/api/dependencies.py` wrapper needed for this — `get_db_client()` (above) takes no arguments, so it's directly usable as a FastAPI route dependency:
-
-Routes declare every dependency as `Annotated[T, Depends(...)]`, never as a `= Depends(...)` default.
+Routes call each owning module's no-argument `get_X()` in the handler body; infra is never a handler parameter or a `Depends()` target. Handler parameters are only request inputs (path/query parameters, body) and, where a route sets its own status code, FastAPI's `response: Response`.
 
 ```python
-from typing import Annotated
-from fastapi import Depends
-from app.db.connection import get_db_client, DatabaseClient
+from app.db.connection import get_db_client
 
-async def get_cleaned_news(cleaned_id: UUID, db: Annotated[DatabaseClient, Depends(get_db_client)]):
-    row = await db.fetch_one("SELECT ... WHERE cleaned_id = $1", cleaned_id)
+async def get_cleaned_news(cleaned_id: UUID):
+    row = await get_db_client().fetch_one("SELECT ... WHERE cleaned_id = $1", cleaned_id)
 ```
 
-Every infra getter doubles as its own route dependency (§15.6).
-
-> `Depends(get_db_client)` rather than a plain call buys `app.dependency_overrides` in tests.
+Unit tests replace a getter by monkeypatching it on the route's module.
 
 ---
 
@@ -4907,18 +4965,31 @@ Every error code SAPI returns, as one commented constant each, in `docs/api.md` 
 
 ```python
 INTERNAL_ERROR = "COMMON-5000"             # Unexpected failure inside SAPI
-SERVICE_UNAVAILABLE = "COMMON-5001"        # Database or Redis unreachable, or not initialized yet
-UPSTREAM_UNAVAILABLE = "COMMON-5002"       # SADI, Admin or HKEXnews unreachable
+SERVICE_UNAVAILABLE = "COMMON-5001"        # SAPI-controlled tools or services unreachable, or not initialized yet
+UPSTREAM_UNAVAILABLE = "COMMON-5002"       # Third-party tools or outside services unavailable
+PARSE_ERROR = "COMMON-6000"                # Structured or unstructured content cannot be parsed
 MALFORMED_REQUEST = "COMMON-4000"          # Request body is not valid JSON
 VALIDATION_FAILED = "COMMON-4001"          # Request fields failed validation
 NOT_FOUND = "COMMON-4004"                  # Requested resource does not exist
 CACHE_UNAVAILABLE = "SAPI-5001"            # Morning Brief cache has no current version
-HK_STOCK_LIST_PARSE_ERROR = "SAPI-5002"    # HKEXnews responded, but the response could not be parsed
+```
+
+#### `app/common/error_categories.py` — Error Categories
+
+The part of SAPI an error was raised from. Every raise site sets one, by where the raising code lives: anything under `app/common/` uses `COMMON`, except the HK Stock List (§4.2), which has its own; other packages use their own member (`app/config.py` → `CONFIG`, `app/db/` → `DB`, `app/redis/` → `REDIS`). Each ticket adds the members it first uses. Raise-site samples elsewhere in this doc leave `category` out; every real raise site passes one.
+
+```python
+class ErrorCategory(StrEnum):
+    COMMON = "COMMON"
+    CONFIG = "CONFIG"
+    DB = "DB"
+    REDIS = "REDIS"
+    STOCK_LIST = "STOCK_LIST"
 ```
 
 #### `app/common/errors.py` — Errors
 
-Every error SAPI raises is a `SAPIError` with five fields. `error_type`, `error_code` (one of the constants above), `message` (short public summary) and `log_level` have per-class defaults; `dev_message` (technical description of this occurrence) is given at every raise site, which may also override any default for that occurrence, as §4.2's unreachable-HKEXnews case does.
+Every error SAPI raises is a `SAPIError` with six fields. `error_type`, `error_code` (one of the constants above), `message` (short public summary) and `log_level` have per-class defaults; `dev_message` (technical description of this occurrence) and `category` (above) are given at every raise site, which may also override any default for that occurrence. `category` and `error_code` are added to the log record whenever a `SAPIError` is logged (§4.3).
 
 ```python
 import logging
@@ -4927,24 +4998,24 @@ from enum import StrEnum
 class ErrorType(StrEnum):
     """Failure category of an error."""
     REQUEST = "REQUEST"
-    INTERNAL = "INTERNAL"
+    GENERAL = "GENERAL"
     STORAGE = "STORAGE"
-    NETWORK = "NETWORK"
     PARSE = "PARSE"
 
 class SAPIError(Exception):
     """Base for every error SAPI raises, so a catch-all `except Exception` (§11.2/§13.2, the
     general handler below) never mistakes one for an unanticipated bug."""
-    error_type: ErrorType = ErrorType.INTERNAL
+    error_type: ErrorType = ErrorType.GENERAL
     error_code: str = error_codes.INTERNAL_ERROR
     message: str = "Internal server error"
     log_level: int = logging.ERROR
 
-    def __init__(self, dev_message: str, *, error_type: ErrorType | None = None,
-                 error_code: str | None = None, message: str | None = None,
-                 log_level: int | None = None):
+    def __init__(self, dev_message: str, *, category: ErrorCategory,
+                 error_type: ErrorType | None = None, error_code: str | None = None,
+                 message: str | None = None, log_level: int | None = None):
         super().__init__(dev_message)
         self.dev_message = dev_message
+        self.category = category
         # each override given replaces the class default for this occurrence only
 
 class NotFoundError(SAPIError):
@@ -4956,9 +5027,20 @@ class NotFoundError(SAPIError):
 class ServiceUnavailableError(SAPIError):
     """Used by every get_X() accessor's "called before create_X()" case (§5.1) and an
     unreachable DB/Redis (§5.2). An unreachable upstream (SADI/Admin/HKEXnews, e.g. §4.2)
-    overrides error_type=NETWORK, error_code=error_codes.UPSTREAM_UNAVAILABLE."""
+    is built with upstream_unavailable()."""
     error_code = error_codes.SERVICE_UNAVAILABLE
     message = "Service unavailable"
+
+    @classmethod
+    def upstream_unavailable(cls, dev_message: str, *, category: ErrorCategory) -> Self:
+        return cls(dev_message, category=category, error_code=error_codes.UPSTREAM_UNAVAILABLE)
+
+class ParseError(SAPIError):
+    """Structured or unstructured content couldn't be parsed: a code/schema issue, not an
+    availability one."""
+    error_type = ErrorType.PARSE
+    error_code = error_codes.PARSE_ERROR
+    message = "Content could not be parsed"
 ```
 
 **Exception handlers** follow SADI's pattern (`stock-assistant-data-ingestion/docs/implementation.md` §7.1): each reads `exc.error_code`/`.message`/`.dev_message`/`.log_level` off the exception, except `RequestValidationError` (third-party) and the general `Exception` catch-all.
@@ -4967,16 +5049,18 @@ class ServiceUnavailableError(SAPIError):
 |---|---|
 | `RequestValidationError` (Pydantic) | HTTP 400; field failure → `COMMON-4001` with `detail.errors`; malformed JSON (`type == "json_invalid"`) → `COMMON-4000` |
 | `NotFoundError` | HTTP 404, `COMMON-4004` |
-| `ServiceUnavailableError` | HTTP 503, `exc.error_code` — `COMMON-5001` by default, `COMMON-5002` where §4.2 overrides it |
+| `ServiceUnavailableError` | HTTP 503, `exc.error_code` — `COMMON-5001` by default, `COMMON-5002` from `upstream_unavailable()` |
 | `MorningBriefCacheUnavailableError` | HTTP 503, `SAPI-5001` (§15.3 below) |
-| `ParseError` | HTTP 500, `SAPI-5002` (§4.2 — HKEXnews response fetched ok but couldn't be parsed; a code/schema issue, not an availability one, so it gets its own code rather than folding into `COMMON-5000` below) |
+| `ParseError` | HTTP 500, `COMMON-6000` (e.g. §4.2's HK Stock List; a code/schema issue, not an availability one, so it gets its own code rather than folding into `COMMON-5000` below) |
 | General `Exception` | HTTP 500, `COMMON-5000` |
 
 See SADI's implementation doc §8.5b and §7.1 for the full `message`/`detail` usage rule and logging-exactly-once policy, both of which apply here unchanged (SAPI has no authentication in MVP either, and is only ever called by other internal MWP services).
 
 ### 15.2 `app/api/routes/health.py` — `GET /v1/health`
 
-#### Handler: `get_health() -> HealthResponse`
+#### Handler: `get_health(response: Response) -> HealthResponse`
+
+`response` is FastAPI's injected `Response`, used only to set the 503 status code (§5.4).
 
 ```
 Purpose : Check DB, both Redis connections, HK Stock List readiness, and
@@ -4996,13 +5080,10 @@ redis_state  = ok  if RedisStateClient.ping() (§6.2) succeeds, else error
     retrieves its result so asyncio never reports it as unhandled. A timeout or any
     exception → that field = error, logged at WARNING. Worst-case latency is one
     timeout, not three (system-design.md §7.1).
-hk_stock_list = ok if len(hk_stock_list_cache) > 0, else not_ready   # §4.2 — in-process, no
-    Redis; hk_stock_list_cache injected via Depends(get_hk_stock_list_cache),
-    imported directly from app.common.hk_stock_list (§4.2), not §15.6
+hk_stock_list = ok if len(get_hk_stock_list_cache()) > 0, else not_ready   # §4.2 — in-process,
+    no Redis
 layers.{entity_analysis,aggregation,scoring,cache} = ok if the corresponding asyncio.Task
-    is still running (not done()), else error — Task liveness is read from
-    app.state (via Depends(get_layer_tasks), never app.state directly per the
-    same routes-never-touch-app.state-directly rule as SADI, §15.5 below)
+    from get_layer_tasks() (§15.6) is still running (not done()), else error
 
 status = unhealthy (HTTP 503) if database=error OR any redis=error OR hk_stock_list=not_ready
 status = degraded  (HTTP 200) if any layers.*=error (database/Redis/HK-Stock-List are all fine,
@@ -5014,9 +5095,9 @@ status = healthy   (HTTP 200) otherwise
 
 ### 15.3 `app/api/routes/morning_brief.py` — `GET /v1/morning-brief`
 
-#### Handler: `get_morning_brief(query: Annotated[MorningBriefQuery, Depends()], cache_store: Annotated[CacheStore, Depends(get_cache_store)], cache_reader: Annotated[CacheReader, Depends(get_cache_reader)]) -> MorningBriefResponse`
+#### Handler: `get_morning_brief(stocks: Annotated[str, Query(min_length=1)], k: Annotated[int | None, Query(ge=1, le=50)] = None) -> MorningBriefResponse`
 
-`get_cache_store` is `app.persistent.cache_store.get_cache_store` (§10.4) and `get_cache_reader` is `app.cache.cache_reader.get_cache_reader` (§14.8), both imported directly.
+`stocks` is comma-separated, split by the handler; an omitted `k` means `CacheConfig.top_k_default` (TOP_K_DEFAULT). The handler reads infra through `get_cache_store()` (§10.4) and `get_cache_reader()` (§14.8), per §5.4.
 
 ```
 Purpose : Serve the current Morning Brief cache, filtered/ranked per stocks
@@ -5031,8 +5112,10 @@ Errors  : HTTP 400 COMMON-4001 on validation (stocks empty, k out of [1,50])
 ```python
 _MAX_POINTER_READS = 3   # a build replacing the version mid-read twice in a row is already unlikely
 
-async def get_morning_brief(stocks: str, k: Optional[int], cache_store: CacheStore, cache_reader: CacheReader) -> MorningBriefResponse:
+async def get_morning_brief(stocks: str, k: int | None = None) -> MorningBriefResponse:
     config = get_config().cache   # §4.1
+    cache_store = get_cache_store()
+    cache_reader = get_cache_reader()
     k = k if k is not None else config.top_k_default
 
     # The pointer and the version data are two reads; a build can commit between them,
@@ -5087,37 +5170,42 @@ class MorningBriefCacheUnavailableError(SAPIError):
 ```
 Purpose : Synchronously call §4.2's refresh_hk_stock_list() and return entries_loaded
           (api.md §3.4). It takes no arguments and reaches its own http_client/cache via
-          get_http_client()/get_hk_stock_list_cache(), so this handler needs no Depends(). It
+          get_http_client()/get_hk_stock_list_cache(), so this handler takes no parameters. It
           is the same function app/main.py's startup calls (§16).
 Returns : HTTP 200 HKStockListSyncResponse
 Errors  : HTTP 503 COMMON-5002 (ServiceUnavailableError) if HKEXnews is unreachable;
-          HTTP 500 SAPI-5002 (ParseError) if its response shape didn't match (§4.2,
+          HTTP 500 COMMON-6000 (ParseError) if its response shape didn't match (§4.2,
           §15.1). The existing cache is untouched on either.
 ```
 
-### 15.6 `app/api/dependencies.py`
+### 15.6 `app/layer_tasks.py`
 
-Every infra resource has a no-argument `get_X()` in its owning module (§5.1, §6.1, §6.2, §10.4, §4.2), which is already a valid `Depends()` target; routes import it directly (§15.3). This file holds only layer-Task liveness, which has no owning module: bookkeeping `main.py`'s lifespan creates and only `GET /health` reads.
+The four layer Tasks follow the same singleton-plus-getter pattern as every infra resource (§5.1): `main.py`'s lifespan registers them (§16), and `GET /health` reads them (§15.2).
 
 ```python
-from fastapi import Request
+_layer_tasks: Optional[dict[str, asyncio.Task]] = None
 
-def get_layer_tasks(request: Request) -> dict[str, asyncio.Task]:
-    """{"entity_analysis": ..., "aggregation": ..., "scoring": ..., "cache": ...} for GET /health's
-    liveness check (§15.2). app.state-based because the four Tasks are lifespan wiring; routes
-    never touch app.state directly (as in SADI)."""
-    return request.app.state.layer_tasks
+def register_layer_tasks(tasks: dict[str, asyncio.Task]) -> None:
+    """Register {"entity_analysis": ..., "aggregation": ..., "scoring": ..., "cache": ...}. main.py
+    passes the dict its monitor keeps updated, so an auto-restarted Task is visible here."""
+    global _layer_tasks
+    _layer_tasks = tasks
+
+def get_layer_tasks() -> dict[str, asyncio.Task]:
+    if _layer_tasks is None:
+        raise ServiceUnavailableError("layer tasks are not registered")
+    return _layer_tasks
 ```
 
 ---
 
 ### 15.7 `app/api/routes/morning_brief_refresh.py` — `POST /v1/admin/morning-brief-refresh`
 
-#### Handler: `post_morning_brief_refresh(cache_service: Annotated[CacheService, Depends(get_cache_service)]) -> MorningBriefRefreshResponse`
+#### Handler: `post_morning_brief_refresh() -> MorningBriefRefreshResponse`
 
 ```
 Purpose : The daily refresh (§14.9, api.md §3.5): version = await
-          cache_service.build_new_version([]) — waits its turn on the build lock, then
+          get_cache_service().build_new_version([]) — waits its turn on the build lock, then
           writes a new version with recency as of now. Synchronous, so Admin's job sees
           the real outcome.
 Returns : HTTP 200 MorningBriefRefreshResponse(status="success", cache_version=version)
@@ -5164,6 +5252,7 @@ from app.scoring.scoring_consumer import ScoringConsumer
 from app.persistent.cache_store import create_cache_store
 from app.cache.cache_service import create_cache_service
 from app.cache.cache_consumer import CacheConsumer
+from app.layer_tasks import register_layer_tasks
 from app.api.main import create_app
 
 configure_logging()   # §4.3
@@ -5234,8 +5323,7 @@ async def lifespan(app: FastAPI):
 
         cache_consumer = CacheConsumer(config.cache)
 
-        # app.state holds only layer_tasks (§15.6).
-        layer_tasks: dict[str, asyncio.Task] = {}
+        layer_tasks: dict[str, asyncio.Task] = {}   # registered below for GET /health (§15.6)
         shutting_down = False
 
         # Launch each layer as a monitored Task (system-design.md §12.1 Coroutine Monitoring). start() uses
@@ -5261,7 +5349,7 @@ async def lifespan(app: FastAPI):
         layer_tasks["aggregation"] = _make_monitored("aggregation", agg_consumer.start)
         layer_tasks["scoring"] = _make_monitored("scoring", scoring_consumer.start)
         layer_tasks["cache"] = _make_monitored("cache", cache_consumer.start)
-        app.state.layer_tasks = layer_tasks
+        register_layer_tasks(layer_tasks)
 
         async def _cancel_layer_tasks() -> None:
             nonlocal shutting_down
@@ -5280,7 +5368,7 @@ app.router.lifespan_context = lifespan
 
 > **Aggregation's final flush:** `AggregationConsumer.start()`'s `try/finally` (§12.2) flushes when the Task is cancelled; `_cancel_layer_tasks()` needs only `task.cancel()` + `gather()`.
 
-> **Routes** reach infra via each owning module's `get_X()` as a `Depends()` target (§5.4, §15.3), and never touch `app.state` directly except for `get_layer_tasks` (§15.6).
+> **Routes** reach infra by calling each owning module's `get_X()` in the handler body (§5.4).
 
 ---
 
