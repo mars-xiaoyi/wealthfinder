@@ -15,12 +15,14 @@ pytestmark = [pytest.mark.live, pytest.mark.timeout(120)]
 COMPONENTS = ("database", "redis_stream", "redis_state")
 REQUEST_TIMEOUT_S = 10
 
+# Everything up and the real HK Stock List loaded: degraded, because layers.* is still
+# hardcoded to error.
 ALL_UP_BODY = {
-    "status": "unhealthy",
+    "status": "degraded",
     "database": "ok",
     "redis_stream": "ok",
     "redis_state": "ok",
-    "hk_stock_list": "not_ready",
+    "hk_stock_list": "ok",
     "layers": {
         "entity_analysis": "error",
         "aggregation": "error",
@@ -37,7 +39,8 @@ async def _get_health(client: AsyncClient) -> tuple[httpx.Response, float]:
 
 
 def _body_with_errors(*failed: str) -> dict[str, object]:
-    return {**ALL_UP_BODY, **{component: "error" for component in failed}}
+    """A failed DB/Redis check makes the response unhealthy; the in-process list stays ok."""
+    return {**ALL_UP_BODY, "status": "unhealthy", **{component: "error" for component in failed}}
 
 
 def _failed_check_warnings(logs: list[MutableMapping[str, Any]]) -> list[str]:
@@ -53,7 +56,7 @@ async def get_health_all_up(start_app):
     async with start_app() as client:
         response, _ = await _get_health(client)
 
-    assert response.status_code == 503
+    assert response.status_code == 200
     HealthResponse.model_validate(response.json())
     assert response.json() == ALL_UP_BODY
 
@@ -87,7 +90,7 @@ async def get_health_dependency_down_then_recovered(infra, start_app, component,
         container.restore()
         response, _ = await _get_health(client)
 
-        assert response.status_code == 503
+        assert response.status_code == 200
         assert response.json() == ALL_UP_BODY
 
 
@@ -107,7 +110,7 @@ async def get_health_all_dependencies_unresponsive(infra, start_app):
         infra.restore_all()
         response, _ = await _get_health(client)
 
-        assert response.status_code == 503
+        assert response.status_code == 200
         assert response.json() == ALL_UP_BODY
 
 
@@ -123,6 +126,7 @@ async def get_health_repeated_db_timeouts(infra, start_app):
         infra.postgres.restore()
         response, elapsed = await _get_health(client)
 
+    assert response.status_code == 200
     assert response.json() == ALL_UP_BODY
     assert elapsed < 2
 
