@@ -2,6 +2,7 @@ import asyncio
 
 import asyncpg
 
+from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 from app.config import DatabaseConfig
 from app.db.errors import DatabaseError
@@ -39,9 +40,11 @@ class DatabaseClient:
             async with self._pool.acquire() as conn:
                 return await conn.fetchrow(query, *args)
         except _CONNECTION_ERRORS as exc:
-            raise ServiceUnavailableError("DB connection error during read") from exc
+            raise ServiceUnavailableError(
+                "DB connection error during read", category=ErrorCategory.DB
+            ) from exc
         except asyncpg.PostgresError as exc:
-            raise DatabaseError(str(exc)) from exc
+            raise DatabaseError(str(exc), category=ErrorCategory.DB) from exc
 
     async def close(self, timeout_s: float) -> None:
         """
@@ -65,7 +68,9 @@ def get_db_client() -> DatabaseClient:
     Raises ServiceUnavailableError if called before create_db_client() has run.
     """
     if _db_client is None:
-        raise ServiceUnavailableError("database client is not initialized")
+        raise ServiceUnavailableError(
+            "database client is not initialized", category=ErrorCategory.DB
+        )
     return _db_client
 
 

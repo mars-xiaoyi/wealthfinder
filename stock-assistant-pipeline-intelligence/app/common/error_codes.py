@@ -3,4 +3,8 @@
 errors.py files reference these instead of literals."""
 
 INTERNAL_ERROR = "COMMON-5000"  # Unexpected failure inside SAPI
-SERVICE_UNAVAILABLE = "COMMON-5001"  # Database or Redis unreachable, or not initialized yet
+SERVICE_UNAVAILABLE = (
+    "COMMON-5001"  # SAPI-controlled tools or services unreachable, or not initialized yet
+)
+UPSTREAM_UNAVAILABLE = "COMMON-5002"  # Third-party tools or outside services unavailable
+PARSE_ERROR = "COMMON-6000"  # Structured or unstructured content cannot be parsed
