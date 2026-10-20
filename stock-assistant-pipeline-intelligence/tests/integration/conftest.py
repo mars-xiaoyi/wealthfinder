@@ -6,8 +6,10 @@ docker CLI. Host ports are fixed per session (not Docker-assigned) so `docker st
 
 import contextlib
 import dataclasses
+import http.server
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -16,13 +18,18 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app import main
+from app.common import hk_stock_list
 
 POSTGRES_IMAGE = "postgres:16-alpine"
 REDIS_IMAGE = "redis:7-alpine"
 POSTGRES_PASSWORD = "password"
 READY_TIMEOUT_S = 30.0
-# Env vars with defaults in app/config.py; cleared so a developer's shell can't change them.
-OPTIONAL_ENV = ("DB_POOL_SIZE", "DB_CLOSE_TIMEOUT_S", "HEALTH_CHECK_TIMEOUT_S")
+# Every env var with a default in app/config.py; cleared so a developer's shell can't change
+# them. Keep in sync with app/config.py.
+OPTIONAL_ENV = ("DB_POOL_SIZE", "DB_CLOSE_TIMEOUT_S", "HTTP_TIMEOUT_S", "HEALTH_CHECK_TIMEOUT_S")
+HKEX_URL_CONSTANTS = ("_ACTIVESTOCK_EN_URL", "_ACTIVESTOCK_ZH_URL", "_LIST_OF_SECURITIES_URL")
+# Nothing listens on port 1, so a connection is refused at once.
+REFUSED_URL = "http://127.0.0.1:1"
 
 
 def _docker(*args: str) -> subprocess.CompletedProcess[str]:
@@ -162,13 +169,96 @@ def infra() -> Iterator[Infra]:
 
 @pytest.fixture(autouse=True)
 def app_env(infra: Infra, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Point app/config.py at the containers, and leave every container running after the test."""
+    """Point app/config.py at the containers, and leave every container running after the test.
+
+    Each test also starts with no HK Stock List registered, as a fresh process does; HKEX itself
+    is real unless a test points the URLs elsewhere (hkex_urls).
+    """
     for key in OPTIONAL_ENV:
         monkeypatch.delenv(key, raising=False)
     for key, value in infra.env().items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setattr(hk_stock_list, "_hk_stock_list_cache", None)
     yield
     infra.restore_all()
+
+
+@pytest.fixture
+def hkex_urls(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
+    """Point HKEX URLs elsewhere: hkex_urls(every=url) for all three, or per constant name
+    (e.g. _LIST_OF_SECURITIES_URL=url); the rest stay real."""
+
+    def point(every: str | None = None, **urls: str) -> None:
+        for name in HKEX_URL_CONSTANTS:
+            url = every if every is not None else urls.get(name)
+            if url is not None:
+                monkeypatch.setattr(hk_stock_list, name, url)
+
+    return point
+
+
+@dataclasses.dataclass
+class StubResponse:
+    status: int
+    body: bytes
+
+
+class _StubServer(http.server.ThreadingHTTPServer):
+    response: StubResponse
+    requests: int
+
+
+class _StubHandler(http.server.BaseHTTPRequestHandler):
+    server: _StubServer
+
+    def do_GET(self) -> None:
+        self.server.requests += 1
+        self.send_response(self.server.response.status)
+        self.send_header("Content-Length", str(len(self.server.response.body)))
+        self.end_headers()
+        self.wfile.write(self.server.response.body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@dataclasses.dataclass
+class StubHKEX:
+    """A local HTTP server answering every GET with one canned response."""
+
+    url: str
+    server: _StubServer
+
+    @property
+    def requests(self) -> int:
+        return self.server.requests
+
+
+@pytest.fixture
+def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
+    servers: list[_StubServer] = []
+
+    def start(response: StubResponse) -> StubHKEX:
+        server = _StubServer(("127.0.0.1", 0), _StubHandler)
+        server.response = response
+        server.requests = 0
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return StubHKEX(url=f"http://127.0.0.1:{server.server_address[1]}", server=server)
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
+def black_hole_url() -> Iterator[str]:
+    """A listener that accepts connections and never replies."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
 
 
 @pytest.fixture
