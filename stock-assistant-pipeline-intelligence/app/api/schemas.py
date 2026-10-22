@@ -36,3 +36,20 @@ class HealthResponse(BaseModel):
     redis_state: ComponentStatus
     hk_stock_list: HKStockListStatus
     layers: LayerStatus
+
+
+# ── POST /v1/admin/hk-stock-list-sync ─────────────────────────────────────────
+
+
+class HKStockListSyncResponse(BaseModel):
+    status: str = "success"
+    entries_loaded: int
+
+
+# ── Error Response (used by all routes) ───────────────────────────────────────
+
+
+class ErrorResponse(BaseModel):
+    error_code: str
+    message: str
+    detail: str | dict[str, object] = {}
