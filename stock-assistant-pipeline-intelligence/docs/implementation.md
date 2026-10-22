@@ -134,6 +134,7 @@ sapi/
 │   │   │   ├── hk_stock_list_sync.py # POST /v1/admin/hk-stock-list-sync (delegates to common/hk_stock_list.py)
 │   │   │   └── morning_brief_refresh.py # POST /v1/admin/morning-brief-refresh — daily cache refresh, called by Admin (§15.7)
 │   │   ├── schemas.py                   # Pydantic request/response schemas
+│   │   ├── error_handlers.py            # SAPIError → HTTP status + ErrorResponse mapping; handler registration (§15.1)
 │   │   └── main.py                      # FastAPI app factory
 │   ├── llm/
 │   │   ├── adapter.py                   # LLMAdapter ABC; standard data structures
@@ -4957,6 +4958,7 @@ def create_app() -> FastAPI:
     app.include_router(morning_brief_router, prefix=f"/{API_VERSION}")
     app.include_router(hk_stock_list_sync_router, prefix=f"/{API_VERSION}")
     app.include_router(morning_brief_refresh_router, prefix=f"/{API_VERSION}")   # route path /admin/morning-brief-refresh (§15.7)
+    register_error_handlers(app)   # app/api/error_handlers.py, below
     return app
 ```
 
@@ -5034,7 +5036,8 @@ class ServiceUnavailableError(SAPIError):
 
     @classmethod
     def upstream_unavailable(cls, dev_message: str, *, category: ErrorCategory) -> Self:
-        return cls(dev_message, category=category, error_code=error_codes.UPSTREAM_UNAVAILABLE)
+        return cls(dev_message, category=category, error_code=error_codes.UPSTREAM_UNAVAILABLE,
+                   log_level=logging.WARNING)   # an outside outage needs no code/config change
 
 class ParseError(SAPIError):
     """Structured or unstructured content couldn't be parsed: a code/schema issue, not an
@@ -5044,7 +5047,7 @@ class ParseError(SAPIError):
     message = "Content could not be parsed"
 ```
 
-**Exception handlers** follow SADI's pattern (`stock-assistant-data-ingestion/docs/implementation.md` §7.1): each reads `exc.error_code`/`.message`/`.dev_message`/`.log_level` off the exception, except `RequestValidationError` (third-party) and the general `Exception` catch-all.
+**Exception handlers** live in `app/api/error_handlers.py`: an `HTTP_STATUS` table (`SAPIError` class → HTTP status), `to_error_response(exc) -> ErrorResponse`, and `register_error_handlers(app)`, which `create_app()` calls. One `sapi_error_handler`, registered for the `SAPIError` base class, serves every `SAPIError`: its status is the table's entry for the error's class or nearest listed base class, else 500, and it reads `exc.error_code`/`.message`/`.dev_message`/`.log_level` off the exception. `unhandled_error_handler`, registered for `Exception`, catches anything else: it logs at `ERROR` and returns 500 `COMMON-5000`. `RequestValidationError` (third-party) gets its own handler.
 
 | Exception | Response |
 |---|---|
@@ -5055,7 +5058,7 @@ class ParseError(SAPIError):
 | `ParseError` | HTTP 500, `COMMON-6000` (e.g. §4.2's HK Stock List; a code/schema issue, not an availability one, so it gets its own code rather than folding into `COMMON-5000` below) |
 | General `Exception` | HTTP 500, `COMMON-5000` |
 
-See SADI's implementation doc §8.5b and §7.1 for the full `message`/`detail` usage rule and logging-exactly-once policy, both of which apply here unchanged (SAPI has no authentication in MVP either, and is only ever called by other internal MWP services).
+A `SAPIError` response is `ErrorResponse(error_code=exc.error_code, message=exc.message)`, with `detail` left `{}`. `detail` is filled only by errors that must tell the caller more, such as `COMMON-4001`'s field list (api.md §1.4). `dev_message` carries the occurrence's technical details, including the underlying exception's (`str(exc)`, `{exc!r}`), and never leaves SAPI: each handler logs it exactly once, as the log entry's message, at `exc.log_level`, with `exc_info=exc`. `log_level` is `ERROR` for an error that needs a code or config change, `WARNING` for a transient one that needs none (`upstream_unavailable()`).
 
 ### 15.2 `app/api/routes/health.py` — `GET /v1/health`
 
