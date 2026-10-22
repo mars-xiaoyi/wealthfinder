@@ -5,10 +5,12 @@ from unittest.mock import AsyncMock, MagicMock
 import asyncpg
 import pytest
 
+from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 from app.config import DatabaseConfig
 from app.db import connection as connection_module
 from app.db.connection import DatabaseClient
+from app.db.errors import DatabaseError
 
 
 def _make_config() -> DatabaseConfig:
@@ -76,6 +78,19 @@ async def fetch_one_with_acquire_connection_failure():
     with pytest.raises(ServiceUnavailableError) as excinfo:
         await client.fetch_one("SELECT 1")
 
+    assert excinfo.value.__cause__ is error
+
+
+async def fetch_one_with_postgres_error():
+    client, _, conn = _make_client()
+    error = asyncpg.PostgresError("syntax error")
+    conn.fetchrow = AsyncMock(side_effect=error)
+
+    with pytest.raises(DatabaseError) as excinfo:
+        await client.fetch_one("SELECT 1")
+
+    assert excinfo.value.dev_message == "syntax error"
+    assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
 
 
