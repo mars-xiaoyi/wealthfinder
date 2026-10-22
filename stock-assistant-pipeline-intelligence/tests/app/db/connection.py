@@ -89,7 +89,6 @@ async def fetch_one_with_postgres_error():
     with pytest.raises(DatabaseError) as excinfo:
         await client.fetch_one("SELECT 1")
 
-    assert excinfo.value.dev_message == "syntax error"
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
 

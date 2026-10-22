@@ -63,8 +63,14 @@ class ServiceUnavailableError(SAPIError):
 
     @classmethod
     def upstream_unavailable(cls, dev_message: str, *, category: ErrorCategory) -> Self:
-        """An unreachable upstream service: UPSTREAM_UNAVAILABLE."""
-        return cls(dev_message, category=category, error_code=error_codes.UPSTREAM_UNAVAILABLE)
+        """An unreachable upstream service: UPSTREAM_UNAVAILABLE, logged at WARNING since an
+        outside outage needs no code or config change."""
+        return cls(
+            dev_message,
+            category=category,
+            error_code=error_codes.UPSTREAM_UNAVAILABLE,
+            log_level=logging.WARNING,
+        )
 
 
 class ParseError(SAPIError):
