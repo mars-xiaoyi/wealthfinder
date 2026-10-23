@@ -7,6 +7,7 @@ docker CLI. Host ports are fixed per session (not Docker-assigned) so `docker st
 import contextlib
 import dataclasses
 import http.server
+import json
 import socket
 import subprocess
 import threading
@@ -26,7 +27,17 @@ POSTGRES_PASSWORD = "password"
 READY_TIMEOUT_S = 30.0
 # Every env var with a default in app/config.py; cleared so a developer's shell can't change
 # them. Keep in sync with app/config.py.
-OPTIONAL_ENV = ("DB_POOL_SIZE", "DB_CLOSE_TIMEOUT_S", "HTTP_TIMEOUT_S", "HEALTH_CHECK_TIMEOUT_S")
+OPTIONAL_ENV = (
+    "DB_POOL_SIZE",
+    "DB_CLOSE_TIMEOUT_S",
+    "HTTP_TIMEOUT_S",
+    "HEALTH_CHECK_TIMEOUT_S",
+    "REDIS_RECONNECT_INTERVAL_S",
+    "ENTITY_ANALYSIS_BATCH_SIZE",
+    "ENTITY_ANALYSIS_BATCH_TIMEOUT_MS",
+    "SADI_API_URL",
+    "HOSTNAME",
+)
 HKEX_URL_CONSTANTS = ("_ACTIVESTOCK_EN_URL", "_ACTIVESTOCK_ZH_URL", "_LIST_OF_SECURITIES_URL")
 # Nothing listens on port 1, so a connection is refused at once.
 REFUSED_URL = "http://127.0.0.1:1"
@@ -127,11 +138,26 @@ class Infra:
             container.restore()
 
 
-def _run(name: str, kind: str, image: str, container_port: int, *env: str) -> Container:
+def _run(
+    name: str,
+    kind: str,
+    image: str,
+    container_port: int,
+    *env: str,
+    command: tuple[str, ...] = (),
+) -> Container:
     port = _free_port()
     env_args = [arg for item in env for arg in ("-e", item)]
     _docker(
-        "run", "-d", "--name", name, "-p", f"127.0.0.1:{port}:{container_port}", *env_args, image
+        "run",
+        "-d",
+        "--name",
+        name,
+        "-p",
+        f"127.0.0.1:{port}:{container_port}",
+        *env_args,
+        image,
+        *command,
     )
     return Container(name=name, kind=kind, port=port)
 
@@ -156,7 +182,16 @@ def infra() -> Iterator[Infra]:
                 "POSTGRES_DB=sapi",
             )
         )
-        started.append(_run(f"{prefix}-redis-stream", "redis", REDIS_IMAGE, 6379))
+        # AOF, so a stopped and restarted stream Redis keeps its streams and consumer groups.
+        started.append(
+            _run(
+                f"{prefix}-redis-stream",
+                "redis",
+                REDIS_IMAGE,
+                6379,
+                command=("redis-server", "--appendonly", "yes"),
+            )
+        )
         started.append(_run(f"{prefix}-redis-state", "redis", REDIS_IMAGE, 6379))
         infra = Infra(*started)
         for container in infra.all():
@@ -250,6 +285,102 @@ def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
     for server in servers:
         server.shutdown()
         server.server_close()
+
+
+@dataclasses.dataclass
+class SADIRequest:
+    cleaned_id: str
+    at: float  # time.monotonic() when the request arrived
+
+
+@dataclasses.dataclass
+class _Behaviour:
+    status: int
+    delay_s: float
+
+
+class _SADIServer(http.server.ThreadingHTTPServer):
+    stub: "StubSADI"
+
+
+class _SADIHandler(http.server.BaseHTTPRequestHandler):
+    server: _SADIServer
+
+    def do_GET(self) -> None:
+        cleaned_id = self.path.rsplit("/", 1)[-1]
+        stub = self.server.stub
+        stub.requests.append(SADIRequest(cleaned_id, time.monotonic()))
+        behaviour = stub.behaviours.get(cleaned_id, _Behaviour(200, 0.0))
+        time.sleep(behaviour.delay_s)
+        body = json.dumps(_sadi_body(cleaned_id, behaviour.status)).encode()
+        self.send_response(behaviour.status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+def _sadi_body(cleaned_id: str, status: int) -> dict[str, object]:
+    """SADI's GET /v1/cleaned_news/{cleaned_id} response body for a status."""
+    if status == 404:
+        return {"error_code": "COMMON-4004", "message": "Resource not found", "detail": {}}
+    if status == 503:
+        return {"error_code": "COMMON-5001", "message": "Service unavailable", "detail": {}}
+    return {
+        "cleaned_id": cleaned_id,
+        "raw_id": str(uuid.uuid4()),
+        "title_cleaned": "騰訊控股公佈第四季業績",
+        "body_cleaned": "騰訊控股第四季廣告收入錄得強勁增長",
+        "published_at": "2025-01-15T00:00:00Z",
+        "source_name": "MINGPAO",
+        "source_url": f"https://finance.mingpao.com/{cleaned_id}",
+        "created_at": "2025-01-15T00:05:00Z",
+    }
+
+
+class StubSADI:
+    """A local HTTP server standing in for SADI's GET /v1/cleaned_news/{cleaned_id}. Every id
+    answers 200 with an article unless respond() says otherwise. It can be stopped and started
+    again on the same port."""
+
+    def __init__(self) -> None:
+        self.requests: list[SADIRequest] = []
+        self.behaviours: dict[str, _Behaviour] = {}
+        self._server: _SADIServer | None = None
+        self._port = 0
+        self.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._port}"
+
+    def respond(self, cleaned_id: uuid.UUID, status: int, delay_s: float = 0.0) -> None:
+        self.behaviours[str(cleaned_id)] = _Behaviour(status, delay_s)
+
+    def requests_for(self, cleaned_id: uuid.UUID) -> list[SADIRequest]:
+        return [r for r in self.requests if r.cleaned_id == str(cleaned_id)]
+
+    def start(self) -> None:
+        server = _SADIServer(("127.0.0.1", self._port), _SADIHandler)
+        server.stub = self
+        self._port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self._server = server
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+
+
+@pytest.fixture
+def stub_sadi() -> Iterator[StubSADI]:
+    stub = StubSADI()
+    yield stub
+    stub.stop()
 
 
 @pytest.fixture
