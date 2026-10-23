@@ -141,7 +141,6 @@ sapi/
 │   │   ├── vertex_adapter.py            # Vertex AI implementation: generate_raw (google-genai SDK), generate_structured (Instructor)
 │   │   └── errors.py                    # LLMError base + LLMRateLimitError / LLMProviderError / LLMAuthenticationError / LLMSchemaViolationError
 │   ├── clients/
-│   │   ├── errors.py                    # NewsClientError, AdminClientError — both SAPIError subclasses (§9)
 │   │   ├── news_client.py              # httpx client: fetch cleaned article content from SADI (Entity Analysis Layer input)
 │   │   └── admin_client.py              # httpx client: fetch source authority config from Admin (§1.5)
 │   ├── db/
@@ -167,7 +166,7 @@ sapi/
 │   │   ├── error_codes.py               # Every error code string, as commented constants (§15.1)
 │   │   ├── error_categories.py          # ErrorCategory — the part of SAPI an error was raised from (§15.1)
 │   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ParseError / ...
-│   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2)
+│   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2); translate_client_errors decorator (§9)
 │   │   ├── stock.py                     # Stock dataclass — cross-module shape shared by lookup_stock.py, hk_stock_list.py's HKStockListCache, and EntityAnalysisSkill (§4.2)
 │   │   ├── lookup_stock.py              # lookup_stock tool: exact code + fuzzy name matching, both against the in-process HKStockListCache (§4.2)
 │   │   ├── hk_stock_list.py          # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; startup load + sync handler, no Redis (§4.2.1)
@@ -476,7 +475,7 @@ class HealthConfig:
 class RedisConfig:
     stream_url: str                 # env: REDIS_STREAM_URL
     state_url: str                  # env: REDIS_STATE_URL
-    reconnect_interval_s: int       # env: REDIS_RECONNECT_INTERVAL_S
+    reconnect_interval_s: int       # env: REDIS_RECONNECT_INTERVAL_S (default 5)
     stream_claim_timeout_ms: int    # env: STREAM_CLAIM_TIMEOUT_MS
 ```
 
@@ -497,8 +496,8 @@ class LLMConfig:
 ```python
 @dataclass
 class EntityAnalysisConfig:
-    batch_size: int                       # env: ENTITY_ANALYSIS_BATCH_SIZE
-    batch_timeout_ms: int                 # env: ENTITY_ANALYSIS_BATCH_TIMEOUT_MS
+    batch_size: int                       # env: ENTITY_ANALYSIS_BATCH_SIZE (default 10)
+    batch_timeout_ms: int                 # env: ENTITY_ANALYSIS_BATCH_TIMEOUT_MS (default 5000)
     max_concurrent: int                   # env: ENTITY_ANALYSIS_MAX_CONCURRENT
     max_retry: int                        # env: ENTITY_ANALYSIS_MAX_RETRY
     name_match_min_overlap_ratio: float   # env: NAME_MATCH_MIN_OVERLAP_RATIO
@@ -1299,7 +1298,9 @@ Returns : List of ReclaimedMessage. delivery_count is XAUTOCLAIM's native
 #### Method: `create_group_if_not_exists(stream: str, group: str) -> None`
 
 ```
-Purpose : XGROUP CREATE ... MKSTREAM, catching BUSYGROUP if it already exists.
+Purpose : XGROUP CREATE ... MKSTREAM at id 0, so a new group starts with the stream's
+          first message. A group that already exists (BUSYGROUP) keeps its position and
+          is logged at INFO consumer_group_exists with stream and group.
 Called  : Once per stream/group pair, at each layer service's startup.
 ```
 
@@ -1330,7 +1331,7 @@ async def ping(self) -> None:
 
 #### Reconnect behaviour
 
-Per system-design.md §12.1 "RedisStreamClient Reconnect": when the underlying connection is unreachable, `read_from()`/`autoclaim()`/`publish()` catch `redis.ConnectionError`, log a warning, sleep `REDIS_RECONNECT_INTERVAL_S`, and retry — indefinitely, at the call site's loop level (each layer's consumer loop already retries its own `read_from()` call every iteration, so no separate reconnect loop is needed inside `RedisStreamClient` itself). Consumer Group position is preserved server-side across the outage; processing resumes from the last ACKed message once the connection returns.
+Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`/`autoclaim()`/`publish()` let `redis.ConnectionError` and `redis.TimeoutError` through untranslated. Each layer's consumer loop catches them around its own calls, logs a WARNING (`entity_analysis_redis_stream_unreachable` in §11.2), sleeps `REDIS_RECONNECT_INTERVAL_S` and loops again — indefinitely, so no separate reconnect loop exists inside `RedisStreamClient`. Consumer Group position is preserved server-side across the outage; processing resumes from the last ACKed message once the connection returns.
 
 #### Reclaim and Dead Letter pattern
 
@@ -2453,19 +2454,14 @@ Each Skill builds a structured completion-log record into its result on every in
 
 Outbound HTTP clients to SADI (`NewsClient`) and Admin (`AdminClient`), using the module-level singleton + getter shape (§5.1).
 
-#### `app/clients/errors.py`
+#### `translate_client_errors` — `app/common/http_client.py`
 
-```python
-from app.common.errors import SAPIError   # §15.1
+Every client method that calls an upstream service is decorated with `@translate_client_errors(upstream="SADI", category=ErrorCategory.NEWS_CLIENT)`, so its body is straight-line code with no try/except and callers never import `httpx`:
 
-class NewsClientError(SAPIError):
-    """Wraps a network failure or non-404 error status from a NewsClient call."""
+- `httpx.HTTPError` (a network failure, a timeout, or the `raise_for_status()` error for a status the method doesn't handle itself) → `ServiceUnavailableError.upstream_unavailable(f"{upstream} request failed: {exc!r}", category=category)`: `COMMON-5002`, WARNING, since an outside outage needs no code or config change.
+- pydantic `ValidationError` (a successful response without the expected shape) → `ParseError(f"{upstream} response shape mismatch: {exc!r}", category=category)`: `COMMON-6000`, ERROR, since the contract changed.
 
-class AdminClientError(SAPIError):
-    """Wraps a network failure or non-2xx error status from an AdminClient call."""
-```
-
-Neither client lets a raw `httpx` exception escape: each catches `httpx.HTTPError` at its call site and re-raises the wrapped `SAPIError` subclass, so callers never import `httpx`.
+There is no per-client error class.
 
 ### 9.1 `app/clients/news_client.py` — `NewsClient`
 
@@ -2473,30 +2469,35 @@ Neither client lets a raw `httpx` exception escape: each catches `httpx.HTTPErro
 class NewsClient:
     def __init__(self, http_client: httpx.AsyncClient, base_url: str): ...
 
+    @translate_client_errors(upstream="SADI", category=ErrorCategory.NEWS_CLIENT)
     async def fetch_cleaned_news(self, cleaned_id: UUID) -> Optional[CleanedNews]:
         """
         GET {base_url}/v1/cleaned_news/{cleaned_id} (docs/api.md §2.4).
         Returns None on HTTP 404 (COMMON-4004) — not an error, see system-design.md §3.6.
-        Raises NewsClientError (app.clients.errors) on network failure
-        or any other non-404 error status — the caller's error table (§11.4)
-        treats this as a generic "SADI API failure".
+        Raises ServiceUnavailableError (COMMON-5002) on a network failure or any other
+        non-404 error status, or ParseError (COMMON-6000) if the body doesn't match
+        CleanedNews — the caller's error table (§11.4) treats both as a generic
+        "SADI API failure".
         """
 ```
 
 #### Data Structure: `CleanedNews` — `app/clients/news_client.py`
 
-SAPI's model of a `GET /v1/cleaned_news/{cleaned_id}` response (docs/api.md §2.4). `fetch_cleaned_news()` maps `title_cleaned`/`body_cleaned` onto `title`/`body`. `cleaned_id` is carried so `find_entity_events()` can set `EntityEvent.source_id` (§11.1), which `persist_entities()` writes into `entity_events.metadata` (§10.1). `raw_id`/`created_at` are excluded. Unrelated to SADI's own `CleanedNews` class.
+SAPI's model of a `GET /v1/cleaned_news/{cleaned_id}` response (docs/api.md §2.4). Validation aliases map `title_cleaned`/`body_cleaned` onto `title`/`body`. `cleaned_id` is carried so `find_entity_events()` can set `EntityEvent.source_id` (§11.1), which `persist_entities()` writes into `entity_events.metadata` (§10.1). `raw_id`/`created_at` are excluded. Unrelated to SADI's own `CleanedNews` class.
 
 ```python
-@dataclass
-class CleanedNews:
+class CleanedNews(BaseModel):
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
     cleaned_id: UUID
-    title: str
-    body: str
+    title: str = Field(validation_alias="title_cleaned")
+    body: str = Field(validation_alias="body_cleaned")
     source_url: str
     source_name: str
-    published_at: Optional[datetime]   # null on the wire if unavailable in source (docs/api.md §2.4)
+    published_at: Optional[AwareDatetime]   # null on the wire if unavailable in source (docs/api.md §2.4); a timestamp without a UTC offset is rejected
 ```
+
+`fetch_cleaned_news()` returns `CleanedNews.model_validate_json(response.content)`; a null or wrong-typed field fails validation (→ `ParseError`, above).
 
 `NewsClient` is a singleton + getter (§5.1):
 
@@ -2522,11 +2523,12 @@ def create_news_client(http_client: httpx.AsyncClient, base_url: str) -> NewsCli
 class AdminClient:
     def __init__(self, http_client: httpx.AsyncClient, base_url: str): ...
 
+    @translate_client_errors(upstream="Admin", category=ErrorCategory.ADMIN_CLIENT)
     async def fetch_sources(self) -> list[dict]:
         """GET {base_url}/v1/sources (docs/api.md §4.3). Returns
         [{"source_name": ..., "authority_weight": ...}, ...] for all active sources.
-        Raises AdminClientError (app.clients.errors) on network failure
-        or a non-2xx response — never a raw httpx exception."""
+        Raises ServiceUnavailableError (COMMON-5002) on a network failure or a non-2xx
+        response, per §9's translate_client_errors."""
 ```
 
 `AdminClient` is a singleton + getter, like `NewsClient` (§9.1):
@@ -3203,7 +3205,7 @@ def create_cache_store() -> CacheStore:
 
 `EntityAnalysisService` is pure business logic: `find_entity_events()` only. `CleanedNewsConsumer` (§11.2) owns consumption of `stream:raw_news_cleaned` (consumer/reclaim loops, dedup guard, `WorkerPool` dispatch, ACK/backoff/dead-letter) and reacts to how `find_entity_events()` returns: normally (ACK); `LLMRateLimitError` (no ACK, backoff); any other `LLMError` (no ACK, already logged); anything else (no ACK, unanticipated bug, logged ERROR, §11.2).
 
-Failures are exceptions rather than a status value because `find_entity_events()` can't enumerate every failure. Each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason()`), so the consumer distinguishes `LLMRateLimitError` (needs `trigger_backoff()`) from other `LLMError`s (already logged). A non-`LLMError` (SADI fetch failure, DB write failure) is an unanticipated bug.
+Failures are exceptions rather than a status value because `find_entity_events()` can't enumerate every failure. Each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason()`), so the consumer distinguishes `LLMRateLimitError` (needs `trigger_backoff()`) from other `LLMError`s (already logged). A non-`LLMError` (SADI fetch failure, DB write failure) is not handled here.
 
 #### Class: `EntityAnalysisService`
 
@@ -3320,7 +3322,7 @@ Owns consumption of `stream:raw_news_cleaned` (consumer/reclaim loops, `WorkerPo
 
 ```python
 class CleanedNewsConsumer:
-    def __init__(self, worker_pool: WorkerPool, config: EntityAnalysisConfig):
+    def __init__(self, worker_pool: WorkerPool, config: EntityAnalysisConfig, redis_config: RedisConfig):
         self._service = get_entity_analysis_service()       # §11.1
         self._redis_stream = get_redis_stream_client()     # §6.1 — consumes, reclaims, ACKs
         self._worker_pool = worker_pool
@@ -3383,7 +3385,7 @@ flowchart TD
 
 > **`hk_stock_list_not_ready` gate:** checked before the in-flight Set and before `EntityAnalysisService`, as a synchronous side-effect-free read. Messages are **not ACKed**: an empty list would make every entity `found=false` and produce a permanently-wrong empty result. The reclaim loop (§6.1) redelivers after `STREAM_CLAIM_TIMEOUT_MS`.
 
-> **`_process_one()` wraps everything from the Set-insert onward in `try`/`except LLMRateLimitError`/`except LLMError`/`except Exception`** (in that order, since `LLMRateLimitError` subclasses `LLMError`). `except LLMError` covers `LLMProviderError`/`LLMAuthenticationError`/`LLMSchemaViolationError`, re-raised as themselves by `find_entity_events()`. Only the last is unanticipated: log ERROR `entity_analysis_process_one_crashed` with `exc_info`, remove `cleaned_id` from `processing_cleaned_ids` in a `finally`, leave the message unACKed, and don't re-raise. The first two skip the ERROR log because `find_entity_events()` already logged `entity_analysis_completed`. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
+> **`_process_one()` wraps everything from the Set-insert onward in `try`/`except LLMRateLimitError`/`except LLMError`/`except SAPIError`/`except Exception`** (in that order, since `LLMRateLimitError` subclasses `LLMError`, which subclasses `SAPIError`). `except LLMError` covers `LLMProviderError`/`LLMAuthenticationError`/`LLMSchemaViolationError`, re-raised as themselves by `find_entity_events()`. `except SAPIError` covers every other SAPI error (a SADI outage, a DB write failure): log it at its own `log_level` with its `dev_message`, and leave the message unACKed. Only the last is unanticipated: log ERROR `entity_analysis_process_one_crashed` with `exc_info`, remove `cleaned_id` from `processing_cleaned_ids` in a `finally`, leave the message unACKed, and don't re-raise. The first two skip the ERROR log because `find_entity_events()` already logged `entity_analysis_completed`. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
 
 ```
 Purpose : The single entry point for dispatching one message, from either _consumer_loop()
@@ -3460,8 +3462,8 @@ The same `WorkerPool` class is used, as independent instances, by Entity Analysi
 | All entities filtered out | Valid `output_items=[]`; no row written, nothing published, `find_entity_events()` returns normally, `CleanedNewsConsumer` ACKs |
 | `cleaned_id` missing from SADI | `NewsClient.fetch_cleaned_news()` returns `None`; `EntityAnalysisService.find_entity_events()` logs warning, returns normally (not an error, system-design.md §3.6); `CleanedNewsConsumer` ACKs (retry can't help) |
 | DB write failure | `DatabaseClient.execute_returning()` raises `ServiceUnavailableError` after retries exhausted; `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method) |
-| SADI API failure | `NewsClient` raises `NewsClientError` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method, same as a DB write failure above) |
-| `RedisStreamClient` unreachable | Handled inside `read_from()`/`publish()` per §6.1's reconnect behaviour |
+| SADI API failure | `NewsClient` raises `ServiceUnavailableError` (`COMMON-5002`) or, for an unexpected body, `ParseError` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s `except SAPIError`, which logs it at its own `log_level` (WARNING for `COMMON-5002`, ERROR for `ParseError`); no ACK |
+| `RedisStreamClient` unreachable | `redis.ConnectionError`/`redis.TimeoutError` caught by `CleanedNewsConsumer._consumer_loop()` around its `read_from()`/`ack()` calls: WARNING `entity_analysis_redis_stream_unreachable`, sleep `REDIS_RECONNECT_INTERVAL_S`, read again (§6.1's reconnect behaviour) |
 | HK Stock List not ready (`len(get_hk_stock_list_cache()) == 0`) | `CleanedNewsConsumer._process_one()`'s first check, before the in-flight Set and before `EntityAnalysisService` is called at all (§11.1); log warning `hk_stock_list_not_ready`; no ACK — never reaches `news_client.fetch_cleaned_news()` or `entity_skill.run()` at all, so no entity ever gets a permanently-wrong empty-result outcome from this cause |
 
 ---
@@ -4388,7 +4390,7 @@ Owns the `source:config` key, built on `RedisStateClient`'s generic primitives; 
 Two independent functions: `source_weights` is scoped to this Event's sources, `total_active_sources` is a global count. `get_source_weights()` calls `AdminClient` on a cold miss; `count_active_sources()` only reads Redis and falls back to its config value, since a full Admin refresh just for a count isn't worth the round-trip.
 
 ```python
-from app.clients.errors import AdminClientError   # §9
+from app.common.errors import ServiceUnavailableError
 
 _SOURCE_CONFIG_KEY = "source:config"
 _DEFAULT_TIER_WEIGHTS = {"P1": 9.0, "P2": 6.0, "P3": 4.0}   # fallback only — see below
@@ -4426,7 +4428,7 @@ async def get_source_weights(config: ScoringConfig, source_names: list[str]) -> 
 
     try:
         sources = await admin_client.fetch_sources()
-    except AdminClientError:
+    except ServiceUnavailableError:
         return _fallback_weights(source_names)
     if not sources:
         logger.warning("source_config_empty_from_admin")
@@ -4446,7 +4448,7 @@ async def count_active_sources(config: ScoringConfig) -> int:
     return total if total > 0 else config.total_active_sources_default
 ```
 
-`except AdminClientError`, not `except Exception`, so an unrelated bug (e.g. a `KeyError` from a malformed response) isn't treated as an outage.
+`except ServiceUnavailableError`, not `except Exception`, so an unrelated bug (e.g. a `KeyError` from a malformed response) isn't treated as an outage.
 
 > `_admin_tier_for(name)` is used only by the dual-failure fallback branch above; Admin's `data_sources` table (admin-tad.md §4.1) remains the source of truth for tiers.
 
@@ -4979,13 +4981,14 @@ CACHE_UNAVAILABLE = "SAPI-5001"            # Morning Brief cache has no current 
 
 #### `app/common/error_categories.py` — Error Categories
 
-The part of SAPI an error was raised from. Every raise site sets one, by where the raising code lives: anything under `app/common/` uses `COMMON`, except the HK Stock List (§4.2), which has its own; other packages use their own member (`app/config.py` → `CONFIG`, `app/db/` → `DB`, `app/redis/` → `REDIS`). Each ticket adds the members it first uses. Raise-site samples elsewhere in this doc leave `category` out; every real raise site passes one.
+The part of SAPI an error was raised from. Every raise site sets one, by where the raising code lives: anything under `app/common/` uses `COMMON`, except the HK Stock List (§4.2), which has its own; other packages use their own member (`app/config.py` → `CONFIG`, `app/db/` → `DB`, `app/clients/news_client.py` → `NEWS_CLIENT`, `app/redis/` → `REDIS`). Each ticket adds the members it first uses. Raise-site samples elsewhere in this doc leave `category` out; every real raise site passes one.
 
 ```python
 class ErrorCategory(StrEnum):
     COMMON = "COMMON"
     CONFIG = "CONFIG"
     DB = "DB"
+    NEWS_CLIENT = "NEWS_CLIENT"
     REDIS = "REDIS"
     STOCK_LIST = "STOCK_LIST"
 ```
@@ -5309,7 +5312,7 @@ async def lifespan(app: FastAPI):
         # Each Service takes only its config and pulls its infra via get_X(); each Consumer pulls its
         # Service via get_X_service() (§5.1).
         create_entity_analysis_service(config.entity_analysis)
-        cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis)
+        cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis, config.redis)
         aggregation_service = create_aggregation_service(config.agg)
         resources.push_async_callback(aggregation_service.close)   # group Tasks outlive the layer Task (§12.1)
         agg_consumer = AggregationConsumer(config.agg)
