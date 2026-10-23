@@ -18,7 +18,14 @@ from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 from app.common.hk_stock_list import HKStockListCache
 from app.common.stock import Stock
-from app.config import AppConfig, DatabaseConfig, HealthConfig, HttpConfig, RedisConfig
+from app.config import (
+    AppConfig,
+    DatabaseConfig,
+    EntityAnalysisConfig,
+    HealthConfig,
+    HttpConfig,
+    RedisConfig,
+)
 from app.db.connection import DatabaseClient
 from app.redis.state_client import RedisStateClient
 from app.redis.stream_client import RedisStreamClient
@@ -49,7 +56,17 @@ def config():
         db=DatabaseConfig(url="postgresql://localhost/sapi", pool_size=10, close_timeout_s=10),
         http=HttpConfig(timeout_s=120),
         health=HealthConfig(check_timeout_s=2),
-        redis=RedisConfig(stream_url="redis://localhost/0", state_url="redis://localhost/1"),
+        redis=RedisConfig(
+            stream_url="redis://localhost/0",
+            state_url="redis://localhost/1",
+            reconnect_interval_s=5,
+        ),
+        entity_analysis=EntityAnalysisConfig(
+            batch_size=10,
+            batch_timeout_ms=5000,
+            sadi_api_url="http://sadi:8000",
+            consumer_name="sapi-entity-analysis-1",
+        ),
     )
 
 

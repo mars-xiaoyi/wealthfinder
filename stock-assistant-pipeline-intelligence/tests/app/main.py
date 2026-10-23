@@ -1,3 +1,4 @@
+import asyncio
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,13 +9,28 @@ from fastapi import FastAPI
 from app import main as main_module
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ParseError, ServiceUnavailableError
-from app.config import AppConfig, DatabaseConfig, HealthConfig, HttpConfig, RedisConfig
+from app.config import (
+    AppConfig,
+    DatabaseConfig,
+    EntityAnalysisConfig,
+    HealthConfig,
+    HttpConfig,
+    RedisConfig,
+)
 
 CONFIG = AppConfig(
     db=DatabaseConfig(url="postgresql://localhost/sapi", pool_size=10, close_timeout_s=10),
     http=HttpConfig(timeout_s=120),
     health=HealthConfig(check_timeout_s=2),
-    redis=RedisConfig(stream_url="redis://localhost/0", state_url="redis://localhost/1"),
+    redis=RedisConfig(
+        stream_url="redis://localhost/0", state_url="redis://localhost/1", reconnect_interval_s=5
+    ),
+    entity_analysis=EntityAnalysisConfig(
+        batch_size=10,
+        batch_timeout_ms=5000,
+        sadi_api_url="http://sadi:8000",
+        consumer_name="sapi-entity-analysis-1",
+    ),
 )
 
 
@@ -34,11 +50,24 @@ def infra():
     create_state = AsyncMock(return_value=redis_state)
     create_http = MagicMock(return_value=http_client)
     refresh = AsyncMock(return_value=2800)
+    create_news = MagicMock()
+
+    async def _consume_until_cancelled() -> None:
+        calls.consumer_started()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            calls.consumer_cancelled()
+            raise
+
+    consumer_cls = MagicMock(return_value=MagicMock(start=_consume_until_cancelled))
     calls.attach_mock(create_db, "create_db_client")
     calls.attach_mock(create_stream, "create_stream_client")
     calls.attach_mock(create_state, "create_state_client")
     calls.attach_mock(create_http, "create_http_client")
     calls.attach_mock(refresh, "refresh_hk_stock_list")
+    calls.attach_mock(create_news, "create_news_client")
+    calls.attach_mock(consumer_cls, "CleanedNewsConsumer")
     with (
         mock.patch.object(main_module, "load_config", return_value=CONFIG),
         mock.patch.object(main_module, "create_db_client", create_db),
@@ -46,6 +75,8 @@ def infra():
         mock.patch.object(main_module, "create_state_client", create_state),
         mock.patch.object(main_module, "create_http_client", create_http),
         mock.patch.object(main_module, "refresh_hk_stock_list", refresh),
+        mock.patch.object(main_module, "create_news_client", create_news),
+        mock.patch.object(main_module, "CleanedNewsConsumer", consumer_cls),
     ):
         yield calls
 
@@ -59,19 +90,33 @@ STARTUP_CALLS = [
     "create_stream_client",
     "create_state_client",
     "create_http_client",
+    "create_news_client",
     "refresh_hk_stock_list",
+    "CleanedNewsConsumer",
+    "consumer_started",
 ]
-SHUTDOWN_CALLS = ["http_client_aclose", "redis_state_close", "redis_stream_close", "db_close"]
+SHUTDOWN_CALLS = [
+    "consumer_cancelled",
+    "http_client_aclose",
+    "redis_state_close",
+    "redis_stream_close",
+    "db_close",
+]
 
 
 async def lifespan(infra):
     async with main_module.lifespan(FastAPI()):
+        await asyncio.sleep(0)  # let the consumer Task start
         assert _call_names(infra) == STARTUP_CALLS
         infra.create_db_client.assert_awaited_once_with(CONFIG.db)
         infra.create_stream_client.assert_awaited_once_with(CONFIG.redis.stream_url)
         infra.create_state_client.assert_awaited_once_with(CONFIG.redis.state_url)
         infra.create_http_client.assert_called_once_with(CONFIG.http.timeout_s)
+        infra.create_news_client.assert_called_once_with(
+            infra.create_http_client.return_value, CONFIG.entity_analysis.sadi_api_url
+        )
         infra.refresh_hk_stock_list.assert_awaited_once_with()
+        infra.CleanedNewsConsumer.assert_called_once_with(CONFIG.entity_analysis, CONFIG.redis)
 
     assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS
     infra.db_close.assert_awaited_once_with(CONFIG.db.close_timeout_s)
@@ -95,6 +140,7 @@ async def lifespan_hk_stock_list_load_failed(infra, error):
     infra.refresh_hk_stock_list.side_effect = error
 
     async with main_module.lifespan(FastAPI()):
+        await asyncio.sleep(0)  # let the consumer Task start
         assert _call_names(infra) == STARTUP_CALLS
 
     assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS

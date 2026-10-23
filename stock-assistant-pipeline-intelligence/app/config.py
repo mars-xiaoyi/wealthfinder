@@ -32,6 +32,15 @@ class HealthConfig:
 class RedisConfig:
     stream_url: str  # env: REDIS_STREAM_URL
     state_url: str  # env: REDIS_STATE_URL
+    reconnect_interval_s: int  # env: REDIS_RECONNECT_INTERVAL_S (default 5)
+
+
+@dataclass
+class EntityAnalysisConfig:
+    batch_size: int  # env: ENTITY_ANALYSIS_BATCH_SIZE (default 10)
+    batch_timeout_ms: int  # env: ENTITY_ANALYSIS_BATCH_TIMEOUT_MS (default 5000)
+    sadi_api_url: str  # env: SADI_API_URL (default http://localhost:8000), without "/v1"
+    consumer_name: str  # env: HOSTNAME (default sapi-entity-analysis-1), unique per pod
 
 
 @dataclass
@@ -40,6 +49,7 @@ class AppConfig:
     http: HttpConfig
     health: HealthConfig
     redis: RedisConfig
+    entity_analysis: EntityAnalysisConfig
 
 
 _config: AppConfig | None = None
@@ -76,6 +86,13 @@ def load_config() -> AppConfig:
         redis=RedisConfig(
             stream_url=_require("REDIS_STREAM_URL"),
             state_url=_require("REDIS_STATE_URL"),
+            reconnect_interval_s=int(os.environ.get("REDIS_RECONNECT_INTERVAL_S", "5")),
+        ),
+        entity_analysis=EntityAnalysisConfig(
+            batch_size=int(os.environ.get("ENTITY_ANALYSIS_BATCH_SIZE", "10")),
+            batch_timeout_ms=int(os.environ.get("ENTITY_ANALYSIS_BATCH_TIMEOUT_MS", "5000")),
+            sadi_api_url=os.environ.get("SADI_API_URL", "http://localhost:8000"),
+            consumer_name=os.environ.get("HOSTNAME", "sapi-entity-analysis-1"),
         ),
     )
     return _config
