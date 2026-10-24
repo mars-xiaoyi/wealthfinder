@@ -1,9 +1,13 @@
 import asyncio
 import functools
+import io
+import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from typing import Any
 
+import openpyxl
 import pytest
 import redis.asyncio
 import redis.exceptions
@@ -13,7 +17,14 @@ from app import logger
 from app.common import error_codes, hk_stock_list
 from app.common.error_categories import ErrorCategory
 from app.redis.stream_client import CONSUMER_GROUP_ENTITY_ANALYSIS, STREAM_RAW_NEWS_CLEANED
-from tests.integration.conftest import REFUSED_URL, Infra, StubSADI
+from tests.integration.conftest import (
+    HKEX_URL_CONSTANTS,
+    REFUSED_URL,
+    Infra,
+    StubHKEX,
+    StubResponse,
+    StubSADI,
+)
 
 pytestmark = [pytest.mark.live, pytest.mark.timeout(120)]
 
@@ -25,6 +36,28 @@ CONSUMER_ENV = {
 }
 POLL_INTERVAL_S = 0.05
 SETTLE_S = 0.5
+GATE_EVENT = "hk_stock_list_not_ready"
+REAL_HKEX_URLS = {name: getattr(hk_stock_list, name) for name in HKEX_URL_CONSTANTS}
+
+# A trimmed copy of HKEX's three files: 00700 and 09988 are equities, 02800 is an ETF.
+EN_FEED = [
+    {"i": 1, "c": "00700", "n": "TENCENT", "s": 1},
+    {"i": 2, "c": "02800", "n": "TRACKER FUND", "s": 2},
+    {"i": 3, "c": "09988", "n": "BABA-W", "s": 3},
+]
+ZH_FEED = [
+    {"i": 1, "c": "00700", "n": "騰訊控股", "s": 1},
+    {"i": 2, "c": "02800", "n": "盈富基金", "s": 2},
+    {"i": 3, "c": "09988", "n": "阿里巴巴", "s": 3},
+]
+SECURITIES_FEED = [
+    ("00700", "TENCENT", "Equity", "Equity Securities (Main Board)", "HKD"),
+    ("02800", "TRACKER FUND", "Exchange Traded Products", "Exchange Traded Funds", "HKD"),
+    ("09988", "BABA-W", "Equity", "Equity Securities (Main Board)", "HKD"),
+]
+LOADED_FEED_ENTRIES = 2
+# CONSUMER_ENV's HTTP_TIMEOUT_S is too short to download the real HKEX files.
+REAL_HKEX_ENV = {"HTTP_TIMEOUT_S": "30"}
 
 
 class StreamProbe:
@@ -66,17 +99,61 @@ async def streams(infra: Infra) -> AsyncIterator[StreamProbe]:
     await client.aclose()
 
 
+def _securities_xlsx() -> bytes:
+    """SECURITIES_FEED as a List of Securities spreadsheet, with HKEX's two title rows."""
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.append(("List of Securities",))
+    sheet.append(("Updated as at 24/10/2026",))
+    sheet.append(
+        ("Stock Code", "Name of Securities", "Category", "Sub-Category", "Trading Currency")
+    )
+    for row in SECURITIES_FEED:
+        sheet.append(row)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def hkex_feed(
+    hkex_urls: Callable[..., None],
+    stub_hkex: Callable[[StubResponse], StubHKEX],
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[str], None]:
+    """Choose where the HK Stock List loads from: hkex_feed("loaded") serves the trimmed feed
+    from local stubs, hkex_feed("empty") refuses at once (no connect retries) so the empty
+    fallback list is installed, and hkex_feed("real") uses the real HKEX."""
+
+    def point(feed: str) -> None:
+        if feed == "empty":
+            hkex_urls(every=REFUSED_URL)
+            monkeypatch.setattr(hk_stock_list, "_CONNECT_RETRY_WAITS_S", (0, 0))
+        elif feed == "loaded":
+            bodies = {
+                "_ACTIVESTOCK_EN_URL": json.dumps(EN_FEED).encode(),
+                "_ACTIVESTOCK_ZH_URL": json.dumps(ZH_FEED).encode(),
+                "_LIST_OF_SECURITIES_URL": _securities_xlsx(),
+            }
+            hkex_urls(
+                **{name: stub_hkex(StubResponse(200, body)).url for name, body in bodies.items()}
+            )
+        else:
+            hkex_urls(**REAL_HKEX_URLS)
+
+    return point
+
+
 @pytest.fixture
 def start_consumer(
     start_app: Callable[..., object],
-    hkex_urls: Callable[..., None],
+    hkex_feed: Callable[[str], None],
     stub_sadi: StubSADI,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[..., object]:
-    """start_app() with SADI pointed at the stub and test timings. The HK Stock List load
-    fails at once (refused, no connect retries): the consumer does not read the list."""
-    hkex_urls(every=REFUSED_URL)
-    monkeypatch.setattr(hk_stock_list, "_CONNECT_RETRY_WAITS_S", (0, 0))
+    """start_app() with SADI pointed at the stub and test timings. The HK Stock List loads
+    from the trimmed feed unless the test points it elsewhere first (hkex_feed)."""
+    hkex_feed("loaded")
     return functools.partial(start_app, **CONSUMER_ENV, SADI_API_URL=stub_sadi.url)
 
 
@@ -299,3 +376,110 @@ async def start_resumes_after_restart(start_consumer, streams, stub_sadi):
         await asyncio.sleep(SETTLE_S)
 
     assert [len(stub_sadi.requests_for(cleaned_id)) for cleaned_id in [*before, after]] == [1, 1, 1]
+
+
+def _gated(logs: list[MutableMapping[str, Any]]) -> list[tuple[object, object]]:
+    """(log_level, message_id) of each hk_stock_list_not_ready record."""
+    return [(log["log_level"], log["message_id"]) for log in logs if log["event"] == GATE_EVENT]
+
+
+async def _wait_gated(logs: list[MutableMapping[str, Any]], count: int, timeout_s: float) -> None:
+    async def gated() -> bool:
+        return len(_gated(logs)) >= count
+
+    await _wait_for(gated, timeout_s)
+
+
+async def start_hk_stock_list_not_ready_holds_message(
+    start_consumer, hkex_feed, streams, stub_sadi
+):
+    """With the HK Stock List empty, the message stays pending and SADI is never asked; the
+    app keeps running."""
+    hkex_feed("empty")
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer() as client:
+            message_id = await streams.add(uuid.uuid4())
+            await _wait_gated(logs, 1, 3)
+            await asyncio.sleep(3)
+            await asyncio.wait_for(client.get("/v1/health"), 3)
+
+    assert _gated(logs) == [("warning", message_id)]
+    assert stub_sadi.requests == []
+    assert await streams.pending() == {message_id: 1}
+
+
+async def start_hk_stock_list_not_ready_every_message(
+    start_consumer, hkex_feed, streams, stub_sadi
+):
+    hkex_feed("empty")
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            message_ids = [await streams.add(uuid.uuid4()) for _ in range(3)]
+            await _wait_gated(logs, 3, 3)
+            await asyncio.sleep(SETTLE_S)
+
+    assert sorted(_gated(logs)) == sorted(("warning", message_id) for message_id in message_ids)
+    assert stub_sadi.requests == []
+    assert await streams.pending() == dict.fromkeys(message_ids, 1)
+
+
+async def start_hk_stock_list_not_ready_before_fetch(start_consumer, hkex_feed, streams, stub_sadi):
+    """The gate comes before the fetch: a message SADI would answer 404 for (an ACKed outcome)
+    stays pending too."""
+    not_found, unavailable = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.respond(not_found, 404)
+    stub_sadi.respond(unavailable, 503)
+    hkex_feed("empty")
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            not_found_message_id = await streams.add(not_found)
+            unavailable_message_id = await streams.add(unavailable)
+            await _wait_gated(logs, 2, 3)
+            await asyncio.sleep(SETTLE_S)
+
+    assert stub_sadi.requests == []
+    assert await streams.pending() == {not_found_message_id: 1, unavailable_message_id: 1}
+
+
+@pytest.mark.parametrize("feed", ["loaded", "real"])
+async def start_hk_stock_list_loaded(start_consumer, hkex_feed, streams, stub_sadi, feed):
+    """With the HK Stock List loaded, from the trimmed feed or the real HKEX, a message is
+    fetched and ACKed with no gate record."""
+    cleaned_id = uuid.uuid4()
+    hkex_feed(feed)
+    env = REAL_HKEX_ENV if feed == "real" else {}
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(**env):
+            message_id = await streams.add(cleaned_id)
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 5)
+            await asyncio.sleep(SETTLE_S)
+
+    assert [r.cleaned_id for r in stub_sadi.requests] == [str(cleaned_id)]
+    assert await streams.pending() == {}
+    assert _gated(logs) == []
+
+
+async def start_hk_stock_list_becomes_ready(start_consumer, hkex_feed, streams, stub_sadi):
+    """Once the HK Stock List loads on the running app, new messages are handled; the one
+    gated before stays pending."""
+    gated, handled = uuid.uuid4(), uuid.uuid4()
+    hkex_feed("empty")
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            gated_message_id = await streams.add(gated)
+            await _wait_gated(logs, 1, 3)
+
+            hkex_feed("loaded")
+            assert await hk_stock_list.refresh_hk_stock_list() == LOADED_FEED_ENTRIES
+            handled_message_id = await streams.add(handled)
+            await _wait_acked(streams, stub_sadi, {handled: handled_message_id}, 5)
+            pending = await streams.pending()
+
+    assert _gated(logs) == [("warning", gated_message_id)]
+    assert [r.cleaned_id for r in stub_sadi.requests] == [str(handled)]
+    assert pending == {gated_message_id: 1}
