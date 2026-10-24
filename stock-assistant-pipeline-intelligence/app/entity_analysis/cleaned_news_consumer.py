@@ -5,6 +5,7 @@ import redis.exceptions
 
 from app.clients.news_client import get_news_client
 from app.common.errors import SAPIError
+from app.common.hk_stock_list import get_hk_stock_list_cache
 from app.config import EntityAnalysisConfig, RedisConfig
 from app.logger import get_logger
 from app.redis.stream_client import (
@@ -60,7 +61,12 @@ class CleanedNewsConsumer:
 
     async def _process_one(self, message: StreamMessage) -> None:
         """Fetch one message's article and ACK the message once its outcome is final: fetched,
-        or not found in SADI. Any other outcome leaves it un-ACKed."""
+        or not found in SADI. Any other outcome, including an HK Stock List not loaded yet,
+        leaves it un-ACKed."""
+        if len(get_hk_stock_list_cache()) == 0:
+            logger.warning("hk_stock_list_not_ready", message_id=message.id)
+            return
+
         try:
             cleaned_id = UUID(message.fields["cleaned_id"])
         except (KeyError, ValueError):

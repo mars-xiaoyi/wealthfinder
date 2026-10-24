@@ -8,8 +8,11 @@ import redis.exceptions
 
 from app.clients import news_client as news_client_module
 from app.clients.news_client import CleanedNews, NewsClient
+from app.common import hk_stock_list as hk_stock_list_module
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
+from app.common.hk_stock_list import HKStockListCache
+from app.common.stock import Stock
 from app.config import EntityAnalysisConfig, RedisConfig
 from app.entity_analysis.cleaned_news_consumer import CleanedNewsConsumer
 from app.redis import stream_client as stream_client_module
@@ -38,6 +41,24 @@ NEWS_A = CleanedNews(
     source_name="MINGPAO",
     published_at=None,
 )
+
+
+LOADED_CACHE = HKStockListCache(
+    {
+        "00700": Stock(
+            stock_code="00700",
+            exchange="HKEX",
+            company_name_zh="騰訊控股",
+            company_name_en="TENCENT",
+        )
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def hk_stock_list_cache(monkeypatch):
+    """A loaded HK Stock List, so every test but the gate's processes its messages."""
+    monkeypatch.setattr(hk_stock_list_module, "_hk_stock_list_cache", LOADED_CACHE)
 
 
 @pytest.fixture
@@ -161,3 +182,15 @@ async def start_redis_unreachable_on_ack(redis_stream, news_client):
     assert news_client.fetch_cleaned_news.await_args_list == [mock.call(ID_A)]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A)]
     assert redis_stream.read_from.await_count == 2
+
+
+async def start_hk_stock_list_not_ready(monkeypatch, redis_stream, news_client):
+    """With the HK Stock List empty, every message is left un-ACKed without fetching its
+    article, and the loop carries on."""
+    monkeypatch.setattr(hk_stock_list_module, "_hk_stock_list_cache", HKStockListCache({}))
+
+    await _run(redis_stream, [MESSAGE_A, MESSAGE_B], [])
+
+    news_client.fetch_cleaned_news.assert_not_awaited()
+    redis_stream.ack.assert_not_awaited()
+    assert redis_stream.read_from.await_args_list == [_read_call()] * 3
