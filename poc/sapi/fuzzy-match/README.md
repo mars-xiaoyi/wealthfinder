@@ -4,7 +4,7 @@ Throwaway scripts that find the best fuzzy-matching algorithm for `lookup_stock`
 
 ## Result in one table
 
-475 labeled cases (details below), all scored as correct / wrong / missed. A wrong match is accepted silently, while a miss makes the FC loop retry with another name or the code, so wrong matches matter more.
+475 labeled cases (details below), all scored as correct / wrong / missed. A wrong match becomes a false entity silently, while a miss only drops one mention, so wrong matches matter more.
 
 | Matcher | Correct | Wrong | Missed |
 |---|---|---|---|
@@ -73,7 +73,7 @@ Two of its three errors are worth knowing: "POSTAL SAVINGS BANK OF CHINA CO., LT
 
 ## Held-out news check (`holdout_sep.py`, `results_holdout_sep.md`)
 
-S8 was then scored once, unchanged, on cleaned articles published 2026-09-01 to 09-07 (`cleaned_news_export.csv`, 220 news articles and 160 HKEX announcements). Articles from 09-08 to 09-13 are reserved for implementation testing and were not read. Companies used by any earlier case set are excluded. That leaves 198 cases from 144 companies: 107 news `name(code)` mentions (`data/sep_news_cases.py`), 9 A-share/US-only companies and 82 HKEX legal names (`data/sep_hkex_cases.py`). The pass bar was fixed before scoring: S8 must get more right than `WRatio`, and S8's wrong rate must be 3% or below.
+S8 was then scored once, unchanged, on cleaned articles published 2026-09-01 to 09-07 (`cleaned_news_export.csv`, 220 news articles and 160 HKEX announcements). Articles from 09-08 to 09-13 were not read here. The LLM Skill spike later used 60 of them, and the 288 still untouched by both spikes are listed in its `eval/splits/cleaned_news_split.json`. Companies used by any earlier case set are excluded. That leaves 198 cases from 144 companies: 107 news `name(code)` mentions (`data/sep_news_cases.py`), 9 A-share/US-only companies and 82 HKEX legal names (`data/sep_hkex_cases.py`). The pass bar was fixed before scoring: S8 must get more right than `WRatio`, and S8's wrong rate must be 3% or below.
 
 | Matcher | Correct | Wrong | Missed |
 |---|---|---|---|
@@ -82,6 +82,35 @@ S8 was then scored once, unchanged, on cleaned articles published 2026-09-01 to 
 | **S8** | **187** | **2** | **9** |
 
 S8 passes (187 > 180; 1.0% wrong). On news mentions S8 and `WRatio` tie at 105 / 0 / 2 and both reject all 9 non-HKEX companies. The gap comes from HKEX English legal names (S8 35 right against 29). The two news misses are 群核 / 群核科技, whose listed Chinese name is the English "MANYCORE TECH". Both wrong matches are English legal names: "RUIFENG GREEN ENERGY AI COMPUTING HOLDINGS" → 綠色能源科技集團 and "CENTRAL CHINA MANAGEMENT" → 建業地產. This is the known short-name-inside-a-longer-name limit.
+
+## As the fallback of the adopted EntityAnalysisSkill (`fallback_swap.py`, `compare_simple.py`)
+
+The Entity Analysis LLM Skill spike (branch `sapi-2882704929-llm-skill-spike`, docs on master `b59dbe8`) dropped the `lookup_stock` tool. One structured-output call returns each company's code and name. Code then accepts the code when the listed name agrees with the model's name, or when the article prints the code. `lookup_stock(name)` runs only when both checks fail. On gemini-3.1-flash-lite that fallback decided 3 of 197 entities on 127 cleaned-news articles, and 17 of 117 on a set with every code stripped out.
+
+**Fallback swap.** `fallback_swap.py` re-scores that spike's stored C3 outputs. It keeps the spike's code checks verbatim and swaps only the fallback (no API calls). The numbers match the spike's own report.
+
+| Fallback | 127 cleaned-news articles, F1 (fallback hits right / wrong) | No-code worst case, F1 (right / wrong) |
+|---|---|---|
+| none | 0.962 (0 / 0) | 0.820 (0 / 0) |
+| §4.2 as written | 0.954 (1 / 19) | 0.888 (16 / 3) |
+| `WRatio`, cutoff 90 | 0.962 (1 / 1) | 0.900 (17 / 1) |
+| that spike's simpler subsequence search | 0.959 (1 / 2) | 0.904 (17 / 0) |
+| **S8** | **0.962 (1 / 1)** | **0.908 (18 / 0)** |
+
+S8's one "wrong" hit, 納真科技 → 09856, is a gap in the automatic gold. That spike read the article by hand, and the match is right. S8 also correctly rejects 瑞銀集團, which the simpler search matches to 華泰瑞銀.
+
+**S8 against the simpler search on every case set here** (`compare_simple.py`, `results_compare_simple.md`). The simpler search is that spike's `name_lookup_subseq`, run verbatim. It folds 7 variant characters, strips suffixes with one regex, matches an ordered subsequence in either direction (the reverse direction needs ≥60% of the query length), lets the smallest length difference win, and treats a tie as a miss.
+
+| Case type | Simpler search c / w / m | S8 c / w / m | Utility (c − 2w), S8 minus simpler |
+|---|---|---|---|
+| news-style names: news `name(code)`, hand-collected, the 15 real name arguments (465) | 435 / 4 / 26 | 442 / 8 / 15 | −1 |
+| HKEX legal names, English and Chinese (272) | 176 / 2 / 94 | 233 / 8 / 31 | +45 |
+
+- **News-style names, the inputs the fallback now sees:** the two matchers are even. S8 gets 7 more right and makes 4 more wrong: 中鋁 → 中鋁國際, 平安 → 平安好醫生, 中海油 → 中海油田服務, 新地 → 新天地產集團 and Seagate → 爪哇控股, against one the simpler search gets wrong (Visa).
+- **HKEX legal names, where S8 wins clearly:** these now reach the fallback only when the model's code is wrong and the announcement doesn't print it. HKEX announcements print the issuer's code in the header.
+- **The 15 real name arguments** (that spike's `lookup_args.json`): both get 15 of 15, including Barclays, 巴克萊, 英偉達 and the REITs as correct misses, and 碧桂園 → 02007 rather than 碧桂園服務.
+- **Latency:** the simpler search as written takes 8.4 ms per call (p99 8.6 ms), because it normalizes every name on every call. S8 takes p99 5.0 ms with names prepared at load. Both are under the 20 ms warning threshold.
+- **Normalization:** the adopted `_name_consistent()` (impl.md §8.2) already normalizes with the simpler search's 7-character map and suffix list. S8 uses OpenCC `t2s` and its own suffix and generic-tail lists. Whichever matcher is adopted, the code check and the name search should share one normalizer.
 
 ## What S8 does (final)
 
@@ -113,6 +142,7 @@ Cost: p50 0.17 ms, p99 4.2 ms, max 6.5 ms over all 475 queries (Python 3.12, App
 | `algorithms.py` | normalization, `rapidfuzz` scorers and the TF-IDF matcher |
 | `subseq.py` | the subsequence matcher, one flag per round |
 | `evaluate.py`, `compare.py`, `holdout.py`, `holdout_sep.py` | results per round; per-category results and latency; the held-out HKEX and news checks |
+| `fallback_swap.py`, `compare_simple.py` | the fallback swap on the LLM Skill spike's stored outputs; S8 against that spike's simpler search |
 | `bench.py` | the earlier I-1 latency and heartbeat test for §4.2 and R1–R7 |
 
 `algorithms.py`, `subseq.py`, `evaluate.py` and `compare.py` need `rapidfuzz` and `opencc` (`uv pip install rapidfuzz opencc`); the rest run on a plain `python3`.
