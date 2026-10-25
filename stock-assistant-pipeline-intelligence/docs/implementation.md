@@ -168,7 +168,8 @@ sapi/
 │   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ParseError / ...
 │   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2); translate_client_errors decorator (§9)
 │   │   ├── stock.py                     # Stock dataclass — cross-module shape shared by lookup_stock.py, hk_stock_list.py's HKStockListCache, and EntityAnalysisSkill (§4.2)
-│   │   ├── lookup_stock.py              # lookup_stock: exact code + fuzzy name matching, both against the in-process HKStockListCache (§4.2)
+│   │   ├── lookup_stock.py              # lookup_stock: name search over the in-process HKStockListCache (§4.2)
+│   │   ├── stock_name_match.py          # The one company-name normalizer + StockNameIndex, shared by lookup_stock and _name_consistent (§4.2)
 │   │   ├── hk_stock_list.py          # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; startup load + sync handler, no Redis (§4.2.1)
 │   │   └── supervised.py                # run_supervised() — leak-free concurrent-coroutine supervision, used by every layer's start() (§6.1)
 │   ├── layer_tasks.py                   # register_layer_tasks()/get_layer_tasks() — the four layer Tasks, for GET /health's liveness check (§15.6)
@@ -499,7 +500,6 @@ class EntityAnalysisConfig:
     batch_timeout_ms: int                 # env: ENTITY_ANALYSIS_BATCH_TIMEOUT_MS (default 5000)
     max_concurrent: int                   # env: ENTITY_ANALYSIS_MAX_CONCURRENT
     max_retry: int                        # env: ENTITY_ANALYSIS_MAX_RETRY
-    name_match_min_overlap_ratio: float   # env: NAME_MATCH_MIN_OVERLAP_RATIO
     max_input_chars: int                  # env: ENTITY_ANALYSIS_MAX_INPUT_CHARS (default 30000) — article body cut before
                                            # the LLM call (§8.2); HKEX announcements reach 2,000,000+ chars
     sadi_api_url: str                     # env: SADI_API_URL — local dev default: http://localhost:8000
@@ -664,14 +664,15 @@ def create_http_client(timeout_s: int) -> httpx.AsyncClient:
 
 #### Class: `HKStockListCache`
 
-`entries` holds `Stock` (below) directly, so `entries[k].stock_code == k`.
+`entries` holds `Stock` (below) directly, so `entries[k].stock_code == k`. `name_index` is the same list's names prepared for matching (`StockNameIndex`, below), built from `entries` at every refresh.
 
-The one shared mutable holder for the in-process HK Stock List, with the same `get_X()` treatment as other infra (§5.1). `app/main.py` (§16) constructs it at startup; `EntityAnalysisSkill` (§8.2) and the sync route (§15.5) reach the same instance via `get_hk_stock_list_cache()`, so a refresh's rebind of `.entries` is immediately visible.
+The one shared mutable holder for the in-process HK Stock List, with the same `get_X()` treatment as other infra (§5.1). `app/main.py` (§16) constructs it at startup; `EntityAnalysisSkill` (§8.2) and the sync route (§15.5) reach the same instance via `get_hk_stock_list_cache()`, so a refresh's rebind of `.entries` and `.name_index` is immediately visible.
 
 ```python
 class HKStockListCache:
-    def __init__(self, entries: dict[str, Stock]):
+    def __init__(self, entries: dict[str, Stock], name_index: StockNameIndex):
         self.entries = entries
+        self.name_index = name_index
 
     def __len__(self) -> int:
         """Lets GET /health's readiness gate (§15.2) just do len(cache) > 0."""
@@ -688,55 +689,124 @@ def get_hk_stock_list_cache() -> HKStockListCache:
     return _hk_stock_list_cache
 ```
 
-#### Function: `lookup_stock(name_or_code: str, min_overlap_ratio: float) -> Optional[Stock]`
+#### `app/common/stock_name_match.py` — company-name matching
 
-```
-Purpose : Resolve a company name or stock code against the HK Stock List.
-          Called by EntityAnalysisSkill._verify_mention() (§8.2) as the name search for a
-          mention whose code is missing or does not check out.
-Params  : name_or_code       — the mention's company_name as the LLM wrote it
-          min_overlap_ratio    — NAME_MATCH_MIN_OVERLAP_RATIO
-Returns : Stock on a match, None on a miss.
-```
+One normalizer and one prepared index serve both name checks in `_verify_mention()` (§8.2): `names_agree()` for `_name_consistent()` (step 1), and `search()` for `lookup_stock()` (step 3). Rationale: system-design.md §9.2. Traditional-to-simplified folding needs `opencc` (runtime dependency).
 
-No cache parameter: `lookup_stock()` calls `get_hk_stock_list_cache()` directly. Fuzzy matching needs the full set in-process (system-design.md §9.2), so the exact-code path uses the same in-memory data.
+**Normalization.** Each name has up to three comparison forms, distinct, longest first:
 
 ```python
-from app.common.hk_stock_list import get_hk_stock_list_cache
+import opencc
+
+_T2S = opencc.OpenCC("t2s")
+_COUNTER_MARKER_RE = re.compile(r"[－\-][A-ZＡ-Ｚ]{1,3}$")          # －Ｗ, -SW, －Ｂ …
+_FULLWIDTH = str.maketrans({chr(c): chr(c - 0xFEE0) for c in range(0xFF01, 0xFF5F)})
+_SPACE_BETWEEN_LATIN_RE = re.compile(r"(?<=[a-z0-9])\s+(?=[a-z0-9])")
+_ZH_LEGAL_SUFFIX_RE = re.compile(r"(股份)?有限公司$|公司$")
+_ZH_GENERIC_TAIL_RE = re.compile(r"(控股|股份)+$")                   # matched after t2s
+_EN_LEGAL_WORDS = {"limited", "ltd", "co", "company", "corporation", "corp", "inc", "plc", "llc", "the"}
+_EN_GENERIC_WORDS = {"holdings", "holding", "hldg", "hldgs", "group", "gp", "international", "intl", "int'l",
+                     "and", "&"}
+
+def _normalize(text: str) -> str:
+    """Counter marker dropped, full-width to ASCII, traditional to simplified, case-folded; whitespace removed
+    except one space between two Latin words."""
+    text = _T2S.convert(_COUNTER_MARKER_RE.sub("", text).translate(_FULLWIDTH)).casefold()
+    text = re.sub(r"\s+", " ", text).strip()
+    return _SPACE_BETWEEN_LATIN_RE.sub("\x00", text).replace(" ", "").replace("\x00", " ")
+
+def name_forms(raw: str) -> tuple[str, ...]:
+    """The normalized name, then with its legal suffix stripped, then also its generic tail; empties dropped."""
+    full = _normalize(raw)
+    latin = full.isascii()
+    if latin:
+        legal = " ".join(t for t in re.split(r"[\s.,]+", full) if t and t not in _EN_LEGAL_WORDS)
+        generic = " ".join(t for t in legal.split() if t not in _EN_GENERIC_WORDS)
+    else:
+        legal = _ZH_LEGAL_SUFFIX_RE.sub("", full)
+        generic = _ZH_GENERIC_TAIL_RE.sub("", legal)
+    return tuple(dict.fromkeys(f for f in (full, legal, generic) if f))
 ```
 
-**Format detection and code normalization** (system-design.md §9.2): if `name_or_code`, with surrounding whitespace trimmed, fully matches `\d{2,5}(\.HK)?` (case-insensitive), treat it as a code lookup — drop the `.HK` suffix, zero-pad the digits to 5, then `get_hk_stock_list_cache().entries.get(normalized)` — a hit returns the `Stock` already stored there directly (no wrapping step; see above's note on `entries`' value type), a miss returns `None`. Anything else — a single digit, or a name that merely contains digits such as `"361度"` — is a name query and runs fuzzy matching against the same `get_hk_stock_list_cache().entries`. A `name_or_code` that is empty after trimming is a miss: return `None` without scanning, logged with `path="fuzzy_name"`, `candidates_scanned=0`, `found=False` (`_fuzzy_match` divides by `len(query)`, so it must never see an empty query).
-
-**Fuzzy name matching** (rationale: system-design.md §9.2):
+**Index.** Built from `HKStockListCache.entries` at every refresh (`refresh_hk_stock_list()`, below):
 
 ```python
-def _normalize_name(text: str) -> str:
-    return "".join(text.split()).casefold()   # HKEX English names are upper case; spaces are not evidence
+@dataclass(frozen=True)
+class NameEntry:
+    stock_code: str
+    forms: tuple[str, ...]          # name_forms() of one of the stock's names
+    latin: bool                     # forms[0].isascii()
 
-def _fuzzy_match(query: str, candidates: dict[str, Stock], min_overlap_ratio: float) -> Optional[str]:
-    q = _normalize_name(query)
-    scored = []
-    for code, entry in candidates.items():
-        for candidate_name in (entry.company_name_zh, entry.company_name_en):
-            name = _normalize_name(candidate_name)
-            overlap = len(set(q) & set(name))  # multiset overlap per system-design.md §9.2
-            overlap_ratio = overlap / len(q)
-            if overlap_ratio >= min_overlap_ratio:
-                lcs = _lcs_length(q, name)
-                scored.append((overlap, lcs, code))
-    if not scored:
-        return None
-    scored.sort(key=lambda t: (-t[0], -t[1]))  # char_overlap_count DESC, then lcs_length DESC
-    return scored[0][2]
+@dataclass(frozen=True)
+class StockNameIndex:
+    names: tuple[NameEntry, ...]                        # one per distinct non-empty zh/en name of each stock
+    forms_by_code: dict[str, tuple[tuple[str, ...], ...]]   # stock_code -> its names' forms (_name_consistent)
+    latin_prefix: dict[str, tuple[NameEntry, ...]]      # first 3 letters of a word of a Latin form -> its names
+
+def build_name_index(entries: dict[str, Stock]) -> StockNameIndex: ...
+
+@dataclass(frozen=True)
+class NameSearchResult:
+    stock_code: Optional[str]       # None on a miss
+    candidates_scanned: int         # names scored, for lookup_stock_completed
 ```
 
-> `set(query) & set(candidate_name)` simplifies system-design.md §9.2's multiset intersection; use `collections.Counter` intersection if repeated-character precision matters (validate with Q-16, §18).
+**`names_agree(name: str, listed: tuple[tuple[str, ...], ...]) -> bool`** (step 1). `listed` is `index.forms_by_code[code]`. True when some form `q` of `name_forms(name)` and some listed form `n` satisfy: `q` is an ordered subsequence of `n` (農行 ⊂ 農業銀行), or `n` is an ordered subsequence of `q` and `len(n) >= 0.6 * len(q)` (a short listed name inside a long legal name, but not "CHINA NEXT-GEN" inside "Amundi FTSE China A50 Index ETF").
 
-**Outbound formatting:** `_fuzzy_match` returns a bare native code; the caller resolves it via `entries[code]`, like the exact-code path.
+**`search(index: StockNameIndex, query: str) -> NameSearchResult`** (step 3):
+
+```
+q_forms = name_forms(query)
+if not q_forms: return NameSearchResult(None, 0)
+
+exact = {e.stock_code for e in index.names if set(e.forms) & set(q_forms)}
+if exact: return NameSearchResult(the code if len(exact) == 1 else None, len(index.names))
+
+q_latin = q_forms[0].isascii()
+pool = every index.latin_prefix[w[:3]] for each word w (3+ letters) of each Latin q form   if q_latin
+       else every non-Latin entry of index.names
+score each entry in pool: the highest _score(q, n) over q in q_forms, n in entry.forms (None: no match)
+the highest score wins if exactly one stock_code holds it; a tie between stock codes is a miss
+return NameSearchResult(winner or None, len(pool))
+```
+
+`_score(q, n)` returns a tuple compared element by element, or `None`:
+
+```
+both Latin (qw, nw = word lists of q and n):
+    name_hits  = count of words x in nw where some y in qw has y == x, or len(x) >= 3 and y.startswith(x)
+    query_hits = count of words y in qw where some x in nw has x == y, or len(y) >= 3 and x.startswith(y)
+    name_hits == len(nw) and total letters of nw >= 3   -> (4, name_hits / len(qw), len(nw))    # whole name in query
+    query_hits == len(qw)                               -> (3, query_hits / len(nw), -len(n))  # whole query in name
+    otherwise None
+one Latin, one not -> None
+both CJK:
+    len(q) < 2                                          -> None
+    q == n                                              -> (9, 1.0, 0)
+    neither set(q) <= set(n) nor set(n) <= set(q)       -> None
+    len(q) <= len(n) and q is an ordered subsequence of n, tightest span [start, end):
+                                                        -> (5, len(q) / (end - start), int(start == 0), len(q) / len(n), -len(n))
+    3 <= len(n) < len(q) and n is an ordered subsequence of q
+                                                        -> (4, len(n) / len(q), len(n))
+    otherwise None
+```
+
+The tightest span is the earliest-ending match, started as late as that end allows.
+
+#### Function: `lookup_stock(name: str) -> Optional[Stock]`
+
+```
+Purpose : Name search over the HK Stock List: step 3 of EntityAnalysisSkill._verify_mention() (§8.2),
+          for a mention whose code is missing or does not check out.
+Params  : name — the mention's company_name as the LLM wrote it
+Returns : Stock on a unique best match, None on a miss (no match, or a tie between companies).
+```
+
+No cache parameter: `lookup_stock()` calls `get_hk_stock_list_cache()` once and reads `.entries` and `.name_index` off that instance. It always runs `search()`: codes are checked in `_verify_mention()` step 1, which handles code normalization (system-design.md §9.2).
 
 #### Performance verification — `lookup_stock_completed` log event
 
-`_fuzzy_match` is an O(N) synchronous scan over ~2,000–2,600 entries (system-design.md §9.2.1) on the same event loop as all four layers (§16), so a slow call blocks every consumer loop. Real impact is unmeasured (§18 I-1), so `lookup_stock` logs its own timing:
+`search()` runs synchronously on the event loop shared by all four layers (§16). Pre-traffic measurements are in §18 I-1. `lookup_stock` logs its own timing for the real-traffic check:
 
 ```python
 import time
@@ -744,23 +814,20 @@ import logging
 
 _SLOW_CALL_THRESHOLD_MS = 20   # WARNING instead of INFO above this; not env-configurable
 
-def lookup_stock(name_or_code, min_overlap_ratio) -> Optional[Stock]:
+def lookup_stock(name: str) -> Optional[Stock]:
     start = time.perf_counter()
     hk_stock_list_cache = get_hk_stock_list_cache()
-    # ... existing exact-code / fuzzy-name branches build `result: Optional[Stock]`
-    # and set local `path` ("exact_code" | "fuzzy_name") and `candidates_scanned`
-    # (0 for exact_code — an O(1) dict lookup; len(hk_stock_list_cache) for
-    # fuzzy_name — _fuzzy_match has no short-circuit, always a full scan;
-    # HKStockListCache.__len__ makes this len() call work directly) ...
+    result = search(hk_stock_list_cache.name_index, name)
+    stock = hk_stock_list_cache.entries[result.stock_code] if result.stock_code else None
 
     latency_ms = (time.perf_counter() - start) * 1000
     level = logging.WARNING if latency_ms > _SLOW_CALL_THRESHOLD_MS else logging.INFO
-    logger.log(level, "lookup_stock_completed", name_or_code=name_or_code, path=path,
-               candidates_scanned=candidates_scanned, latency_ms=latency_ms, found=result is not None)
-    return result
+    logger.log(level, "lookup_stock_completed", name=name, candidates_scanned=result.candidates_scanned,
+               latency_ms=latency_ms, found=stock is not None)
+    return stock
 ```
 
-`name_or_code` in the log line identifies which entity triggered a slow call. `logger` is the shared structlog logger (`app/logger.py`).
+`name` in the log line identifies which entity triggered a slow call. `logger` is the shared structlog logger (`app/logger.py`).
 
 #### Sources
 
@@ -805,19 +872,23 @@ def _parse_equity_codes(content: bytes) -> set[str]:
     finally:
         workbook.close()
 
+def _is_extra_counter(code: str, zh_name: str, en_name: str) -> bool:
+    """An RMB counter (80700 騰訊控股－Ｒ) or a trading-only line (－Ｔ / -T) of a company listed under another code."""
+    return (code.startswith("8") and zh_name.endswith("Ｒ")) or zh_name.endswith("Ｔ") or en_name.endswith("-T")
+
 def _parse_hk_stock_list(en_content: bytes, zh_content: bytes, securities_content: bytes) -> dict[str, Stock]:
-    """Join the two name files by stock code; keep equities only."""
+    """Join the two name files by stock code; keep equities only, without extra counters."""
     en_names = _parse_names(en_content)
     zh_names = _parse_names(zh_content)
     entries: dict[str, Stock] = {}
     for code in _parse_equity_codes(securities_content):
         if code not in en_names and code not in zh_names:
             continue                                       # an equity in neither file is skipped
-        entries[code] = Stock(
-            stock_code=code, exchange="HKEX",
-            company_name_zh=zh_names.get(code, ""),        # a name missing from one file is ""
-            company_name_en=en_names.get(code, ""),
-        )
+        zh_name = zh_names.get(code, "")                   # a name missing from one file is ""
+        en_name = en_names.get(code, "")
+        if _is_extra_counter(code, zh_name, en_name):
+            continue                                       # rationale: system-design.md §9.2.1
+        entries[code] = Stock(stock_code=code, exchange="HKEX", company_name_zh=zh_name, company_name_en=en_name)
     return entries
 ```
 
@@ -881,11 +952,11 @@ async def _fetch_and_filter_hk_stock_list(http_client: httpx.AsyncClient) -> dic
 
 ```
 Purpose : Fetch the HK Stock List from HKEXnews and load it into the process-wide
-          HKStockListCache. The first call registers a new HKStockListCache as the singleton;
-          later calls rebind .entries on the existing instance (see the warning at the call
-          site). Called by app/main.py's eager startup load (system-design.md §9.2.1) and by
+          HKStockListCache, with its StockNameIndex. The first call registers a new
+          HKStockListCache as the singleton; later calls rebind .entries and .name_index on
+          the existing instance (see the warning at the call site). Called by app/main.py's eager startup load (system-design.md §9.2.1) and by
           POST /admin/hk-stock-list-sync (§15.5).
-On fetch failure : Any exception installs an empty HKStockListCache({}) if none is registered
+On fetch failure : Any exception installs an empty HKStockListCache if none is registered
           yet, then re-raises, so get_hk_stock_list_cache() stays usable and GET /health
           reports not_ready until a later call succeeds. An existing cache is left untouched.
           A fetch that yields zero equities is a failure too (ParseError): HKEX always lists
@@ -906,17 +977,20 @@ async def refresh_hk_stock_list() -> int:
         new_entries = await _fetch_and_filter_hk_stock_list(get_http_client())
         if not new_entries:
             raise ParseError("HK Stock List parsed to zero equities", category=ErrorCategory.STOCK_LIST)
+        new_name_index = await asyncio.to_thread(build_name_index, new_entries)
         if _hk_stock_list_cache is None:
-            _hk_stock_list_cache = HKStockListCache(new_entries)
+            _hk_stock_list_cache = HKStockListCache(new_entries, new_name_index)
         else:
-            # WARNING: rebind .entries, never mutate in place. A lookup_stock() call mid-iteration
-            # over the old dict must keep seeing a consistent snapshot.
+            # WARNING: rebind both, back to back with no await between, never mutate in place. A
+            # lookup_stock() call must see one list's entries and name_index together, and a call
+            # mid-iteration over the old ones must keep seeing a consistent snapshot.
             _hk_stock_list_cache.entries = new_entries
+            _hk_stock_list_cache.name_index = new_name_index
     except Exception:
         # Deliberately bare: the process must never crash over this dependency. Always re-raises;
         # only the fallback-cache install is unconditional.
         if _hk_stock_list_cache is None:
-            _hk_stock_list_cache = HKStockListCache({})
+            _hk_stock_list_cache = HKStockListCache({}, build_name_index({}))
         raise
 
     return len(new_entries)
@@ -1935,19 +2009,20 @@ Raises one of the four typed exceptions (§7.2) on any failure above — `SkillB
 
 #### `_verify_mention(mention, article_text) -> Optional[Stock]`
 
-Resolves one `EntityMention` against `self._hk_stock_list_cache.entries` (rationale: system-design.md §9.2):
+Resolves one `EntityMention` against `self._hk_stock_list_cache` (rationale: system-design.md §9.2):
 
 ```
 code = mention.stock_code normalized per system-design.md §9.2 (trim, drop ".HK", zero-pad 2–5 digits to 5;
        anything else → no code)
+entries = self._hk_stock_list_cache.entries
 if code in entries:
     stock = entries[code]
     if _name_consistent(mention.company_name, stock) or _code_printed(code, article_text):
         return stock
-return lookup_stock(mention.company_name, self._config.name_match_min_overlap_ratio)   # §4.2 name search
+return lookup_stock(mention.company_name)   # §4.2 name search
 ```
 
-`_name_consistent(name, stock)`: true when `name` and `stock.company_name_zh` or `stock.company_name_en` agree after normalizing both sides — full-width to half-width, whitespace removed, case-folded, HK variant characters folded (滙→匯, 鋭→銳, 綫→線, 峯→峰, 裏→裡, 衞→衛, 眾→衆), a trailing counter marker (`－Ｗ`, `-SW`, …) dropped, and the words 有限公司/控股/集團/股份/Limited/Holdings/Group/Company/Co/Ltd/Inc removed. They agree when the normalized mention name is an ordered subsequence of the normalized listed name (農行 ⊂ 農業銀行), or the listed name is an ordered subsequence of the mention name and at least 60% of its length (a short listed name inside a long legal name, but not "CHINA NEXT-GEN" inside "Amundi FTSE China A50 Index ETF").
+`_name_consistent(name, stock)`: `names_agree(name, self._hk_stock_list_cache.name_index.forms_by_code[stock.stock_code])` (§4.2), the same normalization the name search uses.
 
 `_code_printed(code, article_text)`: true when the article prints the code in a code-shaped form — `(0700)`, `（00700）`, `00700.HK`, `Stock Code: 700`, `股份代號：700` — with leading zeros optional. A bare number elsewhere in the text never counts.
 
@@ -5421,7 +5496,7 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 | Q-10 | Post-MVP: quality monitoring Service design (log ingestion, LLM-as-Judge, post-event price correlation) | LLM quality improvement | Post-MVP |
 | Q-11 | Validate the common `HTTP_TIMEOUT_S=120` (§4.1 — covers SADI, Admin, and HKEXnews calls) against real latency measurements (`LLM_API_TIMEOUT_S` is measured, §4.1) | Latency tuning | Week 1 |
 | Q-15 | Validate `source_heat_score`'s `source_count / TOTAL_ACTIVE_SOURCES` formula against real cross-source corroboration rates | `source_heat_score` calibration | Week 1-2 |
-| Q-16 | Validate `lookup_stock`'s fuzzy name-matching against real HK news article entity mentions | EntityAnalysisSkill accuracy | Week 2 |
+| Q-16 | Validate the name checks of entity verification (§4.2 `stock_name_match`) at real volume: how often `lookup_stock` decides an entity, and a hand-checked sample of its matches and of unverified entities | EntityAnalysisSkill accuracy | Week 2 |
 | Q-17 | Morning Brief cache retention: Events never age out of the cache (§14.4), so it grows without bound and old high-impact Events keep surfacing in the backfill | Morning Brief content; build cost (§14.1, §14.9); Redis memory | Pre-go-live (product decision) |
 
 (Q-4, Q-5, Q-7, Q-12, Q-13, Q-14 are marked Resolved in system-design.md §14 and are not repeated here.)
@@ -5430,7 +5505,7 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 
 | # | Gap | Where | Recommended resolution |
 |---|---|---|---|
-| I-1 | **`_fuzzy_match`'s (§4.2) real-world performance is unverified:** an O(N) synchronous scan over ~2,000–2,600 entries on the shared event loop (§16). A synthetic benchmark of the §4.2 code (2,600 entries with Chinese and English names, laptop, Python 3.14) measured a ~2–3 ms floor per call (every call rebuilds each name's character set) and ~12–23 ms when hundreds to ~1,400 names pass the overlap ratio and each runs `_lcs_length()`; expect slower on a shared-vCPU VM. | §4.2 | `lookup_stock_completed` (§4.2) provides the measurements. Before traffic: a synthetic micro-benchmark plus an event-loop heartbeat-gap test. After: p50/p95/p99 from the logs. If blocking is meaningful, wrap in `asyncio.to_thread()` (as SADI does for `feedparser`); not before, since dispatch overhead may net-lose. |
+| I-1 | **`lookup_stock`'s (§4.2) real-traffic latency is unmeasured.** `search()` runs synchronously on the shared event loop (§16). Before traffic it measured p50 0.18 ms, p99 5.0 ms, max 6.6 ms over 737 real name queries (Python 3.12, Apple M5 Pro), with the `StockNameIndex` prepared at refresh (16 ms to build), and it runs for about 1.5% of entities on real news. So `asyncio.to_thread()` is not needed. | §4.2 | After traffic: p50/p95/p99 from `lookup_stock_completed`. Revisit `asyncio.to_thread()` only if calls cross the 20 ms WARNING threshold. |
 | I-3 | **BriefSummarySkill/EventLLMScoringSkill's model and `Max Tokens` (§8 table: `gemini-3.1-flash-lite`, 4096/2048) are unmeasured starting values;** EntityAnalysisSkill's row is measured (§8). | §8, system-design.md §9.1 | Measure on real aggregated Events before implementing either Skill: check for calls hitting the max (truncated JSON → `LLMSchemaViolationError`) and for persistent unused headroom at p95/p99; adjust per Skill. |
 ---
 
