@@ -1,0 +1,4 @@
+google-genai==2.33.0
+pydantic==2.14.1
+opencc
+rapidfuzz
