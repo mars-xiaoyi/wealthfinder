@@ -71,6 +71,18 @@ S8's rates match the in-sample HKEX rows (English legal names 20 of 26 right her
 
 Two of its three errors are worth knowing: "POSTAL SAVINGS BANK OF CHINA CO., LTD." → 中國銀行, because the whole listed name "BANK OF CHINA" appears inside the query; and 視頻有限公司 → 中國數字視頻, which is a truncated extraction of the issuer name (label noise).
 
+## Held-out news check (`holdout_sep.py`, `results_holdout_sep.md`)
+
+S8 was then scored once, unchanged, on cleaned articles published 2026-09-01 to 09-07 (`cleaned_news_export.csv`, 220 news articles and 160 HKEX announcements). Articles from 09-08 to 09-13 are reserved for implementation testing and were not read. Companies used by any earlier case set are excluded. That leaves 198 cases from 144 companies: 107 news `name(code)` mentions (`data/sep_news_cases.py`), 9 A-share/US-only companies and 82 HKEX legal names (`data/sep_hkex_cases.py`). The pass bar was fixed before scoring: S8 must get more right than `WRatio`, and S8's wrong rate must be 3% or below.
+
+| Matcher | Correct | Wrong | Missed |
+|---|---|---|---|
+| §4.2 as written | 106 | 10 | 82 |
+| `WRatio`, cutoff 90 | 180 | 1 | 17 |
+| **S8** | **187** | **2** | **9** |
+
+S8 passes (187 > 180; 1.0% wrong). On news mentions S8 and `WRatio` tie at 105 / 0 / 2 and both reject all 9 non-HKEX companies. The gap comes from HKEX English legal names (S8 35 right against 29). The two news misses are 群核 / 群核科技, whose listed Chinese name is the English "MANYCORE TECH". Both wrong matches are English legal names: "RUIFENG GREEN ENERGY AI COMPUTING HOLDINGS" → 綠色能源科技集團 and "CENTRAL CHINA MANAGEMENT" → 建業地產. This is the known short-name-inside-a-longer-name limit.
+
 ## What S8 does (final)
 
 1. **Code path** unchanged from §4.2 (`\d{2,5}(\.HK)?`, zero-pad to 5).
@@ -100,7 +112,7 @@ Cost: p50 0.17 ms, p99 4.2 ms, max 6.5 ms over all 475 queries (Python 3.12, App
 | `match_cases.py`, `match_revised.py` | §4.2 as written, and the first-pass fixes (kept for comparison) |
 | `algorithms.py` | normalization, `rapidfuzz` scorers and the TF-IDF matcher |
 | `subseq.py` | the subsequence matcher, one flag per round |
-| `evaluate.py`, `compare.py`, `holdout.py` | results per round; per-category results and latency; the held-out check |
+| `evaluate.py`, `compare.py`, `holdout.py`, `holdout_sep.py` | results per round; per-category results and latency; the held-out HKEX and news checks |
 | `bench.py` | the earlier I-1 latency and heartbeat test for §4.2 and R1–R7 |
 
 `algorithms.py`, `subseq.py`, `evaluate.py` and `compare.py` need `rapidfuzz` and `opencc` (`uv pip install rapidfuzz opencc`); the rest run on a plain `python3`.
