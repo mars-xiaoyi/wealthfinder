@@ -2,6 +2,19 @@
 
 Throwaway scripts that find the best fuzzy-matching algorithm for `lookup_stock`, measured against the live HK Stock List (2,798 equities, fetched 2026-10-24). No LLM is involved. Starting point: implementation.md §4.2's `_fuzzy_match` as written.
 
+## Conclusion
+
+Name matching runs twice inside EntityAnalysisSkill's verification (`_verify_mention()`, impl.md §8.2). Step 1 checks the model's name against the listed name for its code, and step 3 (`lookup_stock`) searches the whole list by name when the code is missing or fails the checks.
+
+1. **Replace §4.2's `_fuzzy_match`.** As step 3 it makes Entity Analysis worse than no name search at all: F1 0.954 against 0.962 on 127 cleaned-news articles, from 19 wrong matches.
+2. **Step 3 becomes S8.** It scores best of every name search measured: F1 0.962, and 0.908 with every code stripped.
+3. **Steps 1 and 3 share S8's normalization.** Entity F1 is unchanged.
+4. **Remove `NAME_MATCH_MIN_OVERLAP_RATIO`,** since S8 has no threshold, **and `lookup_stock`'s code-format branch,** since only `company_name` reaches it.
+5. **Drop RMB counters and `－Ｔ` trading-only lines when the list loads.**
+6. **I-1, pre-traffic part:** p99 5 ms, and the name search runs for about 1.5% of entities, so `asyncio.to_thread()` is not needed. Q-16 stays open only for its at-scale check.
+
+The measurements behind each point are below.
+
 ## Result in one table
 
 475 labeled cases (details below), all scored as correct / wrong / missed. A wrong match becomes a false entity silently, while a miss only drops one mention, so wrong matches matter more.
@@ -110,7 +123,7 @@ S8's one "wrong" hit, 納真科技 → 09856, is a gap in the automatic gold. Th
 - **HKEX legal names, where S8 wins clearly:** these now reach the fallback only when the model's code is wrong and the announcement doesn't print it. HKEX announcements print the issuer's code in the header.
 - **The 15 real name arguments** (that spike's `lookup_args.json`): both get 15 of 15, including Barclays, 巴克萊, 英偉達 and the REITs as correct misses, and 碧桂園 → 02007 rather than 碧桂園服務.
 - **Latency:** the simpler search as written takes 8.4 ms per call (p99 8.6 ms), because it normalizes every name on every call. S8 takes p99 5.0 ms with names prepared at load. Both are under the 20 ms warning threshold.
-- **Normalization:** the adopted `_name_consistent()` (impl.md §8.2) already normalizes with the simpler search's 7-character map and suffix list. S8 uses OpenCC `t2s` and its own suffix and generic-tail lists. Whichever matcher is adopted, the code check and the name search should share one normalizer.
+- **One normalization for both steps** (`shared_normalizer.py`, `results_shared_normalizer.md`): with step 1 (`_name_consistent`) switched to S8's normalization, entity F1 is unchanged on both sets (0.962 / 0.908). Seven step-1 decisions change: S8's normalization alone accepts 蜜雪冰城, HOME CONTROL, 百盛商業集團, 廣東愛得威建設(集團) and 恆地, and the spike's alone accepts 雲晶數智科技集團 and 嚐‧高美. Every one is still settled the same by the printed-code check or the name search.
 
 ## What S8 does (final)
 
@@ -142,7 +155,7 @@ Cost: p50 0.17 ms, p99 4.2 ms, max 6.5 ms over all 475 queries (Python 3.12, App
 | `algorithms.py` | normalization, `rapidfuzz` scorers and the TF-IDF matcher |
 | `subseq.py` | the subsequence matcher, one flag per round |
 | `evaluate.py`, `compare.py`, `holdout.py`, `holdout_sep.py` | results per round; per-category results and latency; the held-out HKEX and news checks |
-| `fallback_swap.py`, `compare_simple.py` | the fallback swap on the LLM Skill spike's stored outputs; S8 against that spike's simpler search |
+| `fallback_swap.py`, `compare_simple.py`, `shared_normalizer.py` | the fallback swap on the LLM Skill spike's stored outputs; S8 against that spike's simpler search; step 1 with S8's normalization |
 | `bench.py` | the earlier I-1 latency and heartbeat test for §4.2 and R1–R7 |
 
 `algorithms.py`, `subseq.py`, `evaluate.py` and `compare.py` need `rapidfuzz` and `opencc` (`uv pip install rapidfuzz opencc`); the rest run on a plain `python3`.
