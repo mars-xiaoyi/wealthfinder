@@ -62,8 +62,8 @@ SAPI is the intelligence layer of the HK Stock AI Research Assistant. It consume
 | Async framework | asyncio | Optimal for IO-intensive LLM API calls; single-threaded concurrency is safe for shared in-memory state |
 | API framework | FastAPI | Native async support; automatic OpenAPI documentation |
 | Messaging | Redis Streams | Persistent; Consumer Group guarantees at-least-once delivery; `XREADGROUP COUNT+BLOCK` provides native batching with timeout; `XAUTOCLAIM` provides delivery_count for retry management |
-| LLM provider | Vertex AI (Gemini) | Enterprise data isolation; no training data usage; asia-east1 region; unified SDK with `vertexai=True` |
-| LLM structured output | Instructor | Pydantic-based schema enforcement and automatic retry for structured output; used by BriefSummarySkill and EventScoringSkill via `generate_structured`; EntityAnalysisSkill uses raw SDK for Function Calling loop control |
+| LLM provider | Vertex AI (Gemini) | Enterprise data isolation; no training data usage; `global` endpoint (current Gemini models are not served in `asia-east1`/`asia-east2`); unified SDK with `vertexai=True` |
+| LLM structured output | Gemini native structured output + Pydantic | `response_json_schema` makes Gemini enforce field presence and types at the API level; Pydantic parses the response into the Skill's model; used by all three Skills via `generate_structured` |
 | Database client | asyncpg | Native asyncio driver |
 | Cache | Redis | Existing dependency; low-latency Morning Brief serving |
 
@@ -256,7 +256,7 @@ Defined as `EntityAnalysisConfig`: implementation.md §4.1.
 | Scenario | Strategy |
 |---|---|
 | LLM API call failure | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
-| LLM schema violation (Instructor exhausted retries) | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
+| LLM schema violation (response does not parse into the output schema, e.g. cut off at `max_output_tokens`) | No DB record written; log error; do not ACK → redelivery → Dead Letter at `ENTITY_ANALYSIS_MAX_RETRY` |
 | `LLMRateLimitError` | Pause entire Worker Pool for `RATE_LIMIT_BACKOFF_S`; do not ACK → redelivery after backoff; see Section 12.1 Rate Limit Backoff policy |
 | All entities filtered by stock verification | Valid `entities=[]` outcome — no DB record written, no signal emitted; ACK |
 | `cleaned_id` missing from SADI's `cleaned_news` response (silently omitted per `api.md` §2.5, not an HTTP error) | Log warning with `cleaned_id`; ACK — skip this article. Retrying would not recover an ID that isn't in SADI's response. Not expected in normal operation today (SADI has no `cleaned_news` retention/purge job as of this writing) — the log exists to surface it if that changes |
@@ -686,11 +686,11 @@ The client applies `POOL_MATCH_BOOST` to watchlist-matching Events and re-ranks 
 
 ### 8.1 Design Principle
 
-All LLM interactions are encapsulated behind a provider-agnostic Adapter interface. Switching providers requires only a new Adapter implementation with no changes to Skill logic. The Adapter exposes two methods corresponding to two distinct call modes used by different Skills.
+All LLM interactions are encapsulated behind a provider-agnostic Adapter interface. Switching providers requires only a new Adapter implementation with no changes to Skill logic. The Adapter exposes one generation method, used by every Skill.
 
 ### 8.2 MVP Implementation
 
-Vertex AI (Gemini), `asia-east1`, via `google-genai` (raw calls) and Instructor (structured-output calls), authenticated through Google Cloud IAM. Exact client setup: implementation.md §7.3 (`VertexAIAdapter`).
+Vertex AI (Gemini), `global` endpoint, via `google-genai`'s native structured output, authenticated through Google Cloud IAM. Each Skill pins its own model (§9.1). The SDK has no default timeout and the Adapter configures no SDK-level retry: every call is one bounded attempt, and retries happen at the message level (§3.6, §12.1). Exact client setup: implementation.md §7.3 (`VertexAIAdapter`).
 
 ### 8.2.1 Timeout Management
 
@@ -698,11 +698,11 @@ LLM and SADI API call timeouts are both centralised in environment variables rat
 
 ### 8.3 Standard Data Structures
 
-Five shared types cross the Adapter boundary: `ToolCall`/`ToolResultMessage`/`ToolDefinition` (the Function Calling wire shapes), `Message` (per-role conversation history unit), and the two response wrappers `LLMResponse`/`StructuredLLMResponse[T]`. Both response wrappers carry `input_tokens`/`output_tokens`/`latency_ms` (plus `instructor_retries` on the structured one) measured by the Adapter itself — the only place these are knowable — rather than the Adapter logging them or reaching into a Skill-owned accumulator; the calling Skill reads them off the return value to build its own `LlmCallMetric` (§9.8). Exact fields: implementation.md §7.1.
+Three shared types cross the Adapter boundary: `Message` (per-role conversation history unit), `GenerationConfig` (the calling Skill's model, temperature and output cap), and the response wrapper `StructuredLLMResponse[T]`. The wrapper carries `input_tokens`/`output_tokens`/`latency_ms` measured by the Adapter itself (`output_tokens` includes thinking tokens, which are billed as output) — the only place these are knowable — rather than the Adapter logging them or reaching into a Skill-owned accumulator; the calling Skill reads them off the return value to build its own `LlmCallMetric` (§9.8). Exact fields: implementation.md §7.1.
 
 ### 8.4 Adapter Interface
 
-`LLMAdapter` is an abstract base class with three methods: `generate_raw(messages, tools) → LLMResponse` (Function Calling loop control, EntityAnalysisSkill only), `generate_structured(messages, output_schema) → StructuredLLMResponse[T]` (used by all three Skills), and `close()`. Exact interface: implementation.md §7.1.
+`LLMAdapter` is an abstract base class with two methods: `generate_structured(messages, output_schema, generation_config) → StructuredLLMResponse[T]` (used by all three Skills) and `close()`. Exact interface: implementation.md §7.1.
 
 ### 8.5 Exception Mapping
 
@@ -713,9 +713,9 @@ All provider-specific exceptions are mapped to standard types. Skill layer handl
 | `LLMRateLimitError` | Yes | Provider rate limit hit |
 | `LLMProviderError` | Yes | Provider-side error (5xx, network timeout) |
 | `LLMAuthenticationError` | Yes (message-level; not self-healing) | Provider rejects the call as unauthenticated/unauthorized (401/403 — invalid/expired credentials, revoked service account, missing IAM role, API not enabled) |
-| `LLMSchemaViolationError` | No | Instructor internal retries exhausted; output still does not conform to schema |
+| `LLMSchemaViolationError` | No | Response does not parse into the output schema |
 
-> `LLMSchemaViolationError` occurs when Pydantic validators defined in the output schema (e.g. value range constraints) are repeatedly violated after Instructor's internal retries. Gemini's `response_schema` parameter prevents missing field and type errors at the API level; Pydantic validators are the second-layer protection for business logic constraints.
+> Gemini's `response_json_schema` prevents missing-field and type errors at the API level, so `LLMSchemaViolationError` in practice means a malformed or truncated response (cut off at the Skill's `max_output_tokens`). It is not retried inside the Adapter: EntityAnalysisSkill's message is redelivered (§3.6), and BriefSummarySkill/EventScoringSkill apply their fallback (§9.7). Business-rule checks (lengths, ranges) run in each Skill after the call, not as schema validators.
 
 > Handling mechanisms for `LLMRateLimitError` (Worker Pool backoff) and `LLMAuthenticationError` (CRITICAL escalation, since unlike a transient 5xx it fails identically until an operator intervenes) are covered once, in §12.1's Rate Limit Backoff and LLM Authentication Failure mechanisms — not repeated here. `BusinessValidationError` is a log-only event type (not an exception class), covered in §9.7/§9.8.
 
@@ -729,7 +729,7 @@ Three Skills encapsulate all LLM interactions. Each Skill is a versioned, reusab
 
 | Skill | Adapter Method | Temperature | Max Tokens | Depends On |
 |---|---|---|---|---|
-| EntityAnalysisSkill | `generate_raw` + `generate_structured` | 0 | 8192 | — |
+| EntityAnalysisSkill | `generate_structured` | 0 | 16384 | — |
 | BriefSummarySkill | `generate_structured` | 0.1 | 4096 | EntityAnalysisSkill output |
 | EventScoringSkill | `generate_structured` | 0 | 2048 | BriefSummarySkill output |
 
@@ -750,6 +750,7 @@ EventScoringSkill:    SCORING_SKILL_VERSION = "v1.0.0"
 | Prompt wording adjustment, few-shot example modification | Patch (v1.0.0 → v1.0.1) |
 | Output field addition/removal, scoring logic adjustment | Minor (v1.0.0 → v1.1.0) |
 | Output schema structural change | Major (v1.0.0 → v2.0.0) |
+| Model change | Minor (v1.0.0 → v1.1.0) |
 
 **Version storage:** Each Skill's version is stored in the `version` field of its corresponding JSONB output column — `additional_outcome.version`, `brief_summary.version`, `llm_score_detail.version`, `rule_score_detail.version`. This ensures every DB record is traceable to the exact Skill version that produced it.
 
@@ -758,23 +759,31 @@ EventScoringSkill:    SCORING_SKILL_VERSION = "v1.0.0"
 | Item | Estimate |
 |---|---|
 | Articles crawled per run | 50–150 |
-| EntityAnalysisSkill calls (2 per article) | 100–300 |
+| EntityAnalysisSkill calls (1 per article) | 50–150 |
 | Events after aggregation | 20–60 |
 | BriefSummarySkill + EventScoringSkill calls | 40–120 |
-| **Total LLM calls per pipeline run** | **140–420** |
+| **Total LLM calls per pipeline run** | **90–270** |
 
-Two pipeline runs per day (morning-crawl + pre-open-crawl); estimated daily total: 280–840 LLM calls. Within Vertex AI low-cost tier for MVP scale.
+Two pipeline runs per day (morning-crawl + pre-open-crawl); estimated daily total: 180–540 LLM calls. Within Vertex AI low-cost tier for MVP scale.
 
-### 9.2 `lookup_stock` Tool
+### 9.2 Entity Verification
 
-Used exclusively by EntityAnalysisSkill. Executed by the Skill layer as an in-process, in-memory lookup against the HK Stock List (§9.2.1) — no Redis involved; not executed by the Adapter. Given a company name or stock code, it either resolves to a fully-qualified match (stock code, exchange, Chinese/English company name) via an exact code lookup or fuzzy name match, or reports no match. Exact tool schema, wire shape, and lookup algorithm: implementation.md §4.2/§8.2 (`lookup_stock()`, `LOOKUP_STOCK_TOOL`).
+EntityAnalysisSkill's structured-output call (§9.4) returns, for every company it lists, the code the article prints (or the HKEX code the model knows) and the name as written. Code — not the model, and not the Adapter — then verifies each one against the HK Stock List (§9.2.1), in-process, with no Redis and no further LLM call:
 
-**Code format normalization:** the HK Stock List's native format (both HKEXnews and the official "List of Securities") is a bare 5-digit zero-padded code, e.g. `"00700"` — no exchange suffix. `hkex:hk_stock_list` (§11.3.1) is keyed by this native form directly, with no transformation at load time. One conversion happens at the `lookup_stock` boundary; the other direction is now a no-op:
+1. The code is in the list and the listed name agrees with the model's name (one is an ordered subsequence of the other after normalization). This catches a real company carrying the wrong code.
+2. Or the article itself prints that code in a code-shaped form (`(0700)`, `00700.HK`, `Stock Code: 700`). The article's own label is trusted where names differ, such as an English legal name against a Chinese short name.
+3. Otherwise a name search over the list, `lookup_stock()` (below). A miss drops the mention.
+
+A mention that resolves through none of these is dropped, never guessed at. Exact rules: implementation.md §8.2 (`_verify_mention()`).
+
+**Why verification is code-side rather than an LLM tool loop.** Measured on real SADI articles (2026-10-24/25): articles almost always print the code, and the model knows most HKEX codes, so verification is a deterministic check rather than a search the model has to drive. One call per article instead of three to four removes the per-call failure exposure (timeouts and 429s compound per round) and the loop's own failure modes — repeated lookups of an already-verified code until the round cap, and dense market wraps needing more rounds than any fixed cap — at a seventh to a fifteenth of the cost, with equal or better entity accuracy (F1 0.959 against 0.930 for the tool loop on 127 unseen articles). The trade-off is articles that name companies without printing any code: they rely on the model's own code knowledge plus the name search, and recall there is lower (F1 0.90 against 0.98 when every code is stripped from the test set, a worst case). About 6% of real articles name a listed company with no code anywhere in the article, mostly sector roundups; single-company stories almost always print it.
+
+**Code format normalization:** the HK Stock List's native format (both HKEXnews and the official "List of Securities") is a bare 5-digit zero-padded code, e.g. `"00700"` — no exchange suffix. `hkex:hk_stock_list` (§11.3.1) is keyed by this native form directly, with no transformation at load time. One conversion happens at the verification boundary (both the model's code in step 1 and `lookup_stock()`'s own code path); the other direction is a no-op:
 
 - **Inbound:** a `name_or_code` that is wholly a code — 2–5 digits, optionally followed by a trailing `.HK` a caller may still include — has the suffix dropped and its digits zero-padded to 5: `"700"`, `"0700"`, and `"00700.HK"` all normalize to the same key, `"00700"`, before the lookup. Anything else, including a company name that contains digits (`"361度"`), is a name query.
 - **Outbound:** the returned `stock_code` field is that same stored native code, unchanged — no suffix is appended. `exchange` (always `"HKEX"` at MVP scope) is returned as its own field instead of being encoded into `stock_code`; every other stock-bearing schema in this document (`entity_events`/`events`/`event_scores`, the Aggregation Redis key, the Morning Brief API) already carries this exact same separate `exchange` field, so folding a redundant marker into `stock_code` here added nothing — this is now one unified concept and one unified value ("HKEX"), not two ("HK" here vs. "HKEX" everywhere else).
 
-**Fuzzy name matching:** the HK Stock List (§9.2.1) is small (~2,000–2,600 equities after filtering) and held entirely in SAPI's own process memory — both the exact-code and fuzzy-name paths match against that same in-memory data, with no Redis involved at all (Redis has no native fuzzy text search, and the exact-code path gains nothing from a separate round trip when the full set is already in-process regardless). No external fuzzy-matching library is needed — the query and each name are case-folded and stripped of whitespace, then candidates are ranked by character-overlap ratio against `NAME_MATCH_MIN_OVERLAP_RATIO`, ties broken by longest-common-subsequence length; exact algorithm: implementation.md §4.2 (`lookup_stock()`'s `_fuzzy_match()`).
+**Name search (`lookup_stock()`, step 3):** the HK Stock List (§9.2.1) is small (~2,000–2,600 equities after filtering) and held entirely in SAPI's own process memory — both the exact-code and fuzzy-name paths match against that same in-memory data, with no Redis involved at all (Redis has no native fuzzy text search, and the exact-code path gains nothing from a separate round trip when the full set is already in-process regardless). No external fuzzy-matching library is needed — the query and each name are case-folded and stripped of whitespace, then candidates are ranked by character-overlap ratio against `NAME_MATCH_MIN_OVERLAP_RATIO`, ties broken by longest-common-subsequence length; exact algorithm: implementation.md §4.2 (`lookup_stock()`'s `_fuzzy_match()`).
 
 > `overlap_ratio` is normalized by `len(query)`, not the candidate's length — this is what makes a short, abbreviated query (e.g. `"阿里"` against `"阿里巴巴集團控股有限公司"`) score 100% regardless of how much longer the candidate name is, matching the common case of partial/abbreviated company names in news text.
 
@@ -803,7 +812,7 @@ Each returns `[{"i": internal_id, "c": stock_code, "n": name, "s": sort_key}, ..
 
 **Ownership: SAPI owns the fetch/filter/load code; Admin owns triggering ongoing refreshes.** Two distinct triggers load the same in-process cache, both executing the same code path:
 
-1. **SAPI startup (eager, blocking):** `main.py` fetches, filters, and populates the HK Stock List *before* the Entity Analysis Layer's consumer coroutine starts pulling work — a missing HK Stock List silently fails every entity in the first batch (§9.3's loop just treats them as `found=false`, no error surfaced), so this cannot be lazy-on-first-call the way `source:config` (§1.5) is.
+1. **SAPI startup (eager, blocking):** `main.py` fetches, filters, and populates the HK Stock List *before* the Entity Analysis Layer's consumer coroutine starts pulling work — a missing HK Stock List silently fails every entity in the first batch (§9.2's verification just drops every mention as unverified, no error surfaced), so this cannot be lazy-on-first-call the way `source:config` (§1.5) is.
 2. **`POST /v1/admin/hk-stock-list-sync` (Admin-triggered, ongoing):** a SAPI endpoint that re-runs the same fetch/filter/load synchronously on request, rebinding the same process's in-memory data. Admin's scheduler calls this daily (00:00 UTC, matching the existing `watchlist-sync` slot) via a new `HK_STOCK_LIST_SYNC` job type — see `admin-tad.md`. No request body; response `200 {"status": "success", "entries_loaded": N}` on success. Two distinct failure modes map to different HTTP statuses: `503` if HKEXnews itself is unreachable/erroring (a resource issue), or `500` if HKEXnews responded but its data couldn't be parsed into the expected shape (a code/schema issue) — the existing in-memory data is left untouched either way on failure.
 
 **No staleness tracking beyond the fetch/sync call's own success or failure.** There is no TTL and no separate "last refreshed at" record — the in-process cache is only ever replaced by a successful run of trigger 1 or 2 above; a delayed or failed Admin job simply leaves the previous snapshot in place rather than emptying it. Staleness is observable from `POST /admin/hk-stock-list-sync`'s own response status (surfaced in Admin's `job_executions`), without a dedicated Redis key to track it.
@@ -812,33 +821,17 @@ Each returns `[{"i": internal_id, "c": stock_code, "n": name, "s": sort_key}, ..
 
 > **On sync failure (either trigger):** log the error; leave the existing in-memory data as-is (no partial overwrite). A failed `POST /v1/admin/hk-stock-list-sync` call returns a non-2xx status so Admin's job records it as `FAILED` — visible in `job_executions`.
 
-> **Entity Analysis Layer readiness gate:** while the HK Stock List has 0 entries (startup window, an ongoing HKEXnews outage, or a pending fix for a schema-break), the Entity Analysis Layer's consumer must not process any message — every `lookup_stock()` call would otherwise resolve to `found=false` regardless of what the article actually says, and an empty-but-"successful" result would be acknowledged and permanently lost. The Entity Analysis Layer checks readiness before touching a message and leaves it unacknowledged (for redelivery) rather than processing it while the list is empty — this is what keeps `GET /health`'s `unhealthy` signal true in effect, not just in name.
+> **Entity Analysis Layer readiness gate:** while the HK Stock List has 0 entries (startup window, an ongoing HKEXnews outage, or a pending fix for a schema-break), the Entity Analysis Layer's consumer must not process any message — every mention would otherwise fail verification (§9.2) regardless of what the article actually says, and an empty-but-"successful" result would be acknowledged and permanently lost. The Entity Analysis Layer checks readiness before touching a message and leaves it unacknowledged (for redelivery) rather than processing it while the list is empty — this is what keeps `GET /health`'s `unhealthy` signal true in effect, not just in name.
 
 This resolves §14 Q-14 in full — see Open Questions.
 
-### 9.3 Function Calling Loop Control
+### 9.3 Input Bound
 
-Applies to EntityAnalysisSkill only. Two independent hard limits prevent unbounded loops.
-
-**Limit 1 — Total round limit `MAX_FC_ROUNDS` (default: 3):**
-
-Maximum number of `generate_raw` calls in the Function Calling loop. On breach, loop exits immediately; processing continues with `generate_structured` using accumulated message history. Warning log `fc_rounds_exceeded` written.
-
-**Limit 2 — Per-entity retry limit `MAX_FC_RETRIES_PER_ENTITY` (default: 2):**
-
-Tracks `found=false` count per `name_or_code` value in `entity_retry_count: dict[str, int]`. On breach, `instruction` field is appended to the tool result:
-
-```
-"此實體經多次查詢仍無法驗證，請在最終輸出中排除此實體"
-```
-
-Loop continues normally; LLM decides to exclude the entity on next generation.
-
-The loop alternates `generate_raw` tool-call rounds with `lookup_stock` resolution until the LLM stops requesting lookups or a limit above is hit, then makes one final `generate_structured` call for the structured entity list — which is then filtered to only `stock_code`s that actually verified, a hard backstop independent of what the LLM claims. Exact control flow: implementation.md §8.2 (`llm_process()`).
+Applies to EntityAnalysisSkill only. An article body is cut at `ENTITY_ANALYSIS_MAX_INPUT_CHARS` before the call: SADI's cleaned HKEX announcements reach two million characters (a full circular), while the issuer, the counterparties and the event are stated in the first pages. The completion log records when a body was cut (§9.8). Output is bounded separately by the Skill's `max_output_tokens` (§9.1); a response cut off there fails schema parsing and is handled as an `LLMSchemaViolationError` (§9.7).
 
 ### 9.4 EntityAnalysisSkill
 
-**Purpose:** Per-article entity extraction, event classification, sentiment analysis, and entity summary generation. One LLM call pair (Function Calling loop + structured output) per article.
+**Purpose:** Per-article entity extraction, event classification, sentiment analysis, and entity summary generation. One structured-output call per article, followed by code-side verification of every company it lists (§9.2).
 
 **Input:** Article title + body (from SADI API).
 
@@ -923,7 +916,7 @@ Each Skill emits a structured completion log event upon finishing processing. Th
 
 All three Skills' log events share a common shape — per-call LLM metrics (`llm_calls[]`), any errors encountered (`llm_errors[]`), running totals, and a timestamp — plus a business key (`cleaned_id` for EntityAnalysisSkill, `event_id` for the other two) that lets the future monitoring Service JOIN back to DB records. Exact fields: implementation.md §8.1 (`LlmCallMetric`/`LlmErrorEntry`) and §8.2/§8.3/§8.4 (`EntityAnalysisSkillLog`/`BriefSummarySkillLog`/`EventLLMScoringSkillLog`).
 
-> `input_tokens`/`output_tokens`/`latency_ms`/`instructor_retries` come from the Adapter's own return value (`LLMResponse`/`StructuredLLMResponse`, §8.3) — the Adapter measures them (the only place they're actually knowable) and returns them alongside its normal result; it never logs them itself or reaches into a Skill's accumulator. The calling Skill reads them off the return value to build each `llm_calls[]` entry — `call_index`/`purpose` are the Skill's own bookkeeping, not something the Adapter provides.
+> `input_tokens`/`output_tokens`/`latency_ms` come from the Adapter's own return value (`StructuredLLMResponse`, §8.3) — the Adapter measures them (the only place they're actually knowable) and returns them alongside its normal result; it never logs them itself or reaches into a Skill's accumulator. The calling Skill reads them off the return value to build each `llm_calls[]` entry — `call_index`/`purpose` are the Skill's own bookkeeping, not something the Adapter provides.
 
 > `BusinessValidationError` in `llm_errors` indicates business constraint truncation was applied (e.g. `headline` truncated to 20 chars). Does not affect business flow; recorded for prompt quality analysis only.
 
@@ -941,7 +934,7 @@ entity_analysis_completed.cleaned_id
 entity_analysis_completed.entity_event_ids[]
     → JOIN entity_events on entity_event_id, one row per array element
       (0 rows joined for an article with no verified entities)
-    → Analyse: unverified_entities patterns, fc_summary rounds distribution,
+    → Analyse: dropped_mentions patterns, input_truncated rate,
                token consumption per article, latency trends by skill_version
 
 brief_summary_completed.event_id
@@ -1174,11 +1167,11 @@ SAPI is designed and deployed as **exactly one replica** for now — multiple re
 | Q-4 | ~~Post-MVP: migrate source configuration from local defaults to Admin database~~ | Source authority management | **Resolved** — stale; contradicted §1.5, which already specifies live Admin API integration as MVP (hardcoded P1/P2/P3 defaults are a fallback for Admin-unreachable only, not the MVP baseline). Admin's `GET /sources` is a resolved MVP contract (`admin-tad.md` §4.2). Weight *value* calibration (P1=9/P2=6/P3=4) is tracked separately in `admin-tad.md`'s own Q-4 and PRD OQ-2 |
 | Q-5 | ~~DB Write Failure unified retry implementation details~~ | Implementation specification | **Resolved** — stale; same issue as Q-4. §12.1 already fully specifies this (failure classification, retry parameters, exponential backoff formula) — nothing deferred to a separate document |
 | Q-6 | Post-MVP: entity_event_processing_status table for state machine tracking and quality monitoring | Observability | Post-MVP |
-| Q-7 | Validate `MAX_FC_ROUNDS=3` and `MAX_FC_RETRIES_PER_ENTITY=2` against real HK news data; adjust if LLM requires more rounds for cold-stock identification | EntityAnalysisSkill accuracy | Week 2 |
+| Q-7 | ~~Validate `MAX_FC_ROUNDS=3` and `MAX_FC_RETRIES_PER_ENTITY=2` against real HK news data~~ | EntityAnalysisSkill accuracy | **Resolved** — EntityAnalysisSkill makes one structured-output call and verifies entities in code (§9.2, §9.4), so neither limit exists. |
 | Q-8 | Validate BriefSummarySkill input character cap (200 chars total entity_summary) against real aggregated Events; adjust if key_numbers extraction quality is insufficient | BriefSummarySkill output quality | Week 2 |
 | Q-9 | Validate `RATE_LIMIT_BACKOFF_S=60` against actual Vertex AI rate limit reset window; adjust if provider reset is faster or slower | LLM throughput | Week 1 |
 | Q-10 | Post-MVP: Design quality monitoring Service — log ingestion pipeline, LLM-as-Judge evaluation for EntityAnalysisSkill and BriefSummarySkill, post-event price correlation analysis for EventScoringSkill (Option C) | LLM quality improvement | Post-MVP |
-| Q-11 | Validate `LLM_API_TIMEOUT_S=30` and the common `HTTP_TIMEOUT_S=120` (SADI, Admin, HKEXnews calls) against real latency measurements in Week 1; Vertex AI asia-east1 median latency may differ from defaults | Latency tuning | Week 1 |
+| Q-11 | Validate the common `HTTP_TIMEOUT_S=120` (SADI, Admin, HKEXnews calls) against real latency measurements in Week 1 (`LLM_API_TIMEOUT_S` is measured: implementation.md §4.1) | Latency tuning | Week 1 |
 | Q-12 | ~~`event_type_score` enum mapping (§5.6) is only defined for EARNINGS/MA/REGULATORY/GENERAL_ANNOUNCEMENT (per PRD §12.1). `BUYBACK`, `MANAGEMENT_CHANGE`, `ANALYST_RATING`, `DIVIDEND` have no assigned score~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — full 8-value mapping added in §5.6, with rationale. Flagged there as an MVP starting calibration to be revisited via customer/analyst feedback post-MVP (see PRD §3.3, §16.1) |
 | Q-13 | ~~`source_authority_score` and `source_heat_score` (§5.6) have no defined computation formula — only example output values exist.~~ | Rule Score computation; blocks Scoring Layer implementation | **Resolved** — formulas added in §5.6 (MAX for authority; `source_count / TOTAL_ACTIVE_SOURCES` for heat) |
 | Q-14 | ~~HK Stock List for `lookup_stock` (§9.2): no single free source provides `{stock_code, company_name_zh, company_name_en, sector}` in the required shape. Also unresolved: which service owns the ingestion job.~~ | Blocks EntityAnalysisSkill implementation | **Resolved** — see §9.2.1. Data source: HKEXnews's own bilingual JSON endpoints, cross-checked against the official "List of Securities" for equity filtering. `sector` removed from `lookup_stock`/`EntityAnalysisSkill` entirely (no consumer, no bulk source — see §9.2.1). Ownership: SAPI owns the fetch/filter/write code (eager blocking fetch at startup); Admin owns triggering ongoing refresh via a new `HK_STOCK_LIST_SYNC` job calling `POST /v1/admin/hk-stock-list-sync`. No TTL — persistent cache, replaced only on a successful sync. `GET /health` gates readiness on 0-entry state |

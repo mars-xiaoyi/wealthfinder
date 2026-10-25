@@ -105,7 +105,7 @@ sapi/
 ├── app/
 │   ├── skills/
 │   │   ├── skill_base.py                # SkillInput/SkillResult base types + LlmCallMetric/LlmErrorEntry + SkillBase: run() template method + llm_process/build_fail_result — parent of all three Skills (§8.1)
-│   │   ├── entity_analysis_skill.py     # EntityAnalysisSkill; EntityAnalysisInput; LOOKUP_STOCK_TOOL; llm_process (Function Calling loop); stock verification filter; LLMOutput/EntityAnalysisResult (AnalysisOutcome itself lives in app/models/entity_event.py, §11.1)
+│   │   ├── entity_analysis_skill.py     # EntityAnalysisSkill; EntityAnalysisInput; llm_process (one structured-output call); _verify_mention; EntityMention/LLMOutput/EntityAnalysisResult (AnalysisOutcome itself lives in app/models/entity_event.py, §11.1)
 │   │   ├── brief_summary_skill.py       # BriefSummarySkill; BriefSummaryInput; llm_process; input construction; fallback; BriefSummaryResult (BriefSummary itself is in app/models/event.py)
 │   │   └── event_scoring_skill.py       # EventLLMScoringSkill; EventLLMScoringInput; llm_process; fallback; EventLLMScoringResult (LLMScore itself is in app/models/event_score.py)
 │   ├── entity_analysis/
@@ -138,7 +138,7 @@ sapi/
 │   │   └── main.py                      # FastAPI app factory
 │   ├── llm/
 │   │   ├── adapter.py                   # LLMAdapter ABC; standard data structures
-│   │   ├── vertex_adapter.py            # Vertex AI implementation: generate_raw (google-genai SDK), generate_structured (Instructor)
+│   │   ├── vertex_adapter.py            # Vertex AI implementation: generate_structured (google-genai native structured output)
 │   │   └── errors.py                    # LLMError base + LLMRateLimitError / LLMProviderError / LLMAuthenticationError / LLMSchemaViolationError
 │   ├── clients/
 │   │   ├── news_client.py              # httpx client: fetch cleaned article content from SADI (Entity Analysis Layer input)
@@ -168,7 +168,7 @@ sapi/
 │   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ParseError / ...
 │   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2); translate_client_errors decorator (§9)
 │   │   ├── stock.py                     # Stock dataclass — cross-module shape shared by lookup_stock.py, hk_stock_list.py's HKStockListCache, and EntityAnalysisSkill (§4.2)
-│   │   ├── lookup_stock.py              # lookup_stock tool: exact code + fuzzy name matching, both against the in-process HKStockListCache (§4.2)
+│   │   ├── lookup_stock.py              # lookup_stock: exact code + fuzzy name matching, both against the in-process HKStockListCache (§4.2)
 │   │   ├── hk_stock_list.py          # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; startup load + sync handler, no Redis (§4.2.1)
 │   │   └── supervised.py                # run_supervised() — leak-free concurrent-coroutine supervision, used by every layer's start() (§6.1)
 │   ├── layer_tasks.py                   # register_layer_tasks()/get_layer_tasks() — the four layer Tasks, for GET /health's liveness check (§15.6)
@@ -253,7 +253,7 @@ from pydantic import BaseModel
 from app.models.versioned_metadata import VersionedMetadata   # §3.2
 
 class BriefSummary(BaseModel):
-    """Instructor-validated output of BriefSummarySkill.run() (§8.3); wrapped by Event.brief_summary."""
+    """Schema-validated output of BriefSummarySkill.run() (§8.3); wrapped by Event.brief_summary."""
     summary_short: str      # <=30 Traditional Chinese characters
     summary_full: str       # <=150 Traditional Chinese characters
     key_numbers: list[str]  # max 3 items; may be empty
@@ -485,9 +485,8 @@ class RedisConfig:
 @dataclass
 class LLMConfig:
     vertex_project: str            # env: VERTEX_AI_PROJECT
-    vertex_location: str           # env: VERTEX_AI_LOCATION
-    api_timeout_s: int             # env: LLM_API_TIMEOUT_S
-    instructor_max_retries: int    # env: INSTRUCTOR_MAX_RETRIES
+    vertex_location: str           # env: VERTEX_AI_LOCATION (default "global" — current Gemini models are not served in asia-east1/asia-east2)
+    api_timeout_s: int             # env: LLM_API_TIMEOUT_S (default 30 — gemini-3.1-flash-lite on EntityAnalysis calls: p95 8.4 s, max 18 s)
     rate_limit_backoff_s: int      # env: RATE_LIMIT_BACKOFF_S
 ```
 
@@ -501,8 +500,8 @@ class EntityAnalysisConfig:
     max_concurrent: int                   # env: ENTITY_ANALYSIS_MAX_CONCURRENT
     max_retry: int                        # env: ENTITY_ANALYSIS_MAX_RETRY
     name_match_min_overlap_ratio: float   # env: NAME_MATCH_MIN_OVERLAP_RATIO
-    max_fc_rounds: int                    # env: MAX_FC_ROUNDS
-    max_fc_retries_per_entity: int        # env: MAX_FC_RETRIES_PER_ENTITY
+    max_input_chars: int                  # env: ENTITY_ANALYSIS_MAX_INPUT_CHARS (default 30000) — article body cut before
+                                           # the LLM call (§8.2); HKEX announcements reach 2,000,000+ chars
     sadi_api_url: str                     # env: SADI_API_URL — local dev default: http://localhost:8000
                                            # (SADI's own quickstart port, stock-assistant-data-ingestion/docs/implementation.md §1);
                                            # excludes "/v1" — NewsClient appends it per-call (§9.1)
@@ -616,7 +615,7 @@ config = get_config()
 
 ### 4.2 HK Stock List — `app/common/hk_stock_list.py`
 
-Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s `lookup_stock` tool reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. `lookup_stock` lives here too: it is cache-reading logic, and the FC loop (§8.2) is its only caller.
+Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s verification step (§8.2) reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. `lookup_stock` lives here too: it is cache-reading logic, and `EntityAnalysisSkill._verify_mention()` (§8.2) is its only caller.
 
 **In-process only, no Redis** (rationale: system-design.md §9.2.1). One shared mutable `HKStockListCache` instance holds the fetch result.
 
@@ -693,12 +692,11 @@ def get_hk_stock_list_cache() -> HKStockListCache:
 
 ```
 Purpose : Resolve a company name or stock code against the HK Stock List.
-          Called by EntityAnalysisSkill's Function Calling loop (§8.2)
-          as the handler for the LLM's lookup_stock tool calls.
-Params  : name_or_code       — raw string from the LLM's tool_call arguments
+          Called by EntityAnalysisSkill._verify_mention() (§8.2) as the name search for a
+          mention whose code is missing or does not check out.
+Params  : name_or_code       — the mention's company_name as the LLM wrote it
           min_overlap_ratio    — NAME_MATCH_MIN_OVERLAP_RATIO
-Returns : Stock on a match, None on a miss. (The wire-format tool result, including found=False
-          and the retry "instruction", is built by the FC loop, §8.2.)
+Returns : Stock on a match, None on a miss.
 ```
 
 No cache parameter: `lookup_stock()` calls `get_hk_stock_list_cache()` directly. Fuzzy matching needs the full set in-process (system-design.md §9.2), so the exact-code path uses the same in-memory data.
@@ -1429,13 +1427,13 @@ class RedisStateClient:
 
 ### 7.1 `app/llm/adapter.py` — Standard Data Structures and Interface
 
-Per system-design.md §8, all LLM interactions go through a provider-agnostic `LLMAdapter`. Skill code (Section 8) never imports `google.genai` or `instructor` directly — only `app.llm.adapter`.
+Per system-design.md §8, all LLM interactions go through a provider-agnostic `LLMAdapter`. Skill code (Section 8) never imports `google.genai` directly — only `app.llm.adapter`.
 
 ```python
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Generic, Optional, TypeVar
+from typing import Generic, Optional, TypeVar
 from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
@@ -1444,79 +1442,38 @@ class Role(str, Enum):
     SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
-    TOOL = "tool"
-
-@dataclass
-class ToolCall:
-    tool_call_id: str        # Provider-generated; echo back in the tool result
-    tool_name: str
-    arguments: dict
-
-@dataclass
-class ToolResultMessage:
-    tool_call_id: str        # Matches ToolCall.tool_call_id
-    tool_name: str
-    result: dict
-
-@dataclass
-class ToolDefinition:
-    name: str
-    description: str
-    parameters: dict         # JSON Schema
-    strict: bool = False
 
 @dataclass(frozen=True)
 class GenerationConfig:
     """Per-call generation settings. Each Skill passes its own constant (§8's table) on
     every call, so the values live with the Skill that owns them, not in the Adapter."""
+    model: str
     temperature: float
     max_output_tokens: int
 
 @dataclass
 class Message:
     role: Role
-    content: Optional[str] = None
-    tool_calls: Optional[list[ToolCall]] = None       # ASSISTANT tool-call round only
-    tool_results: Optional[list[ToolResultMessage]] = None  # TOOL role only
-
-@dataclass
-class LLMResponse:
-    tool_calls: list[ToolCall]   # non-empty when the LLM requests tool execution; empty on final output
-    raw_response: Any            # provider raw response — debugging only, never used in business logic
-    input_tokens: int            # measured by the Adapter from the provider response — see §7.3
-    output_tokens: int
-    latency_ms: int
+    content: str
 
 @dataclass
 class StructuredLLMResponse(Generic[T]):
-        """Return shape for generate_structured(): the validated output plus the per-call metrics LLMResponse carries."""
+    """Return shape for generate_structured(): the validated output plus per-call metrics."""
     output: T
     input_tokens: int
-    output_tokens: int
+    output_tokens: int           # visible output plus thinking tokens — both are billed as output (§7.3)
     latency_ms: int
-    instructor_retries: int      # 0 for a call with no Instructor-triggered retries
 
 
 class LLMAdapter(ABC):
     """Provider-agnostic interface. Switching providers means a new subclass, no Skill changes."""
 
     @abstractmethod
-    async def generate_raw(self, messages: list[Message], tools: list[ToolDefinition],
-                           generation_config: GenerationConfig) -> LLMResponse:
-        """
-        Single LLM call returning the raw response, used for EntityAnalysisSkill's Function
-        Calling loop (§8.2). `tools` is required. The returned LLMResponse carries
-        input_tokens/output_tokens/latency_ms, measured here (§7.3).
-        Raises: LLMRateLimitError, LLMProviderError, LLMAuthenticationError.
-        """
-        ...
-
-    @abstractmethod
     async def generate_structured(self, messages: list[Message], output_schema: type[T],
                                   generation_config: GenerationConfig) -> StructuredLLMResponse[T]:
         """
-        Single LLM call with Instructor-enforced schema validation, used by all three Skills.
-        Returns the validated output plus the per-call metrics and instructor_retries.
+        Single LLM call whose response is constrained to output_schema, used by all three Skills.
+        Returns the validated output plus input_tokens/output_tokens/latency_ms, measured here (§7.3).
         Raises: LLMRateLimitError, LLMProviderError, LLMAuthenticationError,
         LLMSchemaViolationError.
         """
@@ -1549,24 +1506,27 @@ class LLMAuthenticationError(LLMError):
     message level but not self-healing; SkillBase.run() (§8.1) logs CRITICAL."""
 
 class LLMSchemaViolationError(LLMError):
-    """Instructor's internal retries (INSTRUCTOR_MAX_RETRIES) exhausted; output still
-    does not conform to the Pydantic schema's business-logic validators. Not retryable
-    at this layer — the calling Skill applies its own fallback policy (§5.9, §8.4–8.5)."""
+    """The response did not parse into the output schema (e.g. JSON cut off at
+    max_output_tokens). Not retried at this layer — the calling Skill applies its own
+    fallback policy (§5.9, §8.4–8.5)."""
 ```
 
 The shared `except` block that turns these into an `LlmErrorEntry` is in `SkillBase.run()` (§8.1).
 
 ### 7.3 `app/llm/vertex_adapter.py` — `VertexAIAdapter(LLMAdapter)`
 
+Pinned SDK: `google-genai==2.33.0`.
+
 ```python
 class VertexAIAdapter(LLMAdapter):
     def __init__(self, config: LLMConfig):
-        # google-genai client, vertexai=True, project=config.vertex_project,
-        # location=config.vertex_location
-        # instructor.from_genai(client, mode=instructor.Mode.GENAI_STRUCTURED_OUTPUTS)
-        # wrapped for generate_structured() — see below
+        # genai.Client(vertexai=True, project=config.vertex_project,
+        #              location=config.vertex_location,
+        #              http_options=HttpOptions(timeout=config.api_timeout_s * 1000))
         ...
 ```
+
+`HttpOptions.timeout` (milliseconds) is the call timeout: the SDK has no default timeout, so without it a call can hang indefinitely. `retry_options` stays unset, so the SDK makes exactly one attempt per call; retries happen at the message level (redelivery) and through `WorkerPool` backoff (§11.3), never inside the Adapter.
 
 **Module-level singleton** (§5.1). `VertexAIAdapter.__init__` stays directly constructible for tests; registration is a thin factory:
 
@@ -1586,39 +1546,27 @@ def create_llm_adapter(config: LLMConfig) -> LLMAdapter:
 
 Each Skill calls `get_llm_adapter()` in its `__init__`. `main.py` calls `create_llm_adapter(config.llm)` once at startup.
 
-#### Method: `generate_raw(messages, tools, generation_config) -> LLMResponse`
-
-```
-Purpose : Translate messages/tools to google-genai Content/FunctionDeclaration shapes and
-          issue one generate_content call. `tools[].strict=True` sets
-          function_calling_config.mode = ANY. generation_config's temperature and
-          max_output_tokens go into the call's GenerateContentConfig. Measures input_tokens/output_tokens (provider
-          response) and latency_ms (wall-clock) and returns them on LLMResponse for the
-          Skill's LlmCallMetric (§8.1).
-Timeout : config.api_timeout_s (LLM_API_TIMEOUT_S) wraps the call —
-          asyncio.wait_for or the SDK's own request timeout param.
-Raises  : LLMRateLimitError on a 429 from the provider.
-          LLMAuthenticationError on a 401/403 from the provider.
-          LLMProviderError on any other 5xx, network error, or timeout —
-          i.e. the catch-all for anything not otherwise classified above,
-          so nothing from this call ever escapes as an unclassified exception.
-```
-
 #### Method: `generate_structured(messages, output_schema, generation_config) -> StructuredLLMResponse[T]`
 
 ```
-Purpose : One generate_content call through the Instructor-wrapped client, with
-          response_schema from output_schema.model_json_schema(), and generation_config
-          applied as in generate_raw (Instructor's retries reuse it). Returns the same metrics
-          as generate_raw plus instructor_retries. Instructor re-invokes the LLM up to
-          INSTRUCTOR_MAX_RETRIES times if the Pydantic validators reject the output, in
-          addition to Gemini's schema-level enforcement (system-design.md §8.5).
-Timeout : Same config.api_timeout_s wraps each individual call, including
-          Instructor-triggered retries.
-Raises  : LLMRateLimitError, LLMAuthenticationError, LLMProviderError — same
-          mapping as generate_raw.
-          LLMSchemaViolationError once Instructor's internal retries are
-          exhausted and the output still fails Pydantic validation.
+Purpose : One client.aio.models.generate_content call. The SYSTEM message becomes
+          system_instruction; the remaining messages become contents (USER → role "user",
+          ASSISTANT → role "model"). GenerateContentConfig carries
+          generation_config.temperature/max_output_tokens, response_mime_type="application/json"
+          and response_json_schema=output_schema.model_json_schema(); model=generation_config.model.
+          Gemini enforces the schema at the API level; the response text is then parsed with
+          output_schema.model_validate_json(response.text).
+Metrics : input_tokens  = usage_metadata.prompt_token_count
+          output_tokens = usage_metadata.candidates_token_count + (usage_metadata.thoughts_token_count or 0)
+          latency_ms    = wall-clock around the call
+          thoughts_token_count is reported apart from candidates_token_count, is None when the
+          model does not think, and is billed as output and counted against max_output_tokens.
+Raises  : LLMRateLimitError on google.genai.errors.APIError with code 429.
+          LLMAuthenticationError on APIError with code 401/403.
+          LLMProviderError on any other APIError, network error, or timeout (the SDK reports
+          its own timeout as a 504 DEADLINE_EXCEEDED APIError) — the catch-all for anything
+          not classified above, so nothing escapes as an unclassified exception.
+          LLMSchemaViolationError when model_validate_json fails (truncated or malformed JSON).
 ```
 
 Each call contributes one `llm_calls[]` entry (system-design.md §9.8) to the Skill's log. The Adapter returns the measurements; the Skill adds `call_index`/`purpose` (§8.2–§8.4). `LLMAuthenticationError`'s CRITICAL alert lives in the Skill (§8.1).
@@ -1633,13 +1581,15 @@ Releases the underlying `google-genai` client's HTTP session.
 
 Three Skills (rationale: system-design.md §9.1), each owning its prompt, output schema, and business-constraint validation. Skill modules are the single place prompt engineering happens. **Copy each system prompt (§8.2/§8.3/§8.4) verbatim into the module's `_SYSTEM_PROMPT` constant.**
 
-| Skill | Module | Adapter Method(s) | Temperature | Max Tokens |
+| Skill | Module | Model | Temperature | Max Tokens |
 |---|---|---|---|---|
-| EntityAnalysisSkill | `app/skills/entity_analysis_skill.py` | `generate_raw` (FC loop) + `generate_structured` (final) | 0 | 8192 |
-| BriefSummarySkill | `app/skills/brief_summary_skill.py` | `generate_structured` | 0.1 | 4096 |
-| EventLLMScoringSkill | `app/skills/event_scoring_skill.py` | `generate_structured` | 0 | 2048 |
+| EntityAnalysisSkill | `app/skills/entity_analysis_skill.py` | `gemini-3.1-flash-lite` | 0 | 16384 |
+| BriefSummarySkill | `app/skills/brief_summary_skill.py` | `gemini-3.1-flash-lite` | 0.1 | 4096 |
+| EventLLMScoringSkill | `app/skills/event_scoring_skill.py` | `gemini-3.1-flash-lite` | 0 | 2048 |
 
-Each module holds its row as a constant, `_GENERATION_CONFIG = GenerationConfig(temperature=..., max_output_tokens=...)` (§7.1), and passes it on every Adapter call it makes.
+Every Skill makes `generate_structured` calls only. Each module holds its row as a constant, `_GENERATION_CONFIG = GenerationConfig(model=..., temperature=..., max_output_tokens=...)` (§7.1), and passes it on every Adapter call it makes; a model change is a Skill version bump (system-design.md §9.1.1).
+
+EntityAnalysisSkill's row is measured on real SADI articles: its largest output was 13,917 tokens (a 121-company weekly calendar), every other article stayed under 4,400, and `gemini-3.1-flash-lite` does not think by default. The other two rows are starting values (I-3, §18).
 
 Each module defines a version constant (`ENTITY_SKILL_VERSION`, `BRIEF_SKILL_VERSION`, `SCORING_SKILL_VERSION`, all `"v1.0.0"`) per system-design.md §9.1.1 and sets it as `skill_log.skill_version` (§8.6). Callers read the version from `result.skill_log.skill_version` (§11.1, §13.4) and never re-import the constant.
 
@@ -1668,11 +1618,10 @@ class SkillResult(BaseModel):
 @dataclass
 class LlmCallMetric:
     call_index: int
-    purpose: str              # "fc_round" | "structured_output"
+    purpose: str              # "structured_output"
     input_tokens: int
     output_tokens: int
     latency_ms: int
-    instructor_retries: int
 
 @dataclass
 class LlmErrorEntry:
@@ -1684,7 +1633,6 @@ class LlmErrorEntry:
 class SkillBase(ABC):
     def __init__(self, input: SkillInput):
         self._input = input
-        self._rounds = 0
         self._llm_calls: list[LlmCallMetric] = []
         self._llm_errors: list[LlmErrorEntry] = []
 
@@ -1721,7 +1669,7 @@ class SkillBase(ABC):
 
 ### 8.2 `app/skills/entity_analysis_skill.py` — EntityAnalysisSkill
 
-Identifies the stock entities mentioned in one cleaned article and classifies each into an event: a Function Calling loop lets the LLM call `lookup_stock` to verify candidate company names/codes against the HKEX list, then a final structured-output call produces `event_type_primary`/`event_type_secondary`, `sentiment_label`/`sentiment_score`, `headline`, and `entity_summary` per entity. Only entities that verified against `lookup_stock` make it into the result — unverified ones are dropped, not guessed at. `EntityAnalysisService` (§11.1) is its only caller, constructing a fresh instance per `run()` call.
+Identifies the stock entities mentioned in one cleaned article and classifies each into an event, in one structured-output call: the model lists every company it finds with the code the article prints (or the HKEX code it knows) and its name, plus `event_type_primary`/`event_type_secondary`, `sentiment_label`/`sentiment_score`, `headline`, and `entity_summary`. Code then verifies each listed company against the HK Stock List (`_verify_mention()`, below); only verified companies make it into the result — unverified ones are dropped, not guessed at. Design rationale: system-design.md §9.2–§9.4. `EntityAnalysisService` (§11.1) is its only caller, constructing a fresh instance per `run()` call.
 
 #### Input Schema
 
@@ -1742,14 +1690,14 @@ Design rationale for the extraction rules and edge cases below: system-design.md
 並為每個實體分析對應的事件類型、市場情緒與事件摘要。
 
 規則：
-- 只提取在香港交易所（HKEX）上市的公司實體
-- 每個實體必須通過 lookup_stock 工具驗證後方可納入輸出
-- 未能通過驗證的實體必須從輸出中排除
+- 列出文章提及的每一家公司，包括只以簡稱、英文名或在行情列表中出現的公司，即使文章未標示股票代碼
+- 每個實體填寫 company_name（文章中的公司名稱）及 stock_code（文章標示的代碼；未標示時填你所知的港股代碼，不知道則留空）
+- 不必自行判斷是否於 HKEX 上市：系統會以 HKEX 股票主列表核實每個實體，非 HKEX 上市者會被自動剔除
 ```
 
 *Part 2 — Analysis Dimensions:*
 ```
-對每個已驗證實體，輸出以下分析：
+對每個實體，輸出以下分析：
 
 【event_type_primary】主要事件類型，從以下選項中選擇最符合的一個：
 EARNINGS / BUYBACK / MA / REGULATORY / MANAGEMENT_CHANGE /
@@ -1779,12 +1727,13 @@ ANALYST_RATING / DIVIDEND / GENERAL_ANNOUNCEMENT
 *Part 4 — Edge Case Rules:*
 ```
 1. 文章未提及任何 HKEX 上市公司 → 輸出 entities: []
-2. lookup_stock 返回 found=false：嘗試不同名稱或代碼格式重新查詢（最多兩次）；多次仍無法驗證 → 排除
-3. 文章同時提及 A 股和 H 股：只提取 HKEX 上市的 H 股實體；stock_code 一律使用 lookup_stock 返回的裸代碼（不帶交易所後綴）
-4. 文章提及公司但確認非 HKEX 上市（純 A 股、美股、未上市）→ 從輸出中排除，不體現於 entities
-5. event_type_secondary 只在確實存在明確次要事件時填寫，不確定時留空優於猜測
-6. 同一 stock_code 在文章中對應多個事件時，只能輸出一筆記錄：最重要的事件填入 event_type_primary，次重要的填入 event_type_secondary；不得為同一 stock_code 輸出多筆記錄
+2. 文章同時提及 A 股和 H 股：只提取 HKEX 上市的 H 股實體；stock_code 填 H 股的港股代碼
+3. 文章提及公司但確認非 HKEX 上市（純 A 股、美股、未上市）→ 從輸出中排除，不體現於 entities
+4. event_type_secondary 只在確實存在明確次要事件時填寫，不確定時留空優於猜測
+5. 同一 stock_code 在文章中對應多個事件時，只能輸出一筆記錄：最重要的事件填入 event_type_primary，次重要的填入 event_type_secondary；不得為同一 stock_code 輸出多筆記錄
 ```
+
+The user message is `標題：{title}\n內文：{body}`, with `body` cut to `ENTITY_ANALYSIS_MAX_INPUT_CHARS` (§4.1).
 
 **Few-shot Example 1 — Multi-entity, different event types:**
 ```
@@ -1793,21 +1742,17 @@ INPUT:
 內文：騰訊控股（00700.HK）第四季廣告收入錄得強勁增長，超出市場預期。
      監管機構宣佈就阿里巴巴（09988.HK）電商業務展開正式調查。
 
-TOOL CALLS:
-lookup_stock("騰訊控股") → {found: true, stock_code: "00700", exchange: "HKEX"}
-lookup_stock("阿里巴巴") → {found: true, stock_code: "09988", exchange: "HKEX"}
-
 OUTPUT:
 entities: [
   {
-    stock_code: "00700",
+    stock_code: "00700", company_name: "騰訊控股",
     event_type_primary: "EARNINGS", event_type_secondary: null,
     sentiment_label: "POSITIVE", sentiment_score: 0.85,
     headline: "騰訊Q4廣告收入超預期32%",
     entity_summary: "騰訊控股第四季廣告收入按年增長32%，大幅超出市場預期，顯示廣告業務強勁復甦。"
   },
   {
-    stock_code: "09988",
+    stock_code: "09988", company_name: "阿里巴巴",
     event_type_primary: "REGULATORY", event_type_secondary: null,
     sentiment_label: "NEGATIVE", sentiment_score: 0.78,
     headline: "監管機構調查阿里電商業務",
@@ -1823,13 +1768,10 @@ INPUT:
 內文：碧桂園（02007.HK）行政總裁表示，鑑於市場環境存在不確定性，
      集團將採取更為審慎的擴張策略，暫緩部分非核心城市項目。
 
-TOOL CALLS:
-lookup_stock("碧桂園") → {found: true, stock_code: "02007", exchange: "HKEX"}
-
 OUTPUT:
 entities: [
   {
-    stock_code: "02007",
+    stock_code: "02007", company_name: "碧桂園",
     event_type_primary: "GENERAL_ANNOUNCEMENT", event_type_secondary: null,
     sentiment_label: "NEGATIVE", sentiment_score: 0.62,
     headline: "碧桂園審慎擴張暫緩新項目",
@@ -1844,13 +1786,10 @@ INPUT:
 標題：港交所公佈例行董事會會議日期安排
 內文：香港交易所（00388.HK）公佈本年度董事會例行會議時間表，與往年安排基本一致。
 
-TOOL CALLS:
-lookup_stock("香港交易所") → {found: true, stock_code: "00388", exchange: "HKEX"}
-
 OUTPUT:
 entities: [
   {
-    stock_code: "00388",
+    stock_code: "00388", company_name: "香港交易所",
     event_type_primary: "GENERAL_ANNOUNCEMENT", event_type_secondary: null,
     sentiment_label: "NEUTRAL", sentiment_score: 0.10,
     headline: "港交所公佈例行董事會日期",
@@ -1866,13 +1805,10 @@ INPUT:
 內文：舜宇光學（02382.HK）季度收入按年增長15%，惟毛利率由28%收窄至23%，
      管理層同步下調全年盈利指引。
 
-TOOL CALLS:
-lookup_stock("舜宇光學") → {found: true, stock_code: "02382", exchange: "HKEX"}
-
 OUTPUT:
 entities: [
   {
-    stock_code: "02382",
+    stock_code: "02382", company_name: "舜宇光學",
     event_type_primary: "EARNINGS", event_type_secondary: null,
     sentiment_label: "NEGATIVE", sentiment_score: 0.58,
     headline: "舜宇光學收入增長惟毛利率收窄",
@@ -1883,21 +1819,32 @@ entities: [
 
 #### Output Schemas
 
-`AnalysisOutcome`, the schema Instructor validates this call against, is defined in `app/models/entity_event.py` (§11.1) because `EntityEvent.analysis_outcome` wraps it.
+`EntityMention` is the schema the structured-output call returns; `_verify_mention()` turns each verified one into an `AnalysisOutcome` (defined in `app/models/entity_event.py`, §11.1, because `EntityEvent.analysis_outcome` wraps it).
 
 ```python
 from pydantic import BaseModel
 from app.models.entity_event import AnalysisOutcome   # §3.2/§11.1
+from app.models.enums import EventTypeEnum, SentimentEnum   # §3.1
+
+class EntityMention(BaseModel):
+    stock_code: str | None             # the code the article prints, else the HKEX code the model knows, else null
+    company_name: str                  # as written in the article
+    event_type_primary: EventTypeEnum
+    event_type_secondary: EventTypeEnum | None
+    sentiment_label: SentimentEnum
+    sentiment_score: float             # [0.0, 1.0]
+    headline: str                      # <=20 Traditional Chinese characters
+    entity_summary: str                # <=100 Traditional Chinese characters
 
 class LLMOutput(BaseModel):
-    output_items: list[AnalysisOutcome]    # may be empty
+    output_items: list[EntityMention]    # may be empty
 
 class EntityAnalysisResult(SkillResult):   # base: app/skills/skill_base.py, §8.1
     """run()'s entire return value (§11.1 reads skill_log/failure_reason
     directly off this)."""
     model_config = {"arbitrary_types_allowed": True}   # failure_reason: type[Exception] isn't natively Pydantic-validatable
 
-    entity_events: Optional[list[AnalysisOutcome]]   # None unless failure_reason is None — bare LLM output,
+    entity_events: Optional[list[AnalysisOutcome]]   # None unless failure_reason is None — verified items only,
                                                      # no merged company_name/exchange (§11.1 looks up Stock
                                                      # by stock_code itself, an O(1) cache hit, §4.2)
     skill_log: EntityAnalysisSkillLog                          # always populated, every outcome (§8.2, below)
@@ -1908,27 +1855,21 @@ class EntityAnalysisResult(SkillResult):   # base: app/skills/skill_base.py, §8
 
 #### Skill Log Schema
 
-`LlmCallMetric`/`LlmErrorEntry` live in `skill_base.py` (§8.1); these are specific to this Skill's FC loop:
+`LlmCallMetric`/`LlmErrorEntry` live in `skill_base.py` (§8.1); these are specific to this Skill:
 
 ```python
 @dataclass
-class UnverifiedEntity:
-    name_or_code: str
-    attempts: list[str]
-    reason: str                # e.g. "not_found_in_hkex"
-
-@dataclass
-class FcSummary:
-    rounds: int
-    max_rounds_reached: bool
-    per_entity_retries: dict[str, int]
+class DroppedMention:
+    stock_code: Optional[str]
+    company_name: str
+    reason: str                # "not_in_hk_stock_list"
 
 @dataclass
 class EntityAnalysisSkillLog:
     skill_version: str
     verified_entities: list[str]                 # verified stock_codes
-    unverified_entities: list[UnverifiedEntity]
-    fc_summary: FcSummary
+    dropped_mentions: list[DroppedMention]
+    input_truncated: bool                        # body was cut at ENTITY_ANALYSIS_MAX_INPUT_CHARS
     llm_calls: list[LlmCallMetric]
     total_input_tokens: int
     total_output_tokens: int
@@ -1942,113 +1883,83 @@ class EntityAnalysisSkillLog:
 ```python
 class EntityAnalysisSkill(SkillBase):   # SkillBase — app/skills/skill_base.py, §8.1
     def __init__(self, input: EntityAnalysisInput, config: EntityAnalysisConfig):
-        super().__init__(input)   # sets self._input/_rounds/_llm_calls/_llm_errors (§8.1)
+        super().__init__(input)   # sets self._input/_llm_calls/_llm_errors (§8.1)
         self._adapter = get_llm_adapter()               # §7.3
         self._hk_stock_list_cache = get_hk_stock_list_cache()  # §4.2
         self._config = config
-        # FC-loop-only state — safe on self for the same reason as
-        # SkillBase's own state (§8.1, §11.1): fresh instance per run() call.
-        self._entity_retry_count: dict[str, int] = {}
+        # Safe on self for the same reason as SkillBase's own state (§8.1, §11.1):
+        # fresh instance per run() call.
         self._verified_stocks: dict[str, Stock] = {}
-        self._unverified: list[UnverifiedEntity] = []
-        self._max_rounds_reached = False
+        self._dropped: list[DroppedMention] = []
+        self._input_truncated = False
 ```
 
 `run()` is inherited from `SkillBase` (§8.1) — not redefined here.
 
-#### `llm_process()` — the Function Calling Loop
-
-Control flow: system-design.md §9.3. Tool-result wire shape (both branches below build this dict): `found: bool`; on a match, `stock_code: str` (bare native code), `exchange: str` (always `"HKEX"` at MVP scope), `company_name_zh: str`, `company_name_en: str`; on a miss, those four are `null`, with `instruction: str` added only once `MAX_FC_RETRIES_PER_ENTITY` is hit (below).
+#### `llm_process()`
 
 ```
-LOOP:
-    self._rounds += 1
-    if self._rounds > MAX_FC_ROUNDS:
-        self._max_rounds_reached = True
-        break                                          # log fc_rounds_exceeded
+body = self._input.body[:self._config.max_input_chars]
+self._input_truncated = len(body) < len(self._input.body)
+messages = [Message(Role.SYSTEM, _SYSTEM_PROMPT), Message(Role.USER, f"標題：{self._input.title}\n內文：{body}")]
 
-    response = generate_raw(messages, tools=[LOOKUP_STOCK_TOOL], generation_config=_GENERATION_CONFIG)
-    append LlmCallMetric(purpose="fc_round", ...from response) to self._llm_calls
-
-    if not response.tool_calls:
-        break                                          # normal termination
-
-    FOR each tool_call in response.tool_calls:
-        name_or_code = tool_call.arguments["name_or_code"]
-        self._entity_retry_count[name_or_code] += 1
-        verified_stock = lookup_stock(name_or_code, self._config.name_match_min_overlap_ratio)
-
-        if verified_stock found:
-            self._verified_stocks[stock_code] = verified_stock
-            tool_result = {"found": True, **verified_stock fields}      # wire shape above
-        else:
-            tool_result = {"found": False, ...all fields null}
-            if self._entity_retry_count[name_or_code] >= MAX_FC_RETRIES_PER_ENTITY:
-                tool_result["instruction"] = "此實體經多次查詢仍無法驗證，請在最終輸出中排除此實體"
-                append UnverifiedEntity(name_or_code, attempts, reason="not_found_in_hkex") to self._unverified
-
-        append ToolResultMessage(...) to tool_results
-
-    messages += [assistant tool_calls message, tool results message]
-
-# Final structured output call
 structured = generate_structured(messages, output_schema=LLMOutput, generation_config=_GENERATION_CONFIG)
-append LlmCallMetric(purpose="structured_output", ...from structured) to self._llm_calls
-output = structured.output
+append LlmCallMetric(call_index=1, purpose="structured_output", ...from structured) to self._llm_calls
 
-apply Business Constraint Validation (table below) to output.output_items
-output.output_items = [e for e in output.output_items if e.stock_code in self._verified_stocks]  # only verified
+article_text = self._input.title + body
+outcomes = []
+FOR each mention in structured.output.output_items:
+    stock = _verify_mention(mention, article_text)
+    if stock is None:
+        append DroppedMention(mention.stock_code, mention.company_name, reason="not_in_hk_stock_list") to self._dropped
+        continue
+    self._verified_stocks[stock.stock_code] = stock
+    outcomes.append(AnalysisOutcome(stock_code=stock.stock_code, **mention's analysis fields))
+
+apply Business Constraint Validation (table below) to outcomes
 seen_stock_codes = set()
 deduped = []
-for e in output.output_items:
+for e in outcomes:
     if e.stock_code in seen_stock_codes:
         log BusinessValidationError (duplicate stock_code, dropped)  # does not set failure_reason — same
         continue                                                          # non-fatal treatment as every other
     seen_stock_codes.add(e.stock_code)                                   # row in the table below
     deduped.append(e)
-output.output_items = deduped  # keep first occurrence per stock_code — the LLM is instructed
-                            # not to do this (system-design.md §9.4 Edge Case Rule 6), this is the backstop
+# keep first occurrence per stock_code — the LLM is instructed not to repeat one
+# (system-design.md §9.4 Edge Case Rule 5), and two mentions can verify to the same code
 
-return EntityAnalysisResult(output.output_items, skill_log=self._skill_log(), failure_reason=None)
-    # output.output_items: bare AnalysisOutcomes, already filtered to verified-only stock_codes
-    # above — no merged Stock data here; find_entity_events() (§11.1) looks each one
-    # up by stock_code itself, an O(1) cache hit (§4.2), no need to pass self._verified_stocks along
+return EntityAnalysisResult(deduped, skill_log=self._skill_log(), failure_reason=None)
 ```
 
 Raises one of the four typed exceptions (§7.2) on any failure above — `SkillBase.run()` (§8.1) catches them, not this method.
 
-`LOOKUP_STOCK_TOOL` — module-level constant in this file, the tool schema given to the LLM (design rationale: system-design.md §9.2):
+#### `_verify_mention(mention, article_text) -> Optional[Stock]`
 
-```python
-LOOKUP_STOCK_TOOL = ToolDefinition(
-    name="lookup_stock",
-    description="根據公司名稱或股票代碼查詢HKEx股票主列表，驗證股票是否存在並返回標準化信息。識別到文章中的公司實體時必須調用此工具。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "name_or_code": {
-                "type": "string", 
-                "description": "Company name (Chinese or English) or stock code"
-                }
-            },
-        "required": ["name_or_code"],
-    },
-    strict=True,
-)
+Resolves one `EntityMention` against `self._hk_stock_list_cache.entries` (rationale: system-design.md §9.2):
+
+```
+code = mention.stock_code normalized per system-design.md §9.2 (trim, drop ".HK", zero-pad 2–5 digits to 5;
+       anything else → no code)
+if code in entries:
+    stock = entries[code]
+    if _name_consistent(mention.company_name, stock) or _code_printed(code, article_text):
+        return stock
+return lookup_stock(mention.company_name, self._config.name_match_min_overlap_ratio)   # §4.2 name search
 ```
 
-#### `_skill_log()` / `build_fail_result()`
+`_name_consistent(name, stock)`: true when `name` and `stock.company_name_zh` or `stock.company_name_en` agree after normalizing both sides — full-width to half-width, whitespace removed, case-folded, HK variant characters folded (滙→匯, 鋭→銳, 綫→線, 峯→峰, 裏→裡, 衞→衛, 眾→衆), a trailing counter marker (`－Ｗ`, `-SW`, …) dropped, and the words 有限公司/控股/集團/股份/Limited/Holdings/Group/Company/Co/Ltd/Inc removed. They agree when the normalized mention name is an ordered subsequence of the normalized listed name (農行 ⊂ 農業銀行), or the listed name is an ordered subsequence of the mention name and at least 60% of its length (a short listed name inside a long legal name, but not "CHINA NEXT-GEN" inside "Amundi FTSE China A50 Index ETF").
 
-`_skill_log()` maps `self`'s accumulated state onto `EntityAnalysisSkillLog` (below) — called from both `llm_process()` (success) and `build_fail_result()` (failure).
+`_code_printed(code, article_text)`: true when the article prints the code in a code-shaped form — `(0700)`, `（00700）`, `00700.HK`, `Stock Code: 700`, `股份代號：700` — with leading zeros optional. A bare number elsewhere in the text never counts.
+
+`_skill_log()` maps `self`'s accumulated state onto `EntityAnalysisSkillLog` — called from both `llm_process()` (success) and `build_fail_result()` (failure).
 
 ```python
 def _skill_log(self) -> EntityAnalysisSkillLog:
     return EntityAnalysisSkillLog(
         skill_version=ENTITY_SKILL_VERSION,
         verified_entities=list(self._verified_stocks.keys()),
-        unverified_entities=self._unverified,
-        fc_summary=FcSummary(rounds=self._rounds, max_rounds_reached=self._max_rounds_reached,
-                              per_entity_retries=dict(self._entity_retry_count)),
+        dropped_mentions=self._dropped,
+        input_truncated=self._input_truncated,
         llm_calls=self._llm_calls,
         total_input_tokens=sum(c.input_tokens for c in self._llm_calls),
         total_output_tokens=sum(c.output_tokens for c in self._llm_calls),
@@ -2061,8 +1972,7 @@ def build_fail_result(self, err: Exception) -> EntityAnalysisResult:
     return EntityAnalysisResult(entity_events=None, skill_log=self._skill_log(), failure_reason=type(err))
 ```
 
-
-#### Business Constraint Validation (post-Instructor)
+#### Business Constraint Validation (post-verification)
 
 | Field | Constraint | On violation |
 |---|---|---|
@@ -2070,8 +1980,8 @@ def build_fail_result(self, err: Exception) -> EntityAnalysisResult:
 | `headline` | ≤20 chars | Truncate; log `BusinessValidationError` |
 | `entity_summary` | ≤100 chars | Truncate; log `BusinessValidationError` |
 | `event_type_secondary` | must differ from `event_type_primary` | Set to `null`; log `BusinessValidationError` |
-| `entities[].stock_code` | must be in `verified_stocks` | Filtered out by the loop's design — not a truncation case |
-| `entities[].stock_code` | no duplicates within one article | Keep the first occurrence, drop the rest; log `BusinessValidationError` |
+| `stock_code` | must resolve through `_verify_mention()` | Dropped before validation, recorded in `dropped_mentions` — not a truncation case |
+| `stock_code` | no duplicates within one article | Keep the first occurrence, drop the rest; log `BusinessValidationError` |
 
 Error handling (which exceptions get caught where, and what `EntityAnalysisService` does with each `failure_reason`) is covered once, in §8.5's cross-Skill table and §11.2's flowchart callouts — not repeated here.
 
@@ -2142,7 +2052,7 @@ class BriefSummaryResult(SkillResult):   # base: app/skills/skill_base.py, §8.1
 ```python
 class BriefSummarySkill(SkillBase):   # base: app/skills/skill_base.py, §8.1
     def __init__(self, input: BriefSummaryInput):
-        super().__init__(input)   # sets self._input/_llm_calls/_llm_errors (§8.1); self._rounds unused here
+        super().__init__(input)   # sets self._input/_llm_calls/_llm_errors (§8.1)
         self._adapter = get_llm_adapter()   # §7.3
         self._input_summary, self._messages = build_prompt()   # Input construction, below — reads self._input
 ```
@@ -2231,9 +2141,9 @@ class BriefSummarySkillLog:
 
 `input_summary` fields (`entity_summary_count`, `entity_summary_total_chars`, `truncated_by_source_cap`, `truncated_by_char_cap`) are recorded during this construction and included in the `brief_summary_completed` log event (system-design.md §9.8).
 
-#### Business Constraint Validation (post-Instructor)
+#### Business Constraint Validation (post-call)
 
-Instructor's validation enforces only `BriefSummary`'s field types; the length/count limits are business rules enforced here (as in §8.2, §8.4):
+Schema validation (§7.3) enforces only `BriefSummary`'s field types; the length/count limits are business rules enforced here (as in §8.2, §8.4):
 
 | Field | Constraint | On violation |
 |---|---|---|
@@ -2241,7 +2151,7 @@ Instructor's validation enforces only `BriefSummary`'s field types; the length/c
 | `summary_full` | ≤150 chars | Truncate to 150 chars; log `BusinessValidationError` |
 | `key_numbers` | Max 3 items | Retain first 3; discard remainder; log `BusinessValidationError` |
 
-Applied to the Instructor-validated `BriefSummary` right after `generate_structured()` returns.
+Applied to the schema-validated `BriefSummary` right after `generate_structured()` returns.
 
 #### Fallback (system-design.md §5.9, §9.7)
 
@@ -2331,7 +2241,7 @@ class EventLLMScoringResult(SkillResult):   # base: app/skills/skill_base.py, §
 ```python
 class EventLLMScoringSkill(SkillBase):   # base: app/skills/skill_base.py, §8.1
     def __init__(self, input: EventLLMScoringInput):
-        super().__init__(input)   # sets self._input/_llm_calls/_llm_errors (§8.1); self._rounds unused here
+        super().__init__(input)   # sets self._input/_llm_calls/_llm_errors (§8.1)
         self._adapter = get_llm_adapter()   # §7.3
         self._messages = build_prompt()   # Input construction, below — reads self._input
 ```
@@ -2340,7 +2250,7 @@ class EventLLMScoringSkill(SkillBase):   # base: app/skills/skill_base.py, §8.1
 
 #### `llm_process()`
 
-Two distinct triggers reach this Skill's own fallback (below), both handled here rather than in `SkillBase.run()`: `LLMSchemaViolationError` (caught, like `BriefSummarySkill`, §8.3), and a non-error case — `adjustment_reason` coming back empty, which Instructor's type-only validation doesn't catch. `LLMRateLimitError`/`LLMProviderError`/`LLMAuthenticationError` are left to propagate to `SkillBase.run()`.
+Two distinct triggers reach this Skill's own fallback (below), both handled here rather than in `SkillBase.run()`: `LLMSchemaViolationError` (caught, like `BriefSummarySkill`, §8.3), and a non-error case — `adjustment_reason` coming back empty, which type-only schema validation doesn't catch. `LLMRateLimitError`/`LLMProviderError`/`LLMAuthenticationError` are left to propagate to `SkillBase.run()`.
 
 ```
 try:
@@ -2416,7 +2326,7 @@ class EventLLMScoringSkillLog:
 | `adjustment_reason` | ≤80 chars | Truncate; log `BusinessValidationError` |
 | `adjustment_reason` | non-empty | Trigger fallback (below); log warning |
 
-The clip/truncate rows are applied to the Instructor-validated `LLMScore` right after `generate_structured()` returns. The third row is this Skill's fallback trigger (see `llm_process()`).
+The clip/truncate rows are applied to the schema-validated `LLMScore` right after `generate_structured()` returns. The third row is this Skill's fallback trigger (see `llm_process()`).
 
 #### Fallback (system-design.md §5.9)
 
@@ -2434,7 +2344,7 @@ return LLMScore(stock_impact_score, adjustment_reason)
 
 ### 8.5 Skill Error Handling Summary (system-design.md §9.7)
 
-All three Skills catch the four exceptions internally and return a typed result (`EntityAnalysisResult`/`BriefSummaryResult`/`EventLLMScoringResult`, §8.2–§8.4), each subclassing `SkillResult` (§8.1). `EntityAnalysisResult` carries `skill_log`/`failure_reason` directly; the other two also wrap their Instructor-validated output in an `output` field. Callers inspect `failure_reason`/`fallback`, never a `try`/`except` around the call.
+All three Skills catch the four exceptions internally and return a typed result (`EntityAnalysisResult`/`BriefSummaryResult`/`EventLLMScoringResult`, §8.2–§8.4), each subclassing `SkillResult` (§8.1). `EntityAnalysisResult` carries `skill_log`/`failure_reason` directly; the other two also wrap their schema-validated output in an `output` field. Callers inspect `failure_reason`/`fallback`, never a `try`/`except` around the call.
 
 | Skill | `LLMRateLimitError` | `LLMProviderError` / `LLMAuthenticationError` | `LLMSchemaViolationError` |
 |---|---|---|---|
@@ -3253,7 +3163,7 @@ Purpose :
 
 5. result.failure_reason set: log entity_analysis_completed (below, entity_event_ids=[]); raise result.failure_reason() — the original exception, re-raised as itself in every case.
 
-6. result.failure_reason is None (incl. entity_events=[]): build one EntityEvent per item (below), reading source_id/source_url/source_name/published_at off article (still a separate CleanedNews variable — never nested onto EntityEvent itself), and stock = get_hk_stock_list_cache().entries.get(item.stock_code) (§4.2) — an O(1) dict lookup. EntityAnalysisSkill's Function Calling loop (§8.2) already verified this stock_code, but against the entries dict as it was at lookup time; a POST /admin/hk-stock-list-sync landing during a later await (e.g. the final structured-output call) can rebind entries to a list without it. On None: drop that item, log warning entity_stock_no_longer_listed (cleaned_id, stock_code), and continue with the rest; {
+6. result.failure_reason is None (incl. entity_events=[]): build one EntityEvent per item (below), reading source_id/source_url/source_name/published_at off article (still a separate CleanedNews variable — never nested onto EntityEvent itself), and stock = get_hk_stock_list_cache().entries.get(item.stock_code) (§4.2) — an O(1) dict lookup. EntityAnalysisSkill's verification step (§8.2) already resolved this stock_code, but against the entries dict as it was at that moment; a POST /admin/hk-stock-list-sync landing during a later await can rebind entries to a list without it. On None: drop that item, log warning entity_stock_no_longer_listed (cleaned_id, stock_code), and continue with the rest; {
     7. self._repo.persist_entities() (§10.1) writes all of them in one transaction, each via INSERT ... ON CONFLICT (source_url, stock_code)
        DO NOTHING RETURNING entity_event_id, setting entity_event_id onto each EntityEvent actually inserted and filtering out the rest;
 
@@ -3267,7 +3177,7 @@ Purpose :
 
 > **`entity_skill.run()` only ever raises something outside `LLMError`.** `SkillBase.run()`'s one `except` clause (§8.1) — `except LLMError` — catches all four typed LLM failures and converts them to `result.failure_reason` instead of raising. Anything else escaping `llm_process()` is an unanticipated bug, and propagates straight out of `run()` uncaught, the same as a SADI fetch or DB write failure (§11.4).
 
-> **Row-per-entity.** The `(source_url, stock_code)` unique index (§17) depends on `output_items` never carrying two items for one `stock_code`. The LLM is told not to (system-design.md §9.4 Edge Case Rule 6), and `EntityAnalysisSkill`'s Business Constraint Validation (§8.2) drops duplicates before any `EntityEvent` is built.
+> **Row-per-entity.** The `(source_url, stock_code)` unique index (§17) depends on `output_items` never carrying two items for one `stock_code`. The LLM is told not to (system-design.md §9.4 Edge Case Rule 5), and `EntityAnalysisSkill`'s Business Constraint Validation (§8.2) drops duplicates before any `EntityEvent` is built.
 
 #### Data Structure: `EntityEvent` — `app/models/entity_event.py`
 
@@ -3280,8 +3190,8 @@ from app.common.stock import Stock   # §4.2
 from app.models.enums import EventTypeEnum, SentimentEnum   # §3.1
 
 class AnalysisOutcome(BaseModel):
-    """The schema Instructor validates EntityAnalysisSkill's (§8.2) structured-output call
-    against; wrapped by EntityEvent.analysis_outcome."""
+    """One verified entity from EntityAnalysisSkill (§8.2), built from a verified EntityMention;
+    wrapped by EntityEvent.analysis_outcome."""
     stock_code: str
     event_type_primary: EventTypeEnum
     event_type_secondary: EventTypeEnum | None
@@ -4026,14 +3936,14 @@ from pydantic import BaseModel
 from app.models.versioned_metadata import VersionedMetadata   # §3.2
 
 class LLMScore(BaseModel):
-    """Instructor-validated output of EventLLMScoringSkill.run() (§8.4); wrapped by EventScore.llm_score_detail."""
+    """Schema-validated output of EventLLMScoringSkill.run() (§8.4); wrapped by EventScore.llm_score_detail."""
     stock_impact_score: float   # [-5.0, +5.0]
     adjustment_reason: str      # <=80 Traditional Chinese characters
 
 @dataclass
 class RuleScore:
     """compute_rule_score()'s (§13.3) return type, wrapped by event_scores.rule_score_detail.
-    A plain dataclass: a pure function with no Instructor validation."""
+    A plain dataclass: a pure function with no LLM schema validation."""
     event_type_score: float
     source_authority_score: float
     sentiment_strength_score: float
@@ -5506,24 +5416,22 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 | Q-2 | Validate `SCORING_MAX_CONCURRENT` against LLM API rate limits | Scoring Layer throughput | Week 1 |
 | Q-3 | Post-MVP: Dead Letter Stream consumption and reprocessing pipeline | Service reliability | Post-MVP |
 | Q-6 | Post-MVP: `entity_event_processing_status` table for state machine tracking and quality monitoring | Observability | Post-MVP |
-| Q-7 | Validate `MAX_FC_ROUNDS=3` and `MAX_FC_RETRIES_PER_ENTITY=2` against real HK news data | EntityAnalysisSkill accuracy | Week 2 |
 | Q-8 | Validate BriefSummarySkill's 200-char input cap against real aggregated Events | BriefSummarySkill output quality | Week 2 |
 | Q-9 | Validate `RATE_LIMIT_BACKOFF_S=60` against actual Vertex AI rate limit reset window | LLM throughput | Week 1 |
 | Q-10 | Post-MVP: quality monitoring Service design (log ingestion, LLM-as-Judge, post-event price correlation) | LLM quality improvement | Post-MVP |
-| Q-11 | Validate `LLM_API_TIMEOUT_S=30` and the common `HTTP_TIMEOUT_S=120` (§4.1 — covers SADI, Admin, and HKEXnews calls) against real latency measurements | Latency tuning | Week 1 |
+| Q-11 | Validate the common `HTTP_TIMEOUT_S=120` (§4.1 — covers SADI, Admin, and HKEXnews calls) against real latency measurements (`LLM_API_TIMEOUT_S` is measured, §4.1) | Latency tuning | Week 1 |
 | Q-15 | Validate `source_heat_score`'s `source_count / TOTAL_ACTIVE_SOURCES` formula against real cross-source corroboration rates | `source_heat_score` calibration | Week 1-2 |
 | Q-16 | Validate `lookup_stock`'s fuzzy name-matching against real HK news article entity mentions | EntityAnalysisSkill accuracy | Week 2 |
 | Q-17 | Morning Brief cache retention: Events never age out of the cache (§14.4), so it grows without bound and old high-impact Events keep surfacing in the backfill | Morning Brief content; build cost (§14.1, §14.9); Redis memory | Pre-go-live (product decision) |
 
-(Q-4, Q-5, Q-12, Q-13, Q-14 are marked Resolved in system-design.md §14 and are not repeated here.)
+(Q-4, Q-5, Q-7, Q-12, Q-13, Q-14 are marked Resolved in system-design.md §14 and are not repeated here.)
 
 ### New — implementation-doc-level gaps found while writing this document
 
 | # | Gap | Where | Recommended resolution |
 |---|---|---|---|
 | I-1 | **`_fuzzy_match`'s (§4.2) real-world performance is unverified:** an O(N) synchronous scan over ~2,000–2,600 entries on the shared event loop (§16). A synthetic benchmark of the §4.2 code (2,600 entries with Chinese and English names, laptop, Python 3.14) measured a ~2–3 ms floor per call (every call rebuilds each name's character set) and ~12–23 ms when hundreds to ~1,400 names pass the overlap ratio and each runs `_lcs_length()`; expect slower on a shared-vCPU VM. | §4.2 | `lookup_stock_completed` (§4.2) provides the measurements. Before traffic: a synthetic micro-benchmark plus an event-loop heartbeat-gap test. After: p50/p95/p99 from the logs. If blocking is meaningful, wrap in `asyncio.to_thread()` (as SADI does for `feedparser`); not before, since dispatch overhead may net-lose. |
-| I-2 | **Token counts and `instructor_retries` (§7.1, §7.3) are unverified against the pinned SDKs:** assumes `google-genai` exposes Gemini's `usage_metadata` in a known shape and `instructor.from_genai(...)` surfaces a per-call retry count; no versions are pinned. `latency_ms` needs no verification. | §7.1, §7.3 | Before implementing `VertexAIAdapter`: a standalone spike against the real pinned versions on live Vertex AI, printing the raw response to confirm the token-count attribute path and Instructor's retry count. Token counts matter more (they feed cost monitoring); if `instructor_retries` is awkward, ship a documented placeholder `0`. |
-| I-3 | **Per-Skill `Max Tokens` (§8 table: 8192/4096/2048) has no stated derivation** in either doc; they read as round-number placeholders. | §8, system-design.md §9.1 | Validate against real `output_tokens` from the `llm_calls[]` log (system-design.md §9.8): check for calls hitting the max (truncated JSON) and for persistent unused headroom at p95/p99; adjust per Skill. Not blocking; truncation is the likelier failure. |
+| I-3 | **BriefSummarySkill/EventLLMScoringSkill's model and `Max Tokens` (§8 table: `gemini-3.1-flash-lite`, 4096/2048) are unmeasured starting values;** EntityAnalysisSkill's row is measured (§8). | §8, system-design.md §9.1 | Measure on real aggregated Events before implementing either Skill: check for calls hitting the max (truncated JSON → `LLMSchemaViolationError`) and for persistent unused headroom at p95/p99; adjust per Skill. |
 ---
 
 *— End of Document | SAPI Implementation Guide v0.1 —*
