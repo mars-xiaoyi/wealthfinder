@@ -156,18 +156,22 @@ This document does not introduce new design — every ticket below implements so
 ### Stock Resolution: `lookup_stock` (S)
 
 **Status:** Created
-**Depends on:** Spike: `lookup_stock` Fuzzy Matching (for the final §4.2 algorithm/defaults); Startup & Health: Fetch & Cache HK Stock List (for `HKStockListCache`/`get_hk_stock_list_cache()`/`Stock`)
-**Scope:** Resolve a company name or stock code against the in-process HK Stock List (impl.md §4.2, as revised by the fuzzy-matching spike).
-- `app/common/hk_stock_list.py`: `lookup_stock()`, `_fuzzy_match()`, `_lcs_length()`, and the `lookup_stock_completed` log event with its `_SLOW_CALL_THRESHOLD_MS` WARNING escalation.
-- No config change — `min_overlap_ratio` is a parameter; `EntityAnalysisConfig.name_match_min_overlap_ratio` is added by its first real reader (LLM Entity Extraction).
+**Depends on:** Spike: `lookup_stock` Fuzzy Matching (for the final §4.2 algorithm); Startup & Health: Fetch & Cache HK Stock List (for `HKStockListCache`/`get_hk_stock_list_cache()`/`Stock`/`_parse_hk_stock_list()`/`refresh_hk_stock_list()`)
+**Scope:** The name search and shared name normalizer of entity verification, over the in-process HK Stock List (impl.md §4.2).
+- `app/common/stock_name_match.py`: `name_forms()`, `NameEntry`/`StockNameIndex`/`NameSearchResult`, `build_name_index()`, `names_agree()`, `search()`; `opencc` added to `requirements.txt`.
+- `app/common/hk_stock_list.py`: `HKStockListCache.name_index`; `refresh_hk_stock_list()` builds it in `asyncio.to_thread` and rebinds it back to back with `.entries`, and the fallback cache gets `build_name_index({})`; every existing `HKStockListCache(...)` construction, including tests that seed one, passes a `build_name_index()` index; `_parse_hk_stock_list()` drops RMB counters and `－Ｔ`/`-T` lines (`_is_extra_counter()`).
+- `app/common/lookup_stock.py`: `lookup_stock(name)` and the `lookup_stock_completed` log event with its `_SLOW_CALL_THRESHOLD_MS` WARNING escalation.
+- No config change.
 **Acceptance criteria** (per impl.md §4.2):
-- Exact-code path: `"700"`/`"0700"`/`"00700.HK"` all resolve to `"00700"`; the ≥2-digit rule separates code from name; `candidates_scanned=0`.
-- Fuzzy path: overlap-ratio floor, overlap-then-LCS ranking, `candidates_scanned=len(cache)`; a miss returns `None`.
+- `name_forms()`, `names_agree()` and `search()`'s `_score` ranking match §4.2 exactly.
+- `search()`: an exact form match decides on its own (one stock code wins, several is a miss); only with no exact match does `_score` rank the pool, and a tie between stock codes is a miss. `candidates_scanned` is the number of names checked: `len(index.names)` on the exact path, the pool size otherwise, 0 for a query with no forms.
+- `refresh_hk_stock_list()` rebinds `entries` and `name_index` together; a failed refresh leaves both untouched; the fallback cache's index is empty.
+- `_parse_hk_stock_list()` loads no RMB counter and no `－Ｔ`/`-T` line.
 - `lookup_stock_completed` carries every §4.2 field, at WARNING above the threshold.
 - Unit-tested against a seeded `HKStockListCache`.
-- The fuzzy-matching spike's case table becomes a regression fixture, run once against the live HKEX list as the integration pass.
-**Docs:** impl.md §4.2 (`lookup_stock` onward); design.md §9.2, §9.2.1. Validated by: Entity Analysis: Post-Release Tuning Validation (Q-16 at scale, I-1's real-traffic part).
-**Explicitly deferred:** the `lookup_stock` tool wiring, wire-shape dict, and retry `instruction` (the FC loop — LLM Entity Extraction).
+- The fuzzy-matching spike's case sets become a regression fixture, run against the live HKEX list as the integration pass.
+**Docs:** impl.md §4.2; design.md §9.2, §9.2.1. Validated by: Entity Analysis: Post-Release Tuning Validation (Q-16 at scale, I-1's real-traffic part).
+**Explicitly deferred:** `_name_consistent()` calling `names_agree()`, and the `_verify_mention()` call site (LLM Entity Extraction).
 
 ---
 

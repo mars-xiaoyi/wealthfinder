@@ -615,7 +615,7 @@ config = get_config()
 
 ### 4.2 HK Stock List — `app/common/hk_stock_list.py`
 
-Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s verification step (§8.2) reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. `lookup_stock` lives here too: it is cache-reading logic, and `EntityAnalysisSkill._verify_mention()` (§8.2) is its only caller.
+Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s verification step (§8.2) reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. `lookup_stock` (`app/common/lookup_stock.py`) and the name matching it shares with `_name_consistent()` (`app/common/stock_name_match.py`) are here too: both read this cache, and `EntityAnalysisSkill._verify_mention()` (§8.2) is their only caller.
 
 **In-process only, no Redis** (rationale: system-design.md §9.2.1). One shared mutable `HKStockListCache` instance holds the fetch result.
 
