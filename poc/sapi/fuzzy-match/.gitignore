@@ -1,0 +1,3 @@
+__pycache__/
+# Raw article exports from the local SADI DB (third-party news text); rebuild with the commands in extract_news.py / extract_hkex.py
+data/*_articles.tsv
