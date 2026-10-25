@@ -1,6 +1,6 @@
 .venv/
 __pycache__/
-# local leftovers of the spike runs (article text, caches); the evidence branch has the scripts
+# local leftovers of the spike runs (article text, caches)
 data/
 eval/
 runs/

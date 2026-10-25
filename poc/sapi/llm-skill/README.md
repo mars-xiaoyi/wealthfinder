@@ -78,7 +78,3 @@ gcloud auth application-default login
 ## Test data for implementation
 
 `cleaned_news_split.json` splits `poc/sapi/cleaned_news_export.csv` (729 articles published 2026-09-01..13) by `cleaned_id`. **`reserved`** holds 288 articles published 09-08..13 that no spike has read: 128 HKEX, 97 Ming Pao, 40 AASTOCKS and 23 Yahoo HK. Use those for implementation testing. `verify` (127, this spike's test set), `read_by_other_spike` (312, published 09-01..07) and `spent` (2) have already been used. The file holds IDs only; article text is never committed.
-
-## Full evidence
-
-The round-by-round scripts, the evaluation harness, the raw per-article results and the detailed write-up are kept on branch `sapi-2882704929-llm-skill-spike-evidence` (commit `82a6198`). Every number in this README comes from there.
