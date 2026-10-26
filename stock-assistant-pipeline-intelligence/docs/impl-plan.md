@@ -158,9 +158,10 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Spike: `lookup_stock` Fuzzy Matching (for the final §4.2 algorithm); Startup & Health: Fetch & Cache HK Stock List (for `HKStockListCache`/`get_hk_stock_list_cache()`/`Stock`/`_parse_hk_stock_list()`/`refresh_hk_stock_list()`)
 **Scope:** The name search and shared name normalizer of entity verification, over the in-process HK Stock List (impl.md §4.2).
-- `app/common/stock_name_match.py`: `name_forms()`, `NameEntry`/`StockNameIndex`/`NameSearchResult`, `build_name_index()`, `names_agree()`, `search()`; `opencc` added to `requirements.txt`.
-- `app/common/hk_stock_list.py`: `HKStockListCache.name_index`; `refresh_hk_stock_list()` builds it in `asyncio.to_thread` and rebinds it back to back with `.entries`, and the fallback cache gets `build_name_index({})`; every existing `HKStockListCache(...)` construction, including tests that seed one, passes a `build_name_index()` index; `_parse_hk_stock_list()` drops RMB counters and `－Ｔ`/`-T` lines (`_is_extra_counter()`).
-- `app/common/lookup_stock.py`: `lookup_stock(name)` and the `lookup_stock_completed` log event with its `_SLOW_CALL_THRESHOLD_MS` WARNING escalation.
+- `app/common/hk_stock_list/` becomes a package: today's `hk_stock_list.py` moves to `cache.py` and `app/common/stock.py` to `stock.py`, with every import and monkeypatch target updated.
+- `app/common/hk_stock_list/name_match.py`: `name_forms()`, `NameEntry`/`StockNameIndex`/`NameSearchResult`, `build_name_index()`, `names_agree()`, `search()`; `opencc` added to `requirements.txt`.
+- `app/common/hk_stock_list/cache.py`: `HKStockListCache.name_index`; `refresh_hk_stock_list()` builds it in `asyncio.to_thread` and rebinds it back to back with `.entries`, and the fallback cache gets `build_name_index({})`; every existing `HKStockListCache(...)` construction, including tests that seed one, passes a `build_name_index()` index; `_parse_hk_stock_list()` drops RMB counters and `－Ｔ`/`-T` lines (`_is_extra_counter()`).
+- `app/common/hk_stock_list/lookup.py`: `lookup_stock(name)` and the `lookup_stock_completed` log event with its `_SLOW_CALL_THRESHOLD_MS` WARNING escalation.
 - No config change.
 **Acceptance criteria** (per impl.md §4.2):
 - `name_forms()`, `names_agree()` and `search()`'s `_score` ranking match §4.2 exactly.

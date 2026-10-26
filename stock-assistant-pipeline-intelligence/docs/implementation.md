@@ -131,7 +131,7 @@ sapi/
 │   │   ├── routes/
 │   │   │   ├── morning_brief.py         # GET /v1/morning-brief
 │   │   │   ├── health.py                # GET /v1/health
-│   │   │   ├── hk_stock_list_sync.py # POST /v1/admin/hk-stock-list-sync (delegates to common/hk_stock_list.py)
+│   │   │   ├── hk_stock_list_sync.py # POST /v1/admin/hk-stock-list-sync (delegates to common/hk_stock_list/cache.py)
 │   │   │   └── morning_brief_refresh.py # POST /v1/admin/morning-brief-refresh — daily cache refresh, called by Admin (§15.7)
 │   │   ├── schemas.py                   # Pydantic request/response schemas
 │   │   ├── error_handlers.py            # SAPIError → HTTP status + ErrorResponse mapping; handler registration (§15.1)
@@ -167,10 +167,12 @@ sapi/
 │   │   ├── error_categories.py          # ErrorCategory — the part of SAPI an error was raised from (§15.1)
 │   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ParseError / ...
 │   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2); translate_client_errors decorator (§9)
-│   │   ├── stock.py                     # Stock dataclass — cross-module shape shared by lookup_stock.py, hk_stock_list.py's HKStockListCache, and EntityAnalysisSkill (§4.2)
-│   │   ├── lookup_stock.py              # lookup_stock: name search over the in-process HKStockListCache (§4.2)
-│   │   ├── stock_name_match.py          # The one company-name normalizer + StockNameIndex, shared by lookup_stock and _name_consistent (§4.2)
-│   │   ├── hk_stock_list.py          # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; startup load + sync handler, no Redis (§4.2.1)
+│   │   ├── hk_stock_list/               # The in-process HK Stock List, no Redis (§4.2)
+│   │   │   ├── __init__.py
+│   │   │   ├── stock.py                 # Stock dataclass — the list's entry type, also used by EntityAnalysisSkill
+│   │   │   ├── cache.py                 # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; refresh_hk_stock_list()
+│   │   │   ├── name_match.py            # The one company-name normalizer + StockNameIndex, shared by lookup_stock and _name_consistent
+│   │   │   └── lookup.py                # lookup_stock: name search over the HKStockListCache
 │   │   └── supervised.py                # run_supervised() — leak-free concurrent-coroutine supervision, used by every layer's start() (§6.1)
 │   ├── layer_tasks.py                   # register_layer_tasks()/get_layer_tasks() — the four layer Tasks, for GET /health's liveness check (§15.6)
 │   ├── logger.py                        # Unified system logger; structlog; stdout JSON output (§4.3)
@@ -613,15 +615,15 @@ config = get_config()
 
 ---
 
-### 4.2 HK Stock List — `app/common/hk_stock_list.py`
+### 4.2 HK Stock List — `app/common/hk_stock_list/`
 
-Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s verification step (§8.2) reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. `lookup_stock` (`app/common/lookup_stock.py`) and the name matching it shares with `_name_consistent()` (`app/common/stock_name_match.py`) are here too: both read this cache, and `EntityAnalysisSkill._verify_mention()` (§8.2) is their only caller.
+Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s verification step (§8.2) reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. The package holds the cache (`cache.py`), its entry type (`stock.py`), `lookup_stock` (`lookup.py`), and the name matching `lookup_stock` shares with `_name_consistent()` (`name_match.py`); `EntityAnalysisSkill._verify_mention()` (§8.2) is the only caller of the last two.
 
 **In-process only, no Redis** (rationale: system-design.md §9.2.1). One shared mutable `HKStockListCache` instance holds the fetch result.
 
-#### `app/common/stock.py` — `Stock`
+#### `app/common/hk_stock_list/stock.py` — `Stock`
 
-Shared by `lookup_stock()` and `EntityAnalysisSkill` (§8.2). Not DB-persisted, so it lives in `app/common/` rather than `app/models/`. It represents a *found* match; `lookup_stock()` returns `None` for a miss.
+Shared by `lookup_stock()` and `EntityAnalysisSkill` (§8.2). Not DB-persisted, so it lives with the list rather than in `app/models/`. It represents a *found* match; `lookup_stock()` returns `None` for a miss.
 
 `stock_code` is the **bare native code** (e.g. `"00700"`, no exchange suffix), matching HKEXnews's feed. `exchange` (currently always `"HKEX"`) is its own field, as on every other stock-bearing model (§3).
 
@@ -662,7 +664,7 @@ def create_http_client(timeout_s: int) -> httpx.AsyncClient:
 
 `timeout_s` is the only thing it configures (`HttpConfig.timeout_s`, §4.1), so it is an explicit typed parameter rather than `**kwargs`.
 
-#### Class: `HKStockListCache`
+#### `app/common/hk_stock_list/cache.py` — Class: `HKStockListCache`
 
 `entries` holds `Stock` (below) directly, so `entries[k].stock_code == k`. `name_index` is the same list's names prepared for matching (`StockNameIndex`, below), built from `entries` at every refresh.
 
@@ -689,7 +691,7 @@ def get_hk_stock_list_cache() -> HKStockListCache:
     return _hk_stock_list_cache
 ```
 
-#### `app/common/stock_name_match.py` — company-name matching
+#### `app/common/hk_stock_list/name_match.py` — company-name matching
 
 One normalizer and one prepared index serve both name checks in `_verify_mention()` (§8.2): `names_agree()` for `_name_consistent()` (step 1), and `search()` for `lookup_stock()` (step 3). Rationale: system-design.md §9.2. Traditional-to-simplified folding needs `opencc` (runtime dependency).
 
@@ -793,7 +795,7 @@ both CJK:
 
 The tightest span is the earliest-ending match, started as late as that end allows.
 
-#### Function: `lookup_stock(name: str) -> Optional[Stock]`
+#### `app/common/hk_stock_list/lookup.py` — Function: `lookup_stock(name: str) -> Optional[Stock]`
 
 ```
 Purpose : Name search over the HK Stock List: step 3 of EntityAnalysisSkill._verify_mention() (§8.2),
@@ -829,7 +831,7 @@ def lookup_stock(name: str) -> Optional[Stock]:
 
 `name` in the log line identifies which entity triggered a slow call. `logger` is the shared structlog logger (`app/logger.py`).
 
-#### Sources
+#### `app/common/hk_stock_list/cache.py` — Sources
 
 ```python
 _ACTIVESTOCK_EN_URL = "https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json"
@@ -3261,7 +3263,7 @@ One shape for an `entity_events` row, on both sides: `find_entity_events()` buil
 ```python
 from pydantic import BaseModel
 
-from app.common.stock import Stock   # §4.2
+from app.common.hk_stock_list.stock import Stock   # §4.2
 from app.models.enums import EventTypeEnum, SentimentEnum   # §3.1
 
 class AnalysisOutcome(BaseModel):
@@ -5227,7 +5229,7 @@ from app.llm.vertex_adapter import create_llm_adapter
 from app.common.http_client import create_http_client
 from app.clients.news_client import create_news_client
 from app.clients.admin_client import create_admin_client
-from app.common.hk_stock_list import refresh_hk_stock_list
+from app.common.hk_stock_list.cache import refresh_hk_stock_list
 from app.entity_analysis.worker_pool import WorkerPool
 from app.persistent.entity_event_repository import create_entity_event_repository
 from app.persistent.event_repository import create_event_repository
@@ -5496,7 +5498,7 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 | Q-10 | Post-MVP: quality monitoring Service design (log ingestion, LLM-as-Judge, post-event price correlation) | LLM quality improvement | Post-MVP |
 | Q-11 | Validate the common `HTTP_TIMEOUT_S=120` (§4.1 — covers SADI, Admin, and HKEXnews calls) against real latency measurements (`LLM_API_TIMEOUT_S` is measured, §4.1) | Latency tuning | Week 1 |
 | Q-15 | Validate `source_heat_score`'s `source_count / TOTAL_ACTIVE_SOURCES` formula against real cross-source corroboration rates | `source_heat_score` calibration | Week 1-2 |
-| Q-16 | Validate the name checks of entity verification (§4.2 `stock_name_match`) at real volume: how often `lookup_stock` decides an entity, and a hand-checked sample of its matches and of unverified entities | EntityAnalysisSkill accuracy | Week 2 |
+| Q-16 | Validate the name checks of entity verification (§4.2 `name_match`) at real volume: how often `lookup_stock` decides an entity, and a hand-checked sample of its matches and of unverified entities | EntityAnalysisSkill accuracy | Week 2 |
 | Q-17 | Morning Brief cache retention: Events never age out of the cache (§14.4), so it grows without bound and old high-impact Events keep surfacing in the backfill | Morning Brief content; build cost (§14.1, §14.9); Redis memory | Pre-go-live (product decision) |
 
 (Q-4, Q-5, Q-7, Q-12, Q-13, Q-14 are marked Resolved in system-design.md §14 and are not repeated here.)

@@ -789,7 +789,7 @@ A mention that resolves through none of these is dropped, never guessed at. Exac
 - **Ordered subsequence:** a Chinese abbreviation is an ordered subsequence of the full name, with characters taken from anywhere in it (農行 ⊂ 農業銀行, 國壽 ⊂ 中國人壽), and a listed short name is an ordered subsequence of the issuer's legal name (赤峰黃金 ⊂ 赤峰吉隆黃金礦業集團). The search ranks hits by how compactly the query sits inside the name. English names match word by word, with a word matching a longer word it is a prefix of (DEV ⊂ DEVELOPMENT).
 - **A tie between companies is a miss, not a guess.** A wrong match becomes a false entity silently, while a miss drops one mention, and the article usually prints the code that step 2 accepts. Breaking ties by lowest stock code was measured and rejected: it turned 9 misses into 3 right answers and 6 wrong ones.
 
-Exact algorithm: implementation.md §4.2 (`stock_name_match`).
+Exact algorithm: implementation.md §4.2 (`name_match`).
 
 > **Measured** (2026-10-24/25, real SADI articles and the HKEX list): on the Entity Analysis spike's stored model outputs, the name search keeps entity F1 at 0.962 on 127 unseen cleaned-news articles and raises it from 0.820 to 0.908 when every code is stripped (18 right, 0 wrong). On its own, against 198 held-out names, it gets 187 right, 2 wrong and 9 missed; a general string-similarity scorer (rapidfuzz `WRatio`, cutoff 90) gets 180 / 1 / 17. Sharing the normalizer with step 1 leaves entity F1 unchanged.
 
