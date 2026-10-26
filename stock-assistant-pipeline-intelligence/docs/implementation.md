@@ -878,7 +878,7 @@ def _parse_hk_stock_list(en_content: bytes, zh_content: bytes, securities_conten
     en_names = _parse_names(en_content)
     zh_names = _parse_names(zh_content)
     entries: dict[str, Stock] = {}
-    for code in _parse_equity_codes(securities_content):
+    for code in sorted(_parse_equity_codes(securities_content)):   # deterministic entry order
         if code not in en_names and code not in zh_names:
             continue                                       # an equity in neither file is skipped
         zh_name = zh_names.get(code, "")                   # a name missing from one file is ""
