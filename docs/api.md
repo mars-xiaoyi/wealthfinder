@@ -54,6 +54,8 @@ SERVICE_PREFIX:
 CODE:
     4xxx    Client errors (bad request, not found, validation)
     5xxx    Server errors (internal, dependency unavailable)
+    6xxx    Content parsing errors
+    7xxx    LLM call errors (internal only — never returned by an endpoint)
 ```
 
 ### 1.3 Common Error Codes
@@ -70,6 +72,11 @@ Applicable across all services. Use `COMMON` prefix.
 | `COMMON-5001` | 503 | Service unavailable — tools or services this service controls (e.g. its DB or Redis) unreachable, or not initialized yet |
 | `COMMON-5002` | 503 | Service unavailable — third-party tools or outside services unavailable |
 | `COMMON-6000` | 500 | Structured or unstructured content cannot be parsed |
+| `COMMON-7000` | — | LLM call failed (internal only) |
+| `COMMON-7001` | — | LLM provider rate limit hit (internal only) |
+| `COMMON-7002` | — | LLM provider error, network error or timeout (internal only) |
+| `COMMON-7003` | — | LLM provider rejected the credentials (internal only) |
+| `COMMON-7004` | — | LLM response did not match the output schema (internal only) |
 
 ### 1.4 Validation Error Detail
 
@@ -625,6 +632,11 @@ No service-specific error codes defined in MVP.
 | `COMMON-5001` | 503 | Service unavailable — tools or services this service controls unreachable, or not initialized yet |
 | `COMMON-5002` | 503 | Service unavailable — third-party tools or outside services unavailable |
 | `COMMON-6000` | 500 | Content cannot be parsed |
+| `COMMON-7000` | — | LLM call failed |
+| `COMMON-7001` | — | LLM rate limit hit |
+| `COMMON-7002` | — | LLM provider error |
+| `COMMON-7003` | — | LLM authentication failed |
+| `COMMON-7004` | — | LLM schema violation |
 
 ---
 

@@ -191,27 +191,28 @@ This document does not introduce new design — every ticket below implements so
 ### Entity Analysis: LLM Entity Extraction (L)
 
 **Status:** Created
-**Depends on:** Spike: Entity Analysis LLM Skill (for pinned SDK versions and any §7/§8.2 fixes); Stock Resolution: `lookup_stock`; Entity Analysis: HK Stock List Readiness Gate (for `CleanedNewsConsumer._process_one()`'s current shape)
+**Depends on:** Spike: Entity Analysis LLM Skill (for the pinned SDK version and §7/§8.2's one-call design); Stock Resolution: `lookup_stock` (for `name_matches_stock()`/`lookup_stock()`); Entity Analysis: HK Stock List Readiness Gate (for `CleanedNewsConsumer._process_one()`'s current shape)
 **Scope:** Run `EntityAnalysisSkill` on each fetched article and act on its result — no persistence or publishing yet (impl.md §7, §8.1, §8.2, §11.1 steps 1–2 and 4–6, up to building `EntityEvent`s).
-- `app/config.py`: `LLMConfig` minus `rate_limit_backoff_s`; `EntityAnalysisConfig` gains `name_match_min_overlap_ratio`/`max_fc_rounds`/`max_fc_retries_per_entity`.
-- `app/llm/`: `adapter.py` types/interface (including `GenerationConfig`, passed on every call), `errors.py`, `VertexAIAdapter` + `create_llm_adapter()`/`get_llm_adapter()` (§7.1–§7.3), built against the spike's pinned SDK versions.
+- `app/config.py`: `LLMConfig` minus `rate_limit_backoff_s`; `EntityAnalysisConfig` gains `max_input_chars`.
+- `app/llm/`: `adapter.py` (`GenerationConfig`, `Message`, `StructuredLLMResponse`, `LLMAdapter`), `errors.py` (§7.2), `vertex_adapter.py` — `VertexAIAdapter.generate_structured()` (native structured output, `HttpOptions` timeout, no SDK retries, thinking tokens counted as output, error mapping) + `create_llm_adapter()`/`get_llm_adapter()` (§7.1–§7.3); `google-genai==2.33.0` in `requirements.txt`; the `COMMON-7000`–`7004` error codes and `ErrorCategory.LLM` (§15.1).
 - `app/models/`: `enums.py` (§3.1), `versioned_metadata.py` (§3.2), `AnalysisOutcome`/`EntityEvent` in `entity_event.py` (§11.1).
-- `app/skills/`: `skill_base.py` (§8.1), `entity_analysis_skill.py` (§8.2) — FC loop calling `lookup_stock()`, `LOOKUP_STOCK_TOOL`, verbatim system prompt, business-constraint validation, dedup backstop.
-- `app/entity_analysis/entity_analysis_service.py`: `EntityAnalysisService` + singleton (§11.1), constructed with `NewsClient` only; `find_entity_events()` runs steps 1–2 and 4–6 and logs `entity_analysis_completed` without `entity_event_ids` (added by the persistence ticket).
-- `CleanedNewsConsumer._process_one()`: after the readiness gate, calls the Service instead of `NewsClient` directly, inside `except LLMRateLimitError`/`except LLMError`/`except Exception` (§11.2) — no ACK on any; only the catch-all logs `entity_analysis_process_one_crashed`.
-- Wire `create_llm_adapter()`/`close()` and `create_entity_analysis_service()` into `app/main.py`'s lifespan (§16).
-**Acceptance criteria** (per impl.md §8.1/§8.2/§11.1/§11.4):
-- FC loop: stops at `MAX_FC_ROUNDS` with `max_rounds_reached`; `instruction` and `UnverifiedEntity` only once `MAX_FC_RETRIES_PER_ENTITY` is hit; unverified `stock_code`s dropped; duplicate `stock_code`s keep the first.
-- Every row of §8.2's Business Constraint Validation table applied and logged without setting `failure_reason`.
-- A verified `stock_code` missing from the cache at §11.1 step 6 is dropped with `entity_stock_no_longer_listed`; the other items proceed.
-- `SkillBase.run()`: all four LLM exceptions → `failure_reason=type(err)`; only `LLMAuthenticationError` logs CRITICAL; anything else propagates uncaught.
-- Every Adapter call from `EntityAnalysisSkill` passes its `_GENERATION_CONFIG` (temperature 0, max output tokens 8192, §8's table), and `VertexAIAdapter` applies it to the request.
-- Consumer: success, `entities=[]`, and 404 ACK; every `LLMError` and any unanticipated exception leave the message un-ACKed and the loop keeps going.
-- Unit-tested with a fake `LLMAdapter` and a seeded `HKStockListCache`.
-- Integration pass against live Vertex AI with the LLM spike's article set.
-- The integration cases from Entity Analysis: Consume Cleaned News & Fetch Article for `404`, `503`, timeout and unreachable SADI re-run through `EntityAnalysisService`: the same ACK/un-ACK results, with a SADI failure now also logging ERROR `entity_analysis_process_one_crashed`.
-**Docs:** impl.md §3.1, §3.2, §4.1, §4.2 (`lookup_stock` call contract only), §7, §8.1, §8.2, §8.5, §8.6, §11.1, §11.2, §11.4; design.md §9.3, §9.4, §9.7, §9.8. Validated by: Entity Analysis: Post-Release Tuning Validation (Q-7, Q-11, I-3).
-**Explicitly deferred:** persistence and the redelivery check (`EntityEventRepository`, migration, DB write methods, `entity_event_ids` in the log — Entity Analysis: Persist & Publish Entity Events); publishing to `stream:entity_event_completed`; `WorkerPool`/backoff; the dedup guard; reclaim/dead-letter; the other two Skills; the `v` schema-version check.
+- `app/skills/`: `skill_base.py` (§8.1); `entity_analysis_skill.py` (§8.2) — one structured-output call on the body cut to `max_input_chars`, verbatim system prompt and few-shot examples, `_verify_mention()` (code on the list and `name_matches_stock()`, else the code printed in the article, else `lookup_stock()`), dropped mentions, business-constraint validation, dedup backstop.
+- `app/entity_analysis/entity_analysis_service.py`: `EntityAnalysisService` + singleton (§11.1), getting only `NewsClient`; `find_entity_events()` runs steps 1–2 and 4–6 and logs `entity_analysis_completed` without `entity_event_ids`.
+- `CleanedNewsConsumer._process_one()`: after the readiness gate, calls the Service instead of `NewsClient`; a new `except LLMError` before the existing `except SAPIError` leaves the message un-ACKed without logging again (§11.2). The existing `SAPIError` and catch-all clauses stay as they are.
+- `app/main.py`: `create_llm_adapter()` (closed on shutdown) and `create_entity_analysis_service()` in the lifespan (§16).
+**Acceptance criteria** (per impl.md §7.2/§7.3/§8.1/§8.2/§11.1/§11.4):
+- One `generate_structured()` call per article with `_GENERATION_CONFIG` (`gemini-3.1-flash-lite`, temperature 0, max output tokens 16384, §8's table); the body is cut to `ENTITY_ANALYSIS_MAX_INPUT_CHARS`, and `input_truncated` says whether it was.
+- `_verify_mention()` follows §8.2: code normalization per design.md §9.2; a listed code is accepted on a name match or a code-shaped printing in the article (a bare number never counts); otherwise the name goes through `lookup_stock()`; an unresolved mention is dropped into `dropped_mentions` with `not_in_hk_stock_list`.
+- Every row of §8.2's Business Constraint Validation table applied and logged without setting `failure_reason`; two mentions verifying to the same code keep the first.
+- `VertexAIAdapter`: 429 → `LLMRateLimitError`, 401/403 → `LLMAuthenticationError`, any other API error, network error or timeout → `LLMProviderError`, unparseable output → `LLMSchemaViolationError`, each with §7.2's error code and log level; `output_tokens` includes thinking tokens; one SDK attempt per call, timed out at `LLM_API_TIMEOUT_S`.
+- `SkillBase.run()`: all four LLM exceptions → `failure_reason` is the caught error, logged with its `dev_message` at its own `log_level`; anything else propagates uncaught.
+- `find_entity_events()`: a Skill failure logs `entity_analysis_completed` and re-raises the original exception; a verified `stock_code` missing from the cache at step 6 is dropped with `entity_stock_no_longer_listed`, the other items proceed.
+- Consumer: success, `entities=[]` and SADI 404 ACK; every `LLMError`, SADI failure and unanticipated exception leave the message un-ACKed and the loop keeps going.
+- Unit-tested with a fake `LLMAdapter` and a seeded `HKStockListCache`; `VertexAIAdapter` against a mocked `google-genai` client.
+- Integration pass against live Vertex AI.
+- The integration cases from Entity Analysis: Consume Cleaned News & Fetch Article re-run through `EntityAnalysisService`, with the same ACK/un-ACK results.
+**Docs:** impl.md §3.1, §3.2, §4.1, §4.2 (`name_matches_stock`/`lookup_stock` call contract only), §7, §8 (table), §8.1, §8.2, §8.5, §8.6, §11.1, §11.2, §11.4, §15.1, §16; design.md §8, §9.1.1, §9.2, §9.3, §9.4, §9.7, §9.8. Validated by: Entity Analysis: Post-Release Tuning Validation (Q-16, I-1's real-traffic part).
+**Explicitly deferred:** persistence and the redelivery check (`EntityEventRepository`, migration, DB write methods, `entity_event_ids` in the log — Entity Analysis: Persist & Publish Entity Events); publishing to `stream:entity_event_completed`; `WorkerPool` and the `LLMRateLimitError` backoff (`LLMConfig.rate_limit_backoff_s`); the `processing_cleaned_ids` dedup guard; reclaim/dead-letter; the other two Skills; the `v` schema-version check; `EntityAnalysisConfig.max_concurrent`/`max_retry`.
 
 ---
 
@@ -556,7 +557,7 @@ This document does not introduce new design — every ticket below implements so
 - Input construction: at most 3 articles per source (latest kept); ordered by `source_weights` descending, then latest `published_at`; entries that would exceed 200 characters dropped whole; `input_summary` records counts and both truncation flags.
 - Business constraints: `summary_short` ≤30, `summary_full` ≤150, `key_numbers` ≤3 — truncated and logged, not failed.
 - `LLMSchemaViolationError` → fallback (highest-weight constituent's `headline`, ties by latest `published_at`; `summary_full = summary_short`; `key_numbers = []`), `skill_log.fallback=True`, `brief_summary_fallback` logged, `failure_reason=None`.
-- Rate-limit/provider/auth failures → `failure_reason=type(err)`, `output=None`.
+- Rate-limit/provider/auth failures → `failure_reason` is the caught error, `output=None`.
 - Every call passes `_GENERATION_CONFIG`.
 - Unit-tested with a fake `LLMAdapter`.
 - Integration pass against live Vertex AI with the spike's Events.
@@ -576,7 +577,7 @@ This document does not introduce new design — every ticket below implements so
 - `stock_impact_score` clipped to `[-5, +5]` and `adjustment_reason` truncated to 80, both logged.
 - An empty `adjustment_reason`, or `LLMSchemaViolationError`, → fallback (`stock_impact_score=0`, `adjustment_reason=""`), `skill_log.fallback=True` with the right `fallback_reason`, `event_scoring_fallback` logged, `failure_reason=None`.
 - `input_from_fallback` is recorded in the skill log, not used in the prompt.
-- Rate-limit/provider/auth failures → `failure_reason=type(err)`, `output=None`.
+- Rate-limit/provider/auth failures → `failure_reason` is the caught error, `output=None`.
 - Unit-tested with a fake `LLMAdapter`.
 - Integration pass against live Vertex AI with the spike's Events.
 **Docs:** impl.md §7.1, §8, §8.1, §8.4, §8.5, §8.6, §13.1 (`LLMScore`); design.md §5.9, §9.6, §9.7, §9.8.
@@ -609,7 +610,7 @@ This document does not introduce new design — every ticket below implements so
 - Re-aggregation mid-scoring: each checkpoint returns early (no EventScoringSkill call after the first, no write after the second, a no-op UPSERT at the third), nothing published, ACKed.
 - A missing Event logs `scoring_event_missing` and ACKs.
 - A Skill's rate-limit/provider/auth failure logs its completion event, leaves the message un-ACKed, and the loop continues; a schema violation continues on the fallback, and the score records `llm_fallback`.
-- An Event already in `_in_process` is skipped and left un-ACKed; any other exception logs `scoring_process_one_crashed` and leaves it un-ACKed.
+- An Event already in `_in_process` is skipped and left un-ACKed; any other exception logs ERROR `Unhandled exception: …` and leaves it un-ACKed.
 - Unit-tested with fake Skills/repositories.
 - Integration pass against real Postgres and Redis with faked Skills: seed an Event via Aggregation's tables, publish `stream:event_aggregated` directly, check `event_scores` and `stream:event_scored`; plus one run with live Skills.
 **Docs:** impl.md §3.3, §10.1, §10.2, §10.3, §13.1, §13.2, §13.4, §13.6, §16, §17 (`003`); design.md §5.2–§5.5, §5.7, §5.8, §10.3.
