@@ -1914,14 +1914,18 @@ class EntityMention(BaseModel):
 class LLMOutput(BaseModel):
     output_items: list[EntityMention]    # may be empty
 
+@dataclass
+class VerifiedEntity:
+    """One verified company: its analysis and the listed Stock it was verified against."""
+    stock: Stock                       # §4.2
+    outcome: AnalysisOutcome
+
 class EntityAnalysisResult(SkillResult):   # base: app/skills/skill_base.py, §8.1
     """run()'s entire return value (§11.1 reads skill_log/failure_reason
     directly off this)."""
     model_config = {"arbitrary_types_allowed": True}   # failure_reason: an LLMError isn't natively Pydantic-validatable
 
-    entity_events: Optional[list[AnalysisOutcome]]   # None unless failure_reason is None — verified items only,
-                                                     # no merged company_name/exchange (§11.1 looks up Stock
-                                                     # by stock_code itself, an O(1) cache hit, §4.2)
+    entity_events: Optional[list[VerifiedEntity]]    # None unless failure_reason is None — verified items only
     skill_log: EntityAnalysisSkillLog                          # always populated, every outcome (§8.2, below)
     failure_reason: Optional[LLMError] = None                  # None on success; else the caught
                                                                  # exception itself (§8.1 — no
@@ -1964,7 +1968,7 @@ class EntityAnalysisSkill(SkillBase):   # SkillBase — app/skills/skill_base.py
         self._config = config
         # Safe on self for the same reason as SkillBase's own state (§8.1, §11.1):
         # fresh instance per run() call.
-        self._verified_stocks: dict[str, Stock] = {}
+        self._verified_entities: list[str] = []   # verified stock codes, in output order
         self._dropped: list[DroppedMention] = []
         self._input_truncated = False
 ```
@@ -1982,28 +1986,23 @@ structured = generate_structured(messages, output_schema=LLMOutput, generation_c
 append LlmCallMetric(call_index=1, purpose="structured_output", ...from structured) to self._llm_calls
 
 article_text = self._input.title + body
-outcomes = []
+entities = []
 FOR each mention in structured.output.output_items:
     stock = _verify_mention(mention, article_text)
     if stock is None:
         append DroppedMention(mention.stock_code, mention.company_name, reason="not_in_hk_stock_list") to self._dropped
         continue
-    self._verified_stocks[stock.stock_code] = stock
-    outcomes.append(AnalysisOutcome(stock_code=stock.stock_code, **mention's analysis fields))
-
-apply Business Constraint Validation (table below) to outcomes
-seen_stock_codes = set()
-deduped = []
-for e in outcomes:
-    if e.stock_code in seen_stock_codes:
+    outcome = AnalysisOutcome(stock_code=stock.stock_code, **mention's analysis fields)
+    apply Business Constraint Validation (table below) to outcome
+    if outcome.stock_code in self._verified_entities:
         log BusinessValidationError (duplicate stock_code, dropped)  # does not set failure_reason — same
-        continue                                                          # non-fatal treatment as every other
-    seen_stock_codes.add(e.stock_code)                                   # row in the table below
-    deduped.append(e)
+        continue                                                          # non-fatal treatment as every other row
+    self._verified_entities.append(outcome.stock_code)
+    entities.append(VerifiedEntity(stock, outcome))
 # keep first occurrence per stock_code — the LLM is instructed not to repeat one
 # (system-design.md §9.4 Edge Case Rule 5), and two mentions can verify to the same code
 
-return EntityAnalysisResult(deduped, skill_log=self._skill_log(), failure_reason=None)
+return EntityAnalysisResult(entities, skill_log=self._skill_log(), failure_reason=None)
 ```
 
 Raises one of the four typed exceptions (§7.2) on any failure above — `SkillBase.run()` (§8.1) catches them, not this method.
@@ -2033,7 +2032,7 @@ return lookup_stock(mention.company_name)   # §4.2 name search
 def _skill_log(self) -> EntityAnalysisSkillLog:
     return EntityAnalysisSkillLog(
         skill_version=ENTITY_SKILL_VERSION,
-        verified_entities=list(self._verified_stocks.keys()),
+        verified_entities=self._verified_entities,
         dropped_mentions=self._dropped,
         input_truncated=self._input_truncated,
         llm_calls=self._llm_calls,
@@ -3239,7 +3238,7 @@ Purpose :
 
 5. result.failure_reason set: log entity_analysis_completed (below, entity_event_ids=[]); raise result.failure_reason — the original exception, re-raised as itself in every case.
 
-6. result.failure_reason is None (incl. entity_events=[]): build one EntityEvent per item (below), reading source_id/source_url/source_name/published_at off article (still a separate CleanedNews variable — never nested onto EntityEvent itself), and stock = get_hk_stock_list_cache().entries.get(item.stock_code) (§4.2) — an O(1) dict lookup. EntityAnalysisSkill's verification step (§8.2) already resolved this stock_code, but against the entries dict as it was at that moment; a POST /admin/hk-stock-list-sync landing during a later await can rebind entries to a list without it. On None: drop that item, log warning entity_stock_no_longer_listed (cleaned_id, stock_code), and continue with the rest; {
+6. result.failure_reason is None (incl. entity_events=[]): build one EntityEvent per item (below), reading source_id/source_url/source_name/published_at off article (still a separate CleanedNews variable — never nested onto EntityEvent itself), and stock = item.stock, the listed Stock the Skill verified the item against (§8.2); {
     7. self._repo.persist_entities() (§10.1) writes all of them in one transaction, each via INSERT ... ON CONFLICT (source_url, stock_code)
        DO NOTHING RETURNING entity_event_id, setting entity_event_id onto each EntityEvent actually inserted and filtering out the rest;
 
@@ -3257,7 +3256,7 @@ Purpose :
 
 #### Data Structure: `EntityEvent` — `app/models/entity_event.py`
 
-One shape for an `entity_events` row, on both sides: `find_entity_events()` builds one per verified entity by pairing each `AnalysisOutcome` with `source_id`/`source_url`/`source_name`/`published_at` from `article` (`entity_event_id`/`created_at` unset); `EntityEventRepository.persist_entities()` (§10.1) sets those on a successful insert; `AggregationService.process_entity_event()` (§12.1) reads the row back into a fresh `EntityEvent`. `analysis_outcome` is wrapped in `VersionedMetadata` (§3.2) with `version=result.skill_log.skill_version`.
+One shape for an `entity_events` row, on both sides: `find_entity_events()` builds one per verified entity by pairing each `VerifiedEntity`'s `stock` and `outcome` with `source_id`/`source_url`/`source_name`/`published_at` from `article` (`entity_event_id`/`created_at` unset); `EntityEventRepository.persist_entities()` (§10.1) sets those on a successful insert; `AggregationService.process_entity_event()` (§12.1) reads the row back into a fresh `EntityEvent`. `analysis_outcome` is wrapped in `VersionedMetadata` (§3.2) with `version=result.skill_log.skill_version`.
 
 ```python
 from pydantic import BaseModel
@@ -3283,14 +3282,14 @@ class EntityEvent:
     source_name: str
     published_at: Optional[datetime]   # nullable in entity_events (system-design.md §10.1) — CleanedNews.published_at is Optional too; merge_or_create() (§12.4) applies the created_at fallback, not this repository
     analysis_outcome: VersionedMetadata[AnalysisOutcome]   # §3.2/§8.2; persisted under additional_outcome — the other fields are read off .output
-    stock: Stock                                    # §4.2 — write: get_hk_stock_list_cache().entries[stock_code]; read-back: rebuilt from the row (§10.1)
+    stock: Stock                                    # §4.2 — write: the Stock verification matched (§8.2); read-back: rebuilt from the row (§10.1)
     entity_event_id: Optional[UUID] = None       # set by EntityEventRepository.persist_entities() only if this row's insert actually succeeds
     created_at: Optional[datetime] = None        # mirrors the row's created_at — same datetime.now(timezone.utc) value, set alongside entity_event_id
 ```
 
 `exchange`/`stock_code` are read off `stock`, and `event_type_primary`/`sentiment_label`/`sentiment_score`/`headline`/`entity_summary` off `analysis_outcome.output`. The DB row has its own columns for all seven (system-design.md §10.1); the repository reads and writes them from those sources.
 
-`stock` is snapshotted into the row at write time (`exchange`/`stock_code` columns; `company_name_zh`/`company_name_en` in `additional_outcome.output`, §10.1), and `_row_to_entity_event()` rebuilds it from that snapshot alone, never from the live `HKStockListCache`. Only `find_entity_events()` reads the cache. This keeps Aggregation and Scoring independent of the HK Stock List: a stock removed by a later sync, or an empty fallback cache (§4.2), would otherwise make read-backs fail. The snapshot is historical by design.
+`stock` is snapshotted into the row at write time (`exchange`/`stock_code` columns; `company_name_zh`/`company_name_en` in `additional_outcome.output`, §10.1), and `_row_to_entity_event()` rebuilds it from that snapshot alone, never from the live `HKStockListCache`. Only Entity Analysis reads the cache. This keeps Aggregation and Scoring independent of the HK Stock List: a stock removed by a later sync, or an empty fallback cache (§4.2), would otherwise make read-backs fail. The snapshot is historical by design.
 
 `metadata` is recoverable from `source_id`, and `updated_at` is never read, so neither is a field.
 
@@ -4972,13 +4971,14 @@ CACHE_UNAVAILABLE = "SAPI-5001"            # Morning Brief cache has no current 
 
 #### `app/common/error_categories.py` — Error Categories
 
-The part of SAPI an error was raised from. Every raise site sets one, by where the raising code lives: anything under `app/common/` uses `COMMON`, except the HK Stock List (§4.2), which has its own; other packages use their own member (`app/config.py` → `CONFIG`, `app/db/` → `DB`, `app/llm/` → `LLM`, `app/clients/news_client.py` → `NEWS_CLIENT`, `app/redis/` → `REDIS`). Each ticket adds the members it first uses. Raise-site samples elsewhere in this doc leave `category` out; every real raise site passes one.
+The part of SAPI an error was raised from. Every raise site sets one, by where the raising code lives: anything under `app/common/` uses `COMMON`, except the HK Stock List (§4.2), which has its own; other packages use their own member (`app/config.py` → `CONFIG`, `app/db/` → `DB`, `app/entity_analysis/` → `ENTITY_ANALYSIS`, `app/llm/` → `LLM`, `app/clients/news_client.py` → `NEWS_CLIENT`, `app/redis/` → `REDIS`). Each ticket adds the members it first uses. Raise-site samples elsewhere in this doc leave `category` out; every real raise site passes one.
 
 ```python
 class ErrorCategory(StrEnum):
     COMMON = "COMMON"
     CONFIG = "CONFIG"
     DB = "DB"
+    ENTITY_ANALYSIS = "ENTITY_ANALYSIS"
     LLM = "LLM"
     NEWS_CLIENT = "NEWS_CLIENT"
     REDIS = "REDIS"
