@@ -1553,7 +1553,7 @@ class LLMAdapter(ABC):
 
 ### 7.2 `app/llm/errors.py`
 
-`SAPIError`s (§15.1) with per-class `error_code`/`log_level` defaults. `VertexAIAdapter` (§7.3) raises them with the provider's error detail as `dev_message` and `category=ErrorCategory.LLM`, and every Skill's `run()` (§8.1) catches all four internally.
+`SAPIError`s (§15.1) with per-class `error_code`/`log_level` defaults. `VertexAIAdapter` (§7.3) raises them with the provider's error detail as `dev_message` and `category=ErrorCategory.LLM`, and every Skill's `run()` (§8.1) catches them all internally.
 
 ```python
 import logging
@@ -1687,7 +1687,7 @@ Everything shared across Skills lives in this one file: `SkillInput`, `SkillResu
 
 `LlmCallMetric`/`LlmErrorEntry` are the element types of `SkillBase._llm_calls`/`_llm_errors`, shared by all three completion logs (§8.2–§8.4, system-design.md §9.8).
 
-Each Skill instance is constructed fresh per `run()` call (§11.1, §13.1), so `input` is stored on `self._input`. `SkillBase.run()` is a template method: `try: return await llm_process()`, `except` the four typed exceptions (§7.2): log the error's `dev_message` at its own `log_level`, append an `LlmErrorEntry`, then `build_fail_result(err)`. `llm_process()` returns the final `SkillResult` directly on success. A subclass `__init__` must call `super().__init__(input)`.
+Each Skill instance is constructed fresh per `run()` call (§11.1, §13.1), so `input` is stored on `self._input`. `SkillBase.run()` is a template method: `try: return await llm_process()`, `except` the typed LLM exceptions (§7.2): log the error's `dev_message` at its own `log_level`, append an `LlmErrorEntry`, then `build_fail_result(err)`. `llm_process()` returns the final `SkillResult` directly on success. A subclass `__init__` must call `super().__init__(input)`.
 
 `failure_reason` is the caught `LLMError` itself. Callers (`EntityAnalysisService` §11.1, `ScoringService` §13.1) re-raise it, and their consumers only distinguish `LLMRateLimitError` (triggers `WorkerPool.trigger_backoff()`) from everything else (no ACK).
 
@@ -1712,7 +1712,7 @@ class LlmCallMetric:
 @dataclass
 class LlmErrorEntry:
     call_index: int
-    error_type: str           # "LLMRateLimitError" | "LLMProviderError" | "LLMAuthenticationError" | "LLMSchemaViolationError" | "BusinessValidationError"
+    error_type: str           # "LLMRateLimitError" | "LLMProviderError" | "LLMRequestError" | "LLMAuthenticationError" | "LLMSchemaViolationError" | "BusinessValidationError"
     error_detail: str
     retried: bool
 
@@ -1809,7 +1809,7 @@ ANALYST_RATING / DIVIDEND / GENERAL_ANNOUNCEMENT
 ```
 1. 文章未提及任何 HKEX 上市公司 → 輸出 output_items: []
 2. 文章同時提及 A 股和 H 股：只提取 HKEX 上市的 H 股實體；stock_code 填 H 股的港股代碼
-3. 文章提及公司但確認非 HKEX 上市（純 A 股、美股、未上市）→ 從輸出中排除，不體現於 entities
+3. 文章提及公司但確認非 HKEX 上市（純 A 股、美股、未上市）→ 從輸出中排除，不體現於 output_items
 4. event_type_secondary 只在確實存在明確次要事件時填寫，不確定時留空優於猜測
 5. 同一 stock_code 在文章中對應多個事件時，只能輸出一筆記錄：最重要的事件填入 event_type_primary，次重要的填入 event_type_secondary；不得為同一 stock_code 輸出多筆記錄
 ```
@@ -3256,7 +3256,7 @@ Purpose :
 
 > **`entity_events=[]` is a valid, ACKed outcome** (system-design.md §3.6) — no HK-listed entity mentioned in an article is not an error. `self._repo.persist_entities()` writes zero rows in this case; nothing is published to `stream:entity_event_completed`; `find_entity_events()` still returns normally (an empty list) and the article is still ACKed.
 
-> **`entity_skill.run()` only ever raises something outside `LLMError`.** `SkillBase.run()`'s one `except` clause (§8.1) — `except LLMError` — catches all four typed LLM failures and converts them to `result.failure_reason` instead of raising. Anything else escaping `llm_process()` is an unanticipated bug, and propagates straight out of `run()` uncaught, the same as a SADI fetch or DB write failure (§11.4).
+> **`entity_skill.run()` only ever raises something outside `LLMError`.** `SkillBase.run()`'s one `except` clause (§8.1) — `except LLMError` — catches every typed LLM failure and converts them to `result.failure_reason` instead of raising. Anything else escaping `llm_process()` is an unanticipated bug, and propagates straight out of `run()` uncaught, the same as a SADI fetch or DB write failure (§11.4).
 
 > **Row-per-entity.** The `(source_url, stock_code)` unique index (§17) depends on `output_items` never carrying two items for one `stock_code`. The LLM is told not to (system-design.md §9.4 Edge Case Rule 5), and `EntityAnalysisSkill`'s Business Constraint Validation (§8.2) drops duplicates before any `EntityEvent` is built.
 
