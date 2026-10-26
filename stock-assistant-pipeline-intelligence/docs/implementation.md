@@ -784,7 +784,6 @@ both Latin (qw, nw = word lists of q and n):
 one Latin, one not -> None
 both CJK:
     len(q) < 2                                          -> None
-    q == n                                              -> (9, 1.0, 0)
     neither set(q) <= set(n) nor set(n) <= set(q)       -> None
     len(q) <= len(n) and q is an ordered subsequence of n, tightest span [start, end):
                                                         -> (5, len(q) / (end - start), int(start == 0), len(q) / len(n), -len(n))
