@@ -5,6 +5,8 @@ extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "SIM", "ASYNC", "RUF"]
+# HKEX's Chinese stock names carry full-width counter markers (騰訊控股－Ｒ, 長和－Ｔ).
+allowed-confusables = ["－", "Ａ", "Ｂ", "Ｒ", "Ｔ", "Ｗ", "Ｚ"]
 
 [tool.mypy]
 python_version = "3.12"
