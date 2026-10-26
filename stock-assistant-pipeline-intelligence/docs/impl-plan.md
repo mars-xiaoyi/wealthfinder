@@ -168,7 +168,6 @@ This document does not introduce new design — every ticket below implements so
 - `_parse_hk_stock_list()` loads no RMB counter and no `－Ｔ`/`-T` line.
 - `lookup_stock_completed` carries every §4.2 field, at WARNING above the threshold.
 - Unit-tested against a seeded `HKStockListCache`.
-- The fuzzy-matching spike's case sets become a regression fixture, run against the live HKEX list as the integration pass.
 **Docs:** impl.md §4.2; design.md §9.2, §9.2.1. Validated by: Entity Analysis: Post-Release Tuning Validation (Q-16 at scale, I-1's real-traffic part).
 **Explicitly deferred:** `_name_consistent()` calling `name_matches_stock()`, and the `_verify_mention()` call site (LLM Entity Extraction).
 
