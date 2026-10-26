@@ -1562,7 +1562,7 @@ from app.common import error_codes
 from app.common.errors import ErrorType, SAPIError   # §15.1
 
 class LLMError(SAPIError):
-    """Common base for the four typed exceptions below."""
+    """Common base for the typed exceptions below."""
     error_code = error_codes.LLM_ERROR
 
 class LLMRateLimitError(LLMError):
@@ -1574,6 +1574,11 @@ class LLMProviderError(LLMError):
     """Provider-side error: 5xx, network timeout, or LLM_API_TIMEOUT_S exceeded. Retryable."""
     error_code = error_codes.LLM_PROVIDER_ERROR
     log_level = logging.WARNING
+
+class LLMRequestError(LLMError):
+    """Provider rejected the request itself (any other 4xx: malformed request, unknown model
+    or location). Not self-healing: a code or config fix is needed."""
+    error_code = error_codes.LLM_REQUEST_REJECTED
 
 class LLMAuthenticationError(LLMError):
     """Provider rejected the call as unauthenticated/unauthorized (401/403). Retryable at the
@@ -1589,7 +1594,7 @@ class LLMSchemaViolationError(LLMError):
     error_code = error_codes.LLM_SCHEMA_VIOLATION
 ```
 
-Rate-limit and provider errors are outside outages that need no code or config change, so they log at WARNING; an authentication failure needs an operator to fix the credentials, so it logs at CRITICAL.
+Rate-limit and provider errors are outside outages that need no code or config change, so they log at WARNING; a rejected request needs a code or config fix, so it logs at ERROR; an authentication failure needs an operator to fix the credentials, so it logs at CRITICAL.
 
 The shared `except` block that turns these into an `LlmErrorEntry` is in `SkillBase.run()` (§8.1).
 
@@ -1643,6 +1648,7 @@ Metrics : input_tokens  = usage_metadata.prompt_token_count
           model does not think, and is billed as output and counted against max_output_tokens.
 Raises  : LLMRateLimitError on google.genai.errors.APIError with code 429.
           LLMAuthenticationError on APIError with code 401/403.
+          LLMRequestError on APIError with any other 4xx code.
           LLMProviderError on any other APIError, network error, or timeout (the SDK reports
           its own timeout as a 504 DEADLINE_EXCEEDED APIError) — the catch-all for anything
           not classified above, so nothing escapes as an unclassified exception.
@@ -1730,7 +1736,7 @@ class SkillBase(ABC):
     @abstractmethod
     async def llm_process(self) -> SkillResult:
         """Runs the Skill's LLM call(s) from self._input and returns the final SkillResult
-        directly. Raises one of the four typed LLM exceptions (§7.2) on failure; run()
+        directly. Raises one of the typed LLM exceptions (§7.2) on failure; run()
         appends the LlmErrorEntry, so build_fail_result() only builds the result from
         self + err."""
         ...
@@ -1797,11 +1803,11 @@ ANALYST_RATING / DIVIDEND / GENERAL_ANNOUNCEMENT
 - 不包含其他實體的信息或與該實體無關的市場背景
 ```
 
-*Part 3 — Few-shot Examples:* (below)
+*Part 3 — Few-shot Examples:* the four examples below, each written as `範例 N：` on its own line followed by the example's block. `_SYSTEM_PROMPT` is Parts 1, 2, 3 and 4 in that order, with a blank line between parts and between examples.
 
 *Part 4 — Edge Case Rules:*
 ```
-1. 文章未提及任何 HKEX 上市公司 → 輸出 entities: []
+1. 文章未提及任何 HKEX 上市公司 → 輸出 output_items: []
 2. 文章同時提及 A 股和 H 股：只提取 HKEX 上市的 H 股實體；stock_code 填 H 股的港股代碼
 3. 文章提及公司但確認非 HKEX 上市（純 A 股、美股、未上市）→ 從輸出中排除，不體現於 entities
 4. event_type_secondary 只在確實存在明確次要事件時填寫，不確定時留空優於猜測
@@ -1818,7 +1824,7 @@ INPUT:
      監管機構宣佈就阿里巴巴（09988.HK）電商業務展開正式調查。
 
 OUTPUT:
-entities: [
+output_items: [
   {
     stock_code: "00700", company_name: "騰訊控股",
     event_type_primary: "EARNINGS", event_type_secondary: null,
@@ -1844,7 +1850,7 @@ INPUT:
      集團將採取更為審慎的擴張策略，暫緩部分非核心城市項目。
 
 OUTPUT:
-entities: [
+output_items: [
   {
     stock_code: "02007", company_name: "碧桂園",
     event_type_primary: "GENERAL_ANNOUNCEMENT", event_type_secondary: null,
@@ -1862,7 +1868,7 @@ INPUT:
 內文：香港交易所（00388.HK）公佈本年度董事會例行會議時間表，與往年安排基本一致。
 
 OUTPUT:
-entities: [
+output_items: [
   {
     stock_code: "00388", company_name: "香港交易所",
     event_type_primary: "GENERAL_ANNOUNCEMENT", event_type_secondary: null,
@@ -1881,7 +1887,7 @@ INPUT:
      管理層同步下調全年盈利指引。
 
 OUTPUT:
-entities: [
+output_items: [
   {
     stock_code: "02382", company_name: "舜宇光學",
     event_type_primary: "EARNINGS", event_type_secondary: null,
@@ -2005,7 +2011,7 @@ FOR each mention in structured.output.output_items:
 return EntityAnalysisResult(entities, skill_log=self._skill_log(), failure_reason=None)
 ```
 
-Raises one of the four typed exceptions (§7.2) on any failure above — `SkillBase.run()` (§8.1) catches them, not this method.
+Raises one of the typed exceptions (§7.2) on any failure above — `SkillBase.run()` (§8.1) catches them, not this method.
 
 #### `_verify_mention(mention, article_text) -> Optional[Stock]`
 
@@ -2024,7 +2030,7 @@ return lookup_stock(mention.company_name)   # §4.2 name search
 
 `_name_consistent(name, stock)`: `name_matches_stock(name, stock)` (§4.2), the same normalization the name search uses.
 
-`_code_printed(code, article_text)`: true when the article prints the code in a code-shaped form — `(0700)`, `（00700）`, `00700.HK`, `Stock Code: 700`, `股份代號：700` — with leading zeros optional. A bare number elsewhere in the text never counts.
+`_code_printed(code, article_text)`: true when the article prints the code in a code-shaped form — `(0700)`, `（00700）`, `00700.HK`, `Stock Code: 700`, `股份代號：700` — with leading zeros optional. A bare number elsewhere in the text never counts, and a bracketed number counts only with at least 3 digits, so a list marker such as `(1)` can't confirm a wrong code like `00001`.
 
 `_skill_log()` maps `self`'s accumulated state onto `EntityAnalysisSkillLog` — called from both `llm_process()` (success) and `build_fail_result()` (failure).
 
@@ -2419,9 +2425,9 @@ return LLMScore(stock_impact_score, adjustment_reason)
 
 ### 8.5 Skill Error Handling Summary (system-design.md §9.7)
 
-All three Skills catch the four exceptions internally and return a typed result (`EntityAnalysisResult`/`BriefSummaryResult`/`EventLLMScoringResult`, §8.2–§8.4), each subclassing `SkillResult` (§8.1). `EntityAnalysisResult` carries `skill_log`/`failure_reason` directly; the other two also wrap their schema-validated output in an `output` field. Callers inspect `failure_reason`/`fallback`, never a `try`/`except` around the call.
+All three Skills catch the typed LLM exceptions internally and return a typed result (`EntityAnalysisResult`/`BriefSummaryResult`/`EventLLMScoringResult`, §8.2–§8.4), each subclassing `SkillResult` (§8.1). `EntityAnalysisResult` carries `skill_log`/`failure_reason` directly; the other two also wrap their schema-validated output in an `output` field. Callers inspect `failure_reason`/`fallback`, never a `try`/`except` around the call.
 
-| Skill | `LLMRateLimitError` | `LLMProviderError` / `LLMAuthenticationError` | `LLMSchemaViolationError` |
+| Skill | `LLMRateLimitError` | `LLMProviderError` / `LLMRequestError` / `LLMAuthenticationError` | `LLMSchemaViolationError` |
 |---|---|---|---|
 | EntityAnalysisSkill | `failure_reason=err` (`LLMRateLimitError`), `output=None`; caller: backoff, no ACK | `failure_reason=err`, `output=None`; caller: no ACK | `failure_reason=err` (`LLMSchemaViolationError`), `output=None` (no fallback exists, system-design.md §9.7); caller: no ACK |
 | BriefSummarySkill | `failure_reason=err` (`LLMRateLimitError`), `output=None`; caller: backoff, no ACK | `failure_reason=err`, `output=None`; caller: no ACK | Fallback applied; `output` set, `failure_reason=None`; continues |
@@ -3441,7 +3447,7 @@ The same `WorkerPool` class is used, as independent instances, by Entity Analysi
 
 | Scenario | Where handled |
 |---|---|
-| LLM API call failure (`LLMProviderError`/`LLMAuthenticationError`) | Caught inside `SkillBase.run()` (§8.1, inherited by `EntityAnalysisSkill`) → `result.failure_reason=err`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` from `result.skill_log` with `entity_event_ids=[]` (nothing was persisted) and re-raises the original exception directly (`raise result.failure_reason`); `CleanedNewsConsumer` does not ACK. `LLMAuthenticationError` is logged at CRITICAL, its own `log_level` (§7.2) |
+| LLM API call failure (`LLMProviderError`/`LLMRequestError`/`LLMAuthenticationError`) | Caught inside `SkillBase.run()` (§8.1, inherited by `EntityAnalysisSkill`) → `result.failure_reason=err`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` from `result.skill_log` with `entity_event_ids=[]` (nothing was persisted) and re-raises the original exception directly (`raise result.failure_reason`); `CleanedNewsConsumer` does not ACK. `LLMAuthenticationError` is logged at CRITICAL, its own `log_level` (§7.2) |
 | LLM schema violation | Same, `result.failure_reason` is the `LLMSchemaViolationError` (no fallback exists for this Skill, system-design.md §9.7) — never raised, same logging/outcome/no-ACK treatment |
 | `LLMRateLimitError` | Caught inside `run()` → `result.failure_reason` is the `LLMRateLimitError`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` and re-raises `LLMRateLimitError` itself; `CleanedNewsConsumer` calls `WorkerPool.trigger_backoff()`, does not ACK |
 | All entities filtered out | Valid `output_items=[]`; no row written, nothing published, `find_entity_events()` returns normally, `CleanedNewsConsumer` ACKs |
@@ -4963,6 +4969,7 @@ LLM_RATE_LIMITED = "COMMON-7001"           # LLM provider rate limit hit
 LLM_PROVIDER_ERROR = "COMMON-7002"         # LLM provider error, network error or timeout
 LLM_AUTHENTICATION_FAILED = "COMMON-7003"  # LLM provider rejected the credentials
 LLM_SCHEMA_VIOLATION = "COMMON-7004"       # LLM response did not match the output schema
+LLM_REQUEST_REJECTED = "COMMON-7005"       # LLM provider rejected the request itself
 MALFORMED_REQUEST = "COMMON-4000"          # Request body is not valid JSON
 VALIDATION_FAILED = "COMMON-4001"          # Request fields failed validation
 NOT_FOUND = "COMMON-4004"                  # Requested resource does not exist
