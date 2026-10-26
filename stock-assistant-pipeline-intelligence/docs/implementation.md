@@ -662,13 +662,21 @@ def create_http_client(timeout_s: int) -> httpx.AsyncClient:
 
 #### Class: `HKStockListCache`
 
-`entries` holds `Stock` (below) directly, so `entries[k].stock_code == k`. `name_index` is the same list's names prepared for matching (`StockNameIndex`, below), built from `entries` at every refresh.
+`entries` holds `Stock` (below) directly, so `entries[k].stock_code == k`. `name_index` is the same list's names prepared for matching (`StockNameIndex`, below): the constructor builds it from `entries`, and `reload()` replaces both together.
 
-The one shared mutable holder for the in-process HK Stock List, with the same `get_X()` treatment as other infra (§5.1). `app/main.py` (§16) constructs it at startup; `EntityAnalysisSkill` (§8.2) and the sync route (§15.5) reach the same instance via `get_hk_stock_list_cache()`, so a refresh's rebind of `.entries` and `.name_index` is immediately visible.
+The one shared mutable holder for the in-process HK Stock List, with the same `get_X()` treatment as other infra (§5.1). `app/main.py` (§16) constructs it at startup; `EntityAnalysisSkill` (§8.2) and the sync route (§15.5) reach the same instance via `get_hk_stock_list_cache()`, so a refresh's `reload()` is immediately visible.
 
 ```python
 class HKStockListCache:
-    def __init__(self, entries: dict[str, Stock], name_index: StockNameIndex):
+    def __init__(self, entries: dict[str, Stock]):
+        self.entries = entries
+        self.name_index = _build_name_index(entries)
+
+    async def reload(self, entries: dict[str, Stock]) -> None:
+        name_index = await asyncio.to_thread(_build_name_index, entries)   # CPU work off the event loop
+        # WARNING: rebind both, back to back with no await between, never mutate in place. A
+        # lookup_stock() call must see one list's entries and name_index together, and a call
+        # mid-iteration over the old ones must keep seeing a consistent snapshot.
         self.entries = entries
         self.name_index = name_index
 
@@ -689,7 +697,7 @@ def get_hk_stock_list_cache() -> HKStockListCache:
 
 #### Company-name matching
 
-One normalizer and one name index serve both name checks in `_verify_mention()` (§8.2): `name_matches_stock()` (step 1) and `lookup_stock()` (step 3). Rationale: system-design.md §9.2. Traditional-to-simplified folding needs `opencc` (runtime dependency). Everything below is private except the index types, `build_name_index()` and the two checks.
+One normalizer and one name index serve both name checks in `_verify_mention()` (§8.2): `name_matches_stock()` (step 1) and `lookup_stock()` (step 3). Rationale: system-design.md §9.2. Traditional-to-simplified folding needs `opencc` (runtime dependency). Everything below is private except the index types and the two checks.
 
 **Normalization.** Each name has up to three variants, distinct, longest first: the normalized name, then without its legal suffix, then also without its generic tail (騰訊控股有限公司 → 腾讯控股有限公司, 腾讯控股, 腾讯):
 
@@ -724,7 +732,7 @@ def _name_variants(raw: str) -> list[str]:
     return list(dict.fromkeys(v for v in (full, legal, generic) if v))
 ```
 
-**Index.** `build_name_index(entries)` builds it from `HKStockListCache.entries` at every refresh (`refresh_hk_stock_list()`, below); it is public so tests can seed a cache:
+**Index.** `_build_name_index(entries)` builds it for `HKStockListCache`'s constructor and `reload()` (above):
 
 ```python
 @dataclass(frozen=True)
@@ -739,7 +747,7 @@ class StockNameIndex:
     names_by_code: dict[str, list[NameEntry]]           # stock_code -> its names (step 1)
     names_by_latin_prefix: dict[str, list[NameEntry]]   # first 3 letters of a 3+-letter word of a Latin variant
 
-def build_name_index(entries: dict[str, Stock]) -> StockNameIndex: ...
+def _build_name_index(entries: dict[str, Stock]) -> StockNameIndex: ...
 ```
 
 **`name_matches_stock(name: str, stock: Stock) -> bool`** (step 1). Reads `get_hk_stock_list_cache().name_index.names_by_code[stock.stock_code]` (no entry: `False`). True when some variant `q` of `name` and some variant `n` of one of the stock's names satisfy: `q` is an ordered subsequence of `n` (農行 ⊂ 農業銀行), or `n` is an ordered subsequence of `q` and `len(n) >= 0.6 * len(q)` (a short listed name inside a long legal name, but not "CHINA NEXT-GEN" inside "Amundi FTSE China A50 Index ETF").
@@ -942,8 +950,8 @@ async def _fetch_and_filter_hk_stock_list(http_client: httpx.AsyncClient) -> dic
 ```
 Purpose : Fetch the HK Stock List from HKEXnews and load it into the process-wide
           HKStockListCache, with its StockNameIndex. The first call registers a new
-          HKStockListCache as the singleton; later calls rebind .entries and .name_index on
-          the existing instance (see the warning at the call site). Called by app/main.py's eager startup load (system-design.md §9.2.1) and by
+          HKStockListCache as the singleton; later calls reload() the existing instance.
+          Called by app/main.py's eager startup load (system-design.md §9.2.1) and by
           POST /admin/hk-stock-list-sync (§15.5).
 On fetch failure : Any exception installs an empty HKStockListCache if none is registered
           yet, then re-raises, so get_hk_stock_list_cache() stays usable and GET /health
@@ -966,20 +974,15 @@ async def refresh_hk_stock_list() -> int:
         new_entries = await _fetch_and_filter_hk_stock_list(get_http_client())
         if not new_entries:
             raise ParseError("HK Stock List parsed to zero equities", category=ErrorCategory.STOCK_LIST)
-        new_name_index = await asyncio.to_thread(build_name_index, new_entries)
         if _hk_stock_list_cache is None:
-            _hk_stock_list_cache = HKStockListCache(new_entries, new_name_index)
+            _hk_stock_list_cache = await asyncio.to_thread(HKStockListCache, new_entries)  # index off the loop
         else:
-            # WARNING: rebind both, back to back with no await between, never mutate in place. A
-            # lookup_stock() call must see one list's entries and name_index together, and a call
-            # mid-iteration over the old ones must keep seeing a consistent snapshot.
-            _hk_stock_list_cache.entries = new_entries
-            _hk_stock_list_cache.name_index = new_name_index
+            await _hk_stock_list_cache.reload(new_entries)
     except Exception:
         # Deliberately bare: the process must never crash over this dependency. Always re-raises;
         # only the fallback-cache install is unconditional.
         if _hk_stock_list_cache is None:
-            _hk_stock_list_cache = HKStockListCache({}, build_name_index({}))
+            _hk_stock_list_cache = HKStockListCache({})
         raise
 
     return len(new_entries)

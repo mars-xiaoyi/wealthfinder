@@ -158,8 +158,8 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Spike: `lookup_stock` Fuzzy Matching (for the final §4.2 algorithm); Startup & Health: Fetch & Cache HK Stock List (for `HKStockListCache`/`get_hk_stock_list_cache()`/`Stock`/`_parse_hk_stock_list()`/`refresh_hk_stock_list()`)
 **Scope:** The name search and shared name normalizer of entity verification, over the in-process HK Stock List (impl.md §4.2).
-- `app/common/hk_stock_list.py`: the name index (`NameEntry`, `StockNameIndex`, `build_name_index()`) and its normalizer; `name_matches_stock(name, stock)` (step 1) and `lookup_stock(name)` (step 3) over it, with the `lookup_stock_completed` log event and its `_SLOW_CALL_THRESHOLD_MS` WARNING escalation; `opencc` added to `requirements.txt`.
-- `HKStockListCache.name_index`; `refresh_hk_stock_list()` builds it in `asyncio.to_thread` and rebinds it back to back with `.entries`, and the fallback cache gets `build_name_index({})`; every existing `HKStockListCache(...)` construction, including tests that seed one, passes a `build_name_index()` index; `_parse_hk_stock_list()` drops RMB counters and `－Ｔ`/`-T` lines (`_is_extra_counter()`).
+- `app/common/hk_stock_list.py`: the name index (`NameEntry`, `StockNameIndex`) and its normalizer; `name_matches_stock(name, stock)` (step 1) and `lookup_stock(name)` (step 3) over it, with the `lookup_stock_completed` log event and its `_SLOW_CALL_THRESHOLD_MS` WARNING escalation; `opencc` added to `requirements.txt`.
+- `HKStockListCache.name_index`, built by the constructor from `entries`; `HKStockListCache.reload(entries)` builds the new index in `asyncio.to_thread` and rebinds it back to back with `.entries`; `refresh_hk_stock_list()` builds a first cache in `asyncio.to_thread` and `reload()`s an existing one; `_parse_hk_stock_list()` drops RMB counters and `－Ｔ`/`-T` lines (`_is_extra_counter()`).
 - No config change.
 **Acceptance criteria** (per impl.md §4.2):
 - The name variants, `name_matches_stock()` and the name search's `_score` ranking match §4.2 exactly.
