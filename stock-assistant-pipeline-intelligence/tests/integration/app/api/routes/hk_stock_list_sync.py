@@ -67,6 +67,8 @@ def _error_logs(logs: list[MutableMapping[str, Any]]) -> list[tuple[str, str]]:
 
 
 async def post_hk_stock_list_sync_success(start_app):
+    """The real lists load, without RMB counters (80700 騰訊控股－Ｒ) or trading-only lines
+    (－Ｔ / -T): HKEX marks them the way the parser expects."""
     async with start_app() as client:
         cache = hk_stock_list.get_hk_stock_list_cache()
         old = cache.entries
@@ -80,6 +82,14 @@ async def post_hk_stock_list_sync_success(start_app):
     assert MIN_ENTRIES <= body.entries_loaded <= MAX_ENTRIES
     assert hk_stock_list.get_hk_stock_list_cache() is cache
     assert cache.entries is not old
+    extra_counters = [
+        code
+        for code, stock in cache.entries.items()
+        if (code.startswith("8") and stock.company_name_zh.endswith("Ｒ"))
+        or stock.company_name_zh.endswith("Ｔ")
+        or stock.company_name_en.endswith("-T")
+    ]
+    assert extra_counters == []
 
 
 async def post_hk_stock_list_sync_after_failed_startup(start_app, hkex_urls, monkeypatch):
