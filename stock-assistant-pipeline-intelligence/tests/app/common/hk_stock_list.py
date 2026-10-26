@@ -1,3 +1,4 @@
+import copy
 import io
 from collections.abc import Sequence
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from app.common import hk_stock_list as hk_stock_list_module
 from app.common import http_client as http_client_module
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ParseError, ServiceUnavailableError
-from app.common.hk_stock_list import HKStockListCache
+from app.common.hk_stock_list import HKStockListCache, NameEntry, StockNameIndex
 from app.common.stock import Stock
 
 EN_URL = hk_stock_list_module._ACTIVESTOCK_EN_URL
@@ -23,26 +24,75 @@ EN_ENTRIES = [
     {"i": 1, "c": "00001", "n": "CKH HOLDINGS", "s": 1},
     {"i": 2, "c": "00005", "n": "HSBC HOLDINGS", "s": 2},
     {"i": 3, "c": "02800", "n": "TRACKER FUND", "s": 3},
+    {"i": 4, "c": "80001", "n": "CKH HOLDINGS-R", "s": 4},
+    {"i": 5, "c": "02991", "n": "CKH HOLDINGS-T", "s": 5},
+    {"i": 6, "c": "02992", "n": "HSBC HOLDINGS-T", "s": 6},
+    {"i": 7, "c": "06603", "n": "IFBH", "s": 7},
 ]
 ZH_ENTRIES = [
     {"i": 1, "c": "00001", "n": "長和", "s": 1},
     {"i": 3, "c": "00006", "n": "電能實業", "s": 3},
     {"i": 4, "c": "02800", "n": "盈富基金", "s": 4},
+    {"i": 5, "c": "80001", "n": "長和－Ｒ", "s": 5},
+    {"i": 6, "c": "02991", "n": "長和－Ｔ", "s": 6},
+    {"i": 7, "c": "06603", "n": "IFBH", "s": 7},
 ]
-# (Stock Code, Name of Securities, Category) — 02911 is an equity in neither name file.
+# (Stock Code, Name of Securities, Category) — 02911 is an equity in neither name file; 80001 is
+# an RMB counter, 02991 a trading-only line named in both files, 02992 one named in English only;
+# 06603 has the same name in both files.
 SECURITIES = [
     ("00001", "CKH HOLDINGS", "Equity"),
     ("00005", "HSBC HOLDINGS", "Equity"),
     ("00006", "POWER ASSETS", "Equity"),
     ("02800", "TRACKER FUND", "Exchange Traded Products"),
     ("02911", "NEW LISTING", "Equity"),
+    ("80001", "CKH HOLDINGS-R", "Equity"),
+    ("02991", "CKH HOLDINGS-T", "Equity"),
+    ("02992", "HSBC HOLDINGS-T", "Equity"),
+    ("06603", "IFBH", "Equity"),
 ]
+
+EMPTY_NAME_INDEX = StockNameIndex(names=[], names_by_code={}, names_by_latin_prefix={})
 
 EXPECTED_ENTRIES = {
     "00001": Stock("00001", "HKEX", company_name_zh="長和", company_name_en="CKH HOLDINGS"),
     "00005": Stock("00005", "HKEX", company_name_zh="", company_name_en="HSBC HOLDINGS"),
     "00006": Stock("00006", "HKEX", company_name_zh="電能實業", company_name_en=""),
+    "06603": Stock("06603", "HKEX", company_name_zh="IFBH", company_name_en="IFBH"),
 }
+_CKH_ZH = NameEntry("00001", ["长和"], latin=False)
+_CKH_EN = NameEntry("00001", ["ckh holdings", "ckh"], latin=True)
+_HSBC_EN = NameEntry("00005", ["hsbc holdings", "hsbc"], latin=True)
+_POWER_ASSETS_ZH = NameEntry("00006", ["电能实业"], latin=False)
+_IFBH = NameEntry("06603", ["ifbh"], latin=True)
+# EXPECTED_ENTRIES' names: one entry per distinct non-empty name, normalized into its variants.
+EXPECTED_NAME_INDEX = StockNameIndex(
+    names=[_CKH_ZH, _CKH_EN, _HSBC_EN, _POWER_ASSETS_ZH, _IFBH],
+    names_by_code={
+        "00001": [_CKH_ZH, _CKH_EN],
+        "00005": [_HSBC_EN],
+        "00006": [_POWER_ASSETS_ZH],
+        "06603": [_IFBH],
+    },
+    names_by_latin_prefix={
+        "ckh": [_CKH_EN],
+        "hol": [_CKH_EN, _HSBC_EN],
+        "hsb": [_HSBC_EN],
+        "ifb": [_IFBH],
+    },
+)
+
+
+def _assert_name_index(index: StockNameIndex, expected: StockNameIndex) -> None:
+    """Asserts index holds exactly expected's entries. A list mixing stocks follows the order
+    entries were loaded in, which the parser does not fix, so it is compared by contents."""
+    assert index.names_by_code == expected.names_by_code
+    assert len(index.names) == len(expected.names)
+    assert all(entry in index.names for entry in expected.names)
+    assert index.names_by_latin_prefix.keys() == expected.names_by_latin_prefix.keys()
+    for prefix, entries in expected.names_by_latin_prefix.items():
+        assert len(index.names_by_latin_prefix[prefix]) == len(entries)
+        assert all(entry in index.names_by_latin_prefix[prefix] for entry in entries)
 
 
 def _xlsx(header: tuple[str, ...], rows: Sequence[tuple[str, ...]]) -> bytes:
@@ -119,9 +169,10 @@ async def hkex(monkeypatch):
 @pytest.fixture
 def loaded_cache(monkeypatch):
     """An already registered cache with one entry, as after an earlier successful refresh."""
-    cache = HKStockListCache(
-        {"00700": Stock("00700", "HKEX", company_name_zh="騰訊控股", company_name_en="TENCENT")}
-    )
+    entries = {
+        "00700": Stock("00700", "HKEX", company_name_zh="騰訊控股", company_name_en="TENCENT")
+    }
+    cache = HKStockListCache(entries)
     monkeypatch.setattr(hk_stock_list_module, "_hk_stock_list_cache", cache)
     return cache
 
@@ -163,28 +214,34 @@ def get_hk_stock_list_cache_not_initialized():
     ],
 )
 async def refresh_hk_stock_list_first_load(hkex, securities_xlsx):
-    """Equities only, names joined by code: a name missing from one file is "", and an equity
-    in neither file is skipped."""
+    """Equities only, names joined by code: a name missing from one file is "", an equity in
+    neither file is skipped, and so are RMB counters and trading-only lines. The name index
+    holds the loaded entries' names."""
     hkex.responses = _responses(securities=httpx.Response(200, content=securities_xlsx))
 
     entries_loaded = await hk_stock_list_module.refresh_hk_stock_list()
 
     cache = hk_stock_list_module.get_hk_stock_list_cache()
-    assert entries_loaded == 3
+    assert entries_loaded == 4
     assert cache.entries == EXPECTED_ENTRIES
+    _assert_name_index(cache.name_index, EXPECTED_NAME_INDEX)
 
 
 async def refresh_hk_stock_list_rebinds_loaded_cache(hkex, loaded_cache):
     old_entries = loaded_cache.entries
+    old_name_index = loaded_cache.name_index
     snapshot = dict(old_entries)
+    index_snapshot = copy.deepcopy(old_name_index)
 
     entries_loaded = await hk_stock_list_module.refresh_hk_stock_list()
 
-    assert entries_loaded == 3
+    assert entries_loaded == 4
     assert hk_stock_list_module.get_hk_stock_list_cache() is loaded_cache
     assert loaded_cache.entries == EXPECTED_ENTRIES
     assert loaded_cache.entries is not old_entries
     assert old_entries == snapshot
+    _assert_name_index(loaded_cache.name_index, EXPECTED_NAME_INDEX)
+    assert old_name_index == index_snapshot
 
 
 @pytest.mark.parametrize("key", ["en", "zh", "securities"])
@@ -195,7 +252,7 @@ async def refresh_hk_stock_list_connect_error_retried(hkex, key):
 
     entries_loaded = await hk_stock_list_module.refresh_hk_stock_list()
 
-    assert entries_loaded == 3
+    assert entries_loaded == 4
     assert hk_stock_list_module.get_hk_stock_list_cache().entries == EXPECTED_ENTRIES
     assert hkex.requests[_URLS[key]] == 3
 
@@ -211,7 +268,8 @@ async def refresh_hk_stock_list_connect_error_exhausted(hkex, key):
     assert exc_info.value.category is ErrorCategory.STOCK_LIST
     assert exc_info.value.error_code == error_codes.UPSTREAM_UNAVAILABLE
     assert hkex.requests[_URLS[key]] == 3
-    assert len(hk_stock_list_module.get_hk_stock_list_cache()) == 0
+    assert hk_stock_list_module.get_hk_stock_list_cache().entries == {}
+    assert hk_stock_list_module.get_hk_stock_list_cache().name_index == EMPTY_NAME_INDEX
 
 
 @pytest.mark.parametrize("overrides", UNREACHABLE)
@@ -223,7 +281,8 @@ async def refresh_hk_stock_list_unreachable(hkex, overrides):
 
     assert exc_info.value.category is ErrorCategory.STOCK_LIST
     assert exc_info.value.error_code == error_codes.UPSTREAM_UNAVAILABLE
-    assert len(hk_stock_list_module.get_hk_stock_list_cache()) == 0
+    assert hk_stock_list_module.get_hk_stock_list_cache().entries == {}
+    assert hk_stock_list_module.get_hk_stock_list_cache().name_index == EMPTY_NAME_INDEX
 
 
 @pytest.mark.parametrize("overrides", UNPARSEABLE)
@@ -234,7 +293,8 @@ async def refresh_hk_stock_list_unparseable(hkex, overrides):
         await hk_stock_list_module.refresh_hk_stock_list()
 
     assert exc_info.value.category is ErrorCategory.STOCK_LIST
-    assert len(hk_stock_list_module.get_hk_stock_list_cache()) == 0
+    assert hk_stock_list_module.get_hk_stock_list_cache().entries == {}
+    assert hk_stock_list_module.get_hk_stock_list_cache().name_index == EMPTY_NAME_INDEX
 
 
 async def refresh_hk_stock_list_no_equities(hkex):
@@ -245,7 +305,8 @@ async def refresh_hk_stock_list_no_equities(hkex):
         await hk_stock_list_module.refresh_hk_stock_list()
 
     assert exc_info.value.category is ErrorCategory.STOCK_LIST
-    assert len(hk_stock_list_module.get_hk_stock_list_cache()) == 0
+    assert hk_stock_list_module.get_hk_stock_list_cache().entries == {}
+    assert hk_stock_list_module.get_hk_stock_list_cache().name_index == EMPTY_NAME_INDEX
 
 
 @pytest.mark.parametrize(
@@ -266,6 +327,7 @@ async def refresh_hk_stock_list_no_equities(hkex):
 )
 async def refresh_hk_stock_list_failure_keeps_loaded_cache(hkex, loaded_cache, overrides, error):
     old_entries = loaded_cache.entries
+    old_name_index = loaded_cache.name_index
     snapshot = dict(old_entries)
     hkex.responses = _responses(**overrides)
 
@@ -275,3 +337,89 @@ async def refresh_hk_stock_list_failure_keeps_loaded_cache(hkex, loaded_cache, o
     assert hk_stock_list_module.get_hk_stock_list_cache() is loaded_cache
     assert loaded_cache.entries is old_entries
     assert old_entries == snapshot
+    assert loaded_cache.name_index is old_name_index
+
+
+def _stocks(*rows: tuple[str, str, str]) -> dict[str, Stock]:
+    return {code: Stock(code, "HKEX", zh, en) for code, zh, en in rows}
+
+
+# 06001 and 06002 share both names; 01972 and 09901 both start with 太古; 09901 has no
+# English name; 03988 and 02388 both contain 中 and 銀.
+STOCKS = _stocks(
+    ("00700", "騰訊控股", "TENCENT HOLDINGS"),
+    ("09988", "阿里巴巴－ＳＷ", "BABA-SW"),  # noqa: RUF001
+    ("01288", "農業銀行", "AGRICULTURAL BANK OF CHINA"),
+    ("03988", "中國銀行", "BANK OF CHINA"),
+    ("02388", "中銀香港", "BOC HONG KONG"),
+    ("02628", "中國人壽", "CHINA LIFE"),
+    ("00268", "金蝶國際", "KINGDEE INT'L"),
+    ("01972", "太古地產", "SWIRE PROPERTIES"),
+    ("09901", "太古可樂", ""),
+    ("06001", "星河科技", "GALAXY TECH"),
+    ("06002", "星河科技", "GALAXY TECH"),
+)
+
+
+@pytest.fixture
+def stock_list(monkeypatch):
+    """A loaded HK Stock List holding STOCKS."""
+    cache = HKStockListCache(STOCKS)
+    monkeypatch.setattr(hk_stock_list_module, "_hk_stock_list_cache", cache)
+
+
+@pytest.mark.parametrize(
+    ("name", "code"),
+    [
+        pytest.param("騰訊控股", "00700", id="exact"),
+        pytest.param("騰訊控股有限公司", "00700", id="zh_legal_suffix"),
+        pytest.param("騰訊", "00700", id="zh_generic_tail"),
+        pytest.param("騰訊 控股", "00700", id="zh_space_removed"),
+        pytest.param("阿里巴巴", "09988", id="listed_counter_marker"),
+        pytest.param("ＴＥＮＣＥＮＴ Holdings Ltd.", "00700", id="en_fullwidth_legal_suffix"),  # noqa: RUF001
+        pytest.param("Bank of  China", "03988", id="en_spaces_collapsed"),
+        pytest.param("星河科技", None, id="exact_tie"),
+        pytest.param("農行", "01288", id="zh_abbreviation"),
+        pytest.param("中銀", "02388", id="zh_most_compact_span_wins"),
+        pytest.param("中國人壽保險", "02628", id="zh_name_in_query"),
+        pytest.param("太古", None, id="zh_tie"),
+        pytest.param("銀農", None, id="zh_out_of_order"),
+        pytest.param("騰", None, id="zh_too_short"),
+        pytest.param("火星探險虛構公司", None, id="zh_no_match"),
+        pytest.param("ABC有限公司", None, id="zh_query_latin_variant"),
+        pytest.param("Agricultural Bank of China Hong Kong Branch", "01288", id="en_name_in_query"),
+        pytest.param("Swire Prop", "01972", id="en_query_prefix_of_name"),
+        pytest.param("Swire Pacific", None, id="en_no_match"),
+        pytest.param("AB", None, id="en_no_indexed_word"),
+        pytest.param("", None, id="blank"),
+    ],
+)
+def lookup_stock_result(stock_list, name, code):
+    """A match returns the list's own entry; a miss (no match, or a tie between companies)
+    returns None."""
+    stock = hk_stock_list_module.lookup_stock(name)
+
+    if code is None:
+        assert stock is None
+    else:
+        assert stock is STOCKS[code]
+
+
+@pytest.mark.parametrize(
+    ("name", "code", "matches"),
+    [
+        pytest.param("農行", "01288", True, id="abbreviation"),
+        pytest.param("Agricultural Bank", "01288", True, id="en_abbreviation"),
+        pytest.param("金蝶國際軟件", "00268", True, id="listed_name_in_name"),
+        pytest.param("金蝶國際軟件集團有限公司", "00268", False, id="listed_name_too_short"),
+        pytest.param("匯豐", "00700", False, id="unrelated"),
+    ],
+)
+def name_matches_stock_result(stock_list, name, code, matches):
+    assert hk_stock_list_module.name_matches_stock(name, STOCKS[code]) is matches
+
+
+def name_matches_stock_not_listed(stock_list):
+    stock = Stock("00005", "HKEX", company_name_zh="匯豐控股", company_name_en="HSBC HOLDINGS")
+
+    assert hk_stock_list_module.name_matches_stock("匯豐控股", stock) is False

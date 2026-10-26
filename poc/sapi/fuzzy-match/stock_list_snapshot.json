@@ -995,12 +995,6 @@
   "company_name_zh": "興勝創建",
   "company_name_en": "HANISON"
  },
- "04336": {
-  "stock_code": "04336",
-  "exchange": "HKEX",
-  "company_name_zh": "應用材料－Ｔ",
-  "company_name_en": "APPL MATERIAL-T"
- },
  "03838": {
   "stock_code": "03838",
   "exchange": "HKEX",
@@ -1361,12 +1355,6 @@
   "company_name_zh": "民信國際控股",
   "company_name_en": "MANSION INTL"
  },
- "82388": {
-  "stock_code": "82388",
-  "exchange": "HKEX",
-  "company_name_zh": "中銀香港－Ｒ",
-  "company_name_en": "BOC HONG KONG-R"
- },
  "08455": {
   "stock_code": "08455",
   "exchange": "HKEX",
@@ -1492,12 +1480,6 @@
   "exchange": "HKEX",
   "company_name_zh": "環龍控股",
   "company_name_en": "VANOV HOLDINGS"
- },
- "81024": {
-  "stock_code": "81024",
-  "exchange": "HKEX",
-  "company_name_zh": "快手－ＷＲ",
-  "company_name_en": "KUAISHOU-WR"
  },
  "00276": {
   "stock_code": "00276",
@@ -3041,12 +3023,6 @@
   "company_name_zh": "寶業集團",
   "company_name_en": "BAOYE GROUP"
  },
- "81810": {
-  "stock_code": "81810",
-  "exchange": "HKEX",
-  "company_name_zh": "小米集團－ＷＲ",
-  "company_name_en": "XIAOMI-WR"
- },
  "00493": {
   "stock_code": "00493",
   "exchange": "HKEX",
@@ -3292,12 +3268,6 @@
   "exchange": "HKEX",
   "company_name_zh": "中深建業",
   "company_name_en": "ZHONGSHENJIANYE"
- },
- "81211": {
-  "stock_code": "81211",
-  "exchange": "HKEX",
-  "company_name_zh": "比亞迪股份－Ｒ",
-  "company_name_en": "BYD COMPANY-R"
  },
  "00839": {
   "stock_code": "00839",
@@ -4222,18 +4192,6 @@
   "exchange": "HKEX",
   "company_name_zh": "浩德控股",
   "company_name_en": "ALTUS HLDGS"
- },
- "82020": {
-  "stock_code": "82020",
-  "exchange": "HKEX",
-  "company_name_zh": "安踏體育－Ｒ",
-  "company_name_en": "ANTA SPORTS-R"
- },
- "04338": {
-  "stock_code": "04338",
-  "exchange": "HKEX",
-  "company_name_zh": "微軟－Ｔ",
-  "company_name_en": "MICROSOFT-T"
  },
  "02333": {
   "stock_code": "02333",
@@ -5789,12 +5747,6 @@
   "company_name_zh": "中國燃氣",
   "company_name_en": "CHINA GAS HOLD"
  },
- "86618": {
-  "stock_code": "86618",
-  "exchange": "HKEX",
-  "company_name_zh": "京東健康－Ｒ",
-  "company_name_en": "JD HEALTH-R"
- },
  "06978": {
   "stock_code": "06978",
   "exchange": "HKEX",
@@ -6035,12 +5987,6 @@
   "company_name_zh": "中國鵬飛集團",
   "company_name_en": "CHINA PENGFEI"
  },
- "82318": {
-  "stock_code": "82318",
-  "exchange": "HKEX",
-  "company_name_zh": "中國平安－Ｒ",
-  "company_name_en": "PING AN-R"
- },
  "01591": {
   "stock_code": "01591",
   "exchange": "HKEX",
@@ -6064,12 +6010,6 @@
   "exchange": "HKEX",
   "company_name_zh": "勝利管道",
   "company_name_en": "SHENGLI PIPE"
- },
- "80700": {
-  "stock_code": "80700",
-  "exchange": "HKEX",
-  "company_name_zh": "騰訊控股－Ｒ",
-  "company_name_en": "TENCENT-R"
  },
  "01030": {
   "stock_code": "01030",
@@ -6106,12 +6046,6 @@
   "exchange": "HKEX",
   "company_name_zh": "新威國際",
   "company_name_en": "SUNWAY INT'L"
- },
- "04337": {
-  "stock_code": "04337",
-  "exchange": "HKEX",
-  "company_name_zh": "星巴克－Ｔ",
-  "company_name_en": "STARBUCKS-T"
  },
  "02611": {
   "stock_code": "02611",
@@ -6665,12 +6599,6 @@
   "company_name_zh": "中海物業",
   "company_name_en": "CHINA OVS PPT"
  },
- "80941": {
-  "stock_code": "80941",
-  "exchange": "HKEX",
-  "company_name_zh": "中國移動－Ｒ",
-  "company_name_en": "CHINA MOBILE-R"
- },
  "03318": {
   "stock_code": "03318",
   "exchange": "HKEX",
@@ -6898,12 +6826,6 @@
   "exchange": "HKEX",
   "company_name_zh": "中國宏橋",
   "company_name_en": "CHINAHONGQIAO"
- },
- "89988": {
-  "stock_code": "89988",
-  "exchange": "HKEX",
-  "company_name_zh": "阿里巴巴－ＷＲ",
-  "company_name_en": "BABA-WR"
  },
  "00370": {
   "stock_code": "00370",
@@ -7847,12 +7769,6 @@
   "company_name_zh": "中國生物科技服務",
   "company_name_en": "CH BIOTECH SER"
  },
- "89618": {
-  "stock_code": "89618",
-  "exchange": "HKEX",
-  "company_name_zh": "京東集團－ＳＷＲ",
-  "company_name_en": "JD-SWR"
- },
  "00124": {
   "stock_code": "00124",
   "exchange": "HKEX",
@@ -8182,12 +8098,6 @@
   "exchange": "HKEX",
   "company_name_zh": "聖諾醫藥－Ｂ",
   "company_name_en": "SIRNAOMICS-B"
- },
- "80883": {
-  "stock_code": "80883",
-  "exchange": "HKEX",
-  "company_name_zh": "中國海洋石油－Ｒ",
-  "company_name_en": "CNOOC-R"
  },
  "06898": {
   "stock_code": "06898",
@@ -8699,12 +8609,6 @@
   "company_name_zh": "交銀國際",
   "company_name_en": "BOCOM INTL"
  },
- "82333": {
-  "stock_code": "82333",
-  "exchange": "HKEX",
-  "company_name_zh": "長城汽車－Ｒ",
-  "company_name_en": "GWMOTOR-R"
- },
  "00242": {
   "stock_code": "00242",
   "exchange": "HKEX",
@@ -9173,12 +9077,6 @@
   "company_name_zh": "IDT INT'L",
   "company_name_en": "IDT INT'L"
  },
- "80175": {
-  "stock_code": "80175",
-  "exchange": "HKEX",
-  "company_name_zh": "吉利汽車－Ｒ",
-  "company_name_en": "GEELY AUTO-R"
- },
  "01965": {
   "stock_code": "01965",
   "exchange": "HKEX",
@@ -9443,12 +9341,6 @@
   "company_name_zh": "弘海高新資源",
   "company_name_en": "GRAND OCEAN AR"
  },
- "81299": {
-  "stock_code": "81299",
-  "exchange": "HKEX",
-  "company_name_zh": "友邦保險－Ｒ",
-  "company_name_en": "AIA-R"
- },
  "02167": {
   "stock_code": "02167",
   "exchange": "HKEX",
@@ -9460,12 +9352,6 @@
   "exchange": "HKEX",
   "company_name_zh": "中港照相",
   "company_name_en": "CHINA-HK PHOTO"
- },
- "04332": {
-  "stock_code": "04332",
-  "exchange": "HKEX",
-  "company_name_zh": "AMGEN-T",
-  "company_name_en": "AMGEN-T"
  },
  "08411": {
   "stock_code": "08411",
@@ -9856,12 +9742,6 @@
   "exchange": "HKEX",
   "company_name_zh": "中國東方航空股份",
   "company_name_en": "CHINA EAST AIR"
- },
- "83690": {
-  "stock_code": "83690",
-  "exchange": "HKEX",
-  "company_name_zh": "美團－ＷＲ",
-  "company_name_en": "MEITUAN-WR"
  },
  "08232": {
   "stock_code": "08232",
@@ -10607,12 +10487,6 @@
   "company_name_zh": "沛嘉醫療－Ｂ",
   "company_name_en": "PEIJIA-B"
  },
- "89888": {
-  "stock_code": "89888",
-  "exchange": "HKEX",
-  "company_name_zh": "百度集團－ＷＲ",
-  "company_name_en": "BIDU-WR"
- },
  "00205": {
   "stock_code": "00205",
   "exchange": "HKEX",
@@ -10852,12 +10726,6 @@
   "exchange": "HKEX",
   "company_name_zh": "中安控股集團",
   "company_name_en": "OMNIBRIDGE HLDG"
- },
- "82331": {
-  "stock_code": "82331",
-  "exchange": "HKEX",
-  "company_name_zh": "李寧－Ｒ",
-  "company_name_en": "LI NING-R"
  },
  "01710": {
   "stock_code": "01710",
@@ -11129,23 +10997,11 @@
   "company_name_zh": "福耀玻璃",
   "company_name_en": "FUYAO GLASS"
  },
- "80388": {
-  "stock_code": "80388",
-  "exchange": "HKEX",
-  "company_name_zh": "香港交易所－Ｒ",
-  "company_name_en": "HKEX-R"
- },
  "06611": {
   "stock_code": "06611",
   "exchange": "HKEX",
   "company_name_zh": "三巽集團",
   "company_name_en": "SANXUN GROUP"
- },
- "80291": {
-  "stock_code": "80291",
-  "exchange": "HKEX",
-  "company_name_zh": "華潤啤酒－Ｒ",
-  "company_name_en": "CHINARES BEER-R"
  },
  "00868": {
   "stock_code": "00868",
@@ -11955,7 +11811,7 @@
   "stock_code": "01956",
   "exchange": "HKEX",
   "company_name_zh": "中科聞歌",
-  "company_name_en": "WENGE AI-50"
+  "company_name_en": "WENGE AI"
  },
  "00632": {
   "stock_code": "00632",
@@ -13631,12 +13487,6 @@
   "company_name_zh": "環球數碼創意",
   "company_name_en": "GDC"
  },
- "04333": {
-  "stock_code": "04333",
-  "exchange": "HKEX",
-  "company_name_zh": "思科－Ｔ",
-  "company_name_en": "CISCO-T"
- },
  "01218": {
   "stock_code": "01218",
   "exchange": "HKEX",
@@ -13852,12 +13702,6 @@
   "exchange": "HKEX",
   "company_name_zh": "農業銀行",
   "company_name_en": "ABC"
- },
- "80020": {
-  "stock_code": "80020",
-  "exchange": "HKEX",
-  "company_name_zh": "商湯－ＷＲ",
-  "company_name_en": "SENSETIME-WR"
  },
  "00033": {
   "stock_code": "00033",
@@ -14591,12 +14435,6 @@
   "company_name_zh": "金蝶國際",
   "company_name_en": "KINGDEE INT'L"
  },
- "04335": {
-  "stock_code": "04335",
-  "exchange": "HKEX",
-  "company_name_zh": "英特爾－Ｔ",
-  "company_name_en": "INTEL-T"
- },
  "01543": {
   "stock_code": "01543",
   "exchange": "HKEX",
@@ -14746,12 +14584,6 @@
   "exchange": "HKEX",
   "company_name_zh": "正道集團",
   "company_name_en": "HYBRID KINETIC"
- },
- "80016": {
-  "stock_code": "80016",
-  "exchange": "HKEX",
-  "company_name_zh": "新鴻基地產－Ｒ",
-  "company_name_en": "SHK PPT-R"
  },
  "02147": {
   "stock_code": "02147",
@@ -15959,12 +15791,6 @@
   "company_name_zh": "人瑞人才",
   "company_name_en": "RENRUI HR"
  },
- "80992": {
-  "stock_code": "80992",
-  "exchange": "HKEX",
-  "company_name_zh": "聯想集團－Ｒ",
-  "company_name_en": "LENOVO GROUP-R"
- },
  "01900": {
   "stock_code": "01900",
   "exchange": "HKEX",
@@ -16529,12 +16355,6 @@
   "company_name_zh": "自動系統",
   "company_name_en": "AUTOMATED SYS"
  },
- "80737": {
-  "stock_code": "80737",
-  "exchange": "HKEX",
-  "company_name_zh": "灣區發展－Ｒ",
-  "company_name_en": "BAY AREA DEV-R"
- },
  "00174": {
   "stock_code": "00174",
   "exchange": "HKEX",
@@ -16592,8 +16412,8 @@
  "09929": {
   "stock_code": "09929",
   "exchange": "HKEX",
-  "company_name_zh": "澳達控股",
-  "company_name_en": "SEM HLDGS"
+  "company_name_zh": "耀寶",
+  "company_name_en": "YAOPOP"
  },
  "01883": {
   "stock_code": "01883",
