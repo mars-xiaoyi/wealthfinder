@@ -157,5 +157,6 @@ Cost: p50 0.17 ms, p99 4.2 ms, max 6.5 ms over all 475 queries (Python 3.12, App
 | `evaluate.py`, `compare.py`, `holdout.py`, `holdout_sep.py` | results per round; per-category results and latency; the held-out HKEX and news checks |
 | `fallback_swap.py`, `compare_simple.py`, `shared_normalizer.py` | the fallback swap on the LLM Skill spike's stored outputs; S8 against that spike's simpler search; step 1 with S8's normalization |
 | `bench.py` | the earlier I-1 latency and heartbeat test for §4.2 and R1–R7 |
+| `make_lookup_stock_cases.py` | builds SAPI's `lookup_stock` regression fixture (`tests/integration/app/common/lookup_stock_cases.json`) from the case sets and S8 |
 
-`algorithms.py`, `subseq.py`, `evaluate.py` and `compare.py` need `rapidfuzz` and `opencc` (`uv pip install rapidfuzz opencc`); the rest run on a plain `python3`.
+`algorithms.py`, `subseq.py`, `evaluate.py`, `compare.py` and `make_lookup_stock_cases.py` need `rapidfuzz` and `opencc` (`uv pip install rapidfuzz opencc`); the rest run on a plain `python3`.
