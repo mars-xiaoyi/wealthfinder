@@ -1212,22 +1212,21 @@ The same translation, without the retry, applies to `fetch_one()`/`fetch_all()` 
 ```python
 from app.common.errors import SAPIError   # §15.1
 
-class UniqueConstraintError(SAPIError):
-    """Raised on a unique-constraint violation not already absorbed by ON CONFLICT DO NOTHING."""
-    error_type = ErrorType.STORAGE
-    error_code = error_codes.UNIQUE_CONSTRAINT_VIOLATED
-
-    def __init__(self, constraint_name: str):
-        super().__init__(f"unique constraint violated: {constraint_name}")
-        self.constraint_name = constraint_name
-
 class DatabaseError(SAPIError):
     """Raised on any other data-integrity failure."""
     error_type = ErrorType.STORAGE
     error_code = error_codes.DATABASE_ERROR
+
+class UniqueConstraintError(DatabaseError):
+    """Raised on a unique-constraint violation not already absorbed by ON CONFLICT DO NOTHING."""
+    error_code = error_codes.UNIQUE_CONSTRAINT_VIOLATED
+
+    def __init__(self, constraint_name: str, *, category: ErrorCategory):
+        super().__init__(f"unique constraint violated: {constraint_name}", category=category)
+        self.constraint_name = constraint_name
 ```
 
-Both subclass `SAPIError` (§15.1) so a catch-all `except Exception` can't swallow them as unanticipated bugs.
+`UniqueConstraintError` is a `DatabaseError`; both are `SAPIError`s (§15.1) so a catch-all `except Exception` can't swallow them as unanticipated bugs.
 
 `ServiceUnavailableError` lives in `app/common/errors.py` (§15.1) because it is also raised outside the DB layer; every infra `get_X()` reuses it (§5.1).
 
