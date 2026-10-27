@@ -6,6 +6,7 @@ docker CLI. Host ports are fixed per session (not Docker-assigned) so `docker st
 
 import contextlib
 import dataclasses
+import functools
 import http.server
 import json
 import os
@@ -207,14 +208,14 @@ def infra() -> Iterator[Infra]:
         infra = Infra(*started)
         for container in infra.all():
             container.wait_ready()
-        alembic(infra, "upgrade", "head")
+        _alembic(infra, "upgrade", "head")
         yield infra
     finally:
         for container in started:
             subprocess.run(["docker", "rm", "-f", container.name], capture_output=True)
 
 
-def alembic(infra: Infra, *args: str) -> subprocess.CompletedProcess[str]:
+def _alembic(infra: Infra, *args: str) -> subprocess.CompletedProcess[str]:
     """Run the alembic CLI against the session's Postgres, as an operator would."""
     return subprocess.run(
         [sys.executable, "-m", "alembic", *args],
@@ -224,6 +225,12 @@ def alembic(infra: Infra, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=True,
     )
+
+
+@pytest.fixture
+def alembic(infra: Infra) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """alembic("upgrade", "head") runs the alembic CLI against the session's Postgres."""
+    return functools.partial(_alembic, infra)
 
 
 @pytest.fixture(autouse=True)

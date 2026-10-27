@@ -1,7 +1,6 @@
 import asyncpg
 import pytest
 
-from tests.integration import conftest
 from tests.integration.conftest import Infra
 
 pytestmark = [pytest.mark.live, pytest.mark.timeout(120)]
@@ -41,16 +40,16 @@ async def _table_exists(conn: asyncpg.Connection) -> bool:
     return bool(await conn.fetchval("SELECT to_regclass('entity_events') IS NOT NULL"))
 
 
-async def upgrade_downgrade_success(infra: Infra):
+async def upgrade_downgrade_success(infra: Infra, alembic):
     """From an empty schema, upgrade creates entity_events as specified, downgrade removes it,
     and upgrading again succeeds — all in SAPI's own sapi database."""
-    conftest.alembic(infra, "downgrade", "base")
+    alembic("downgrade", "base")
     conn = await asyncpg.connect(infra.env()["DATABASE_URL"])
     try:
         assert await conn.fetchval("SELECT current_database()") == "sapi"
         assert not await _table_exists(conn)
 
-        conftest.alembic(infra, "upgrade", "head")
+        alembic("upgrade", "head")
 
         columns = await conn.fetch(
             "SELECT column_name, format_type(atttypid, atttypmod) AS type, is_nullable"
@@ -70,15 +69,15 @@ async def upgrade_downgrade_success(infra: Infra):
         assert dict(tuple(row) for row in indexes) == ENTITY_EVENTS_INDEXES
         assert await conn.fetch("SELECT version_num FROM alembic_version") == [("001",)]
 
-        conftest.alembic(infra, "downgrade", "-1")
+        alembic("downgrade", "-1")
 
         assert not await _table_exists(conn)
         assert await conn.fetchval("SELECT count(*) FROM alembic_version") == 0
 
-        conftest.alembic(infra, "upgrade", "head")
+        alembic("upgrade", "head")
 
         assert await _table_exists(conn)
         assert await conn.fetchval("SELECT current_database()") == "sapi"
     finally:
-        conftest.alembic(infra, "upgrade", "head")
+        alembic("upgrade", "head")
         await conn.close()
