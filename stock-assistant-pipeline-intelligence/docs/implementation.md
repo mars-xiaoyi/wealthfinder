@@ -1655,7 +1655,7 @@ Raises  : LLMRateLimitError on google.genai.errors.APIError with code 429.
           LLMSchemaViolationError when model_validate_json fails (truncated or malformed JSON).
 ```
 
-Each call contributes one `llm_calls[]` entry (system-design.md §9.8) to the Skill's log. The Adapter returns the measurements; the Skill adds `call_index`/`purpose` (§8.2–§8.4). `LLMAuthenticationError`'s CRITICAL alert lives in the Skill (§8.1).
+Each call contributes one `llm_calls[]` entry (system-design.md §9.8) to the Skill's log. The Adapter returns the measurements; the Skill adds `call_index`/`purpose` (§8.2–§8.4).
 
 #### Method: `close() -> None`
 
@@ -1687,11 +1687,11 @@ Everything shared across Skills lives in this one file: `SkillInput`, `SkillResu
 
 `LlmCallMetric`/`LlmErrorEntry` are the element types of `SkillBase._llm_calls`/`_llm_errors`, shared by all three completion logs (§8.2–§8.4, system-design.md §9.8).
 
-Each Skill instance is constructed fresh per `run()` call (§11.1, §13.1), so `input` is stored on `self._input`. `SkillBase.run()` is a template method: `try: return await llm_process()`, `except` the typed LLM exceptions (§7.2): log the error's `dev_message` at its own `log_level`, append an `LlmErrorEntry`, then `build_fail_result(err)`. `llm_process()` returns the final `SkillResult` directly on success. A subclass `__init__` must call `super().__init__(input)`.
+Each Skill instance is constructed fresh per `run()` call (§11.1, §13.1), so `input` is stored on `self._input`. `SkillBase.run()` is a template method: `try: return await llm_process()`, `except` the typed LLM exceptions (§7.2): append an `LlmErrorEntry`, then `build_fail_result(err)`. It doesn't log the error: the result carries it, and the consumer that finally catches the re-raised error logs it (§11.2, §13.2). `llm_process()` returns the final `SkillResult` directly on success. A subclass `__init__` must call `super().__init__(input)`.
 
-`failure_reason` is the caught `LLMError` itself. Callers (`EntityAnalysisService` §11.1, `ScoringService` §13.1) re-raise it, and their consumers only distinguish `LLMRateLimitError` (triggers `WorkerPool.trigger_backoff()`) from everything else (no ACK).
+`failure_reason` is the caught `LLMError` itself. Callers (`EntityAnalysisService` §11.1, `ScoringService` §13.1) re-raise it; their consumers log it and only distinguish `LLMRateLimitError` (triggers `WorkerPool.trigger_backoff()`) from everything else (no ACK).
 
-> **`LLMAuthenticationError` is its own type** because it isn't self-healing: every call fails until an operator fixes the credentials, so its CRITICAL `log_level` (§7.2) pages immediately. Deduping the CRITICAL log across a sustained outage is deferred.
+> **`LLMAuthenticationError` is its own type** because it isn't self-healing: every call fails until an operator fixes the credentials, so its CRITICAL `log_level` (§7.2) pages immediately when the consumer logs it. Deduping the CRITICAL log across a sustained outage is deferred.
 
 ```python
 @dataclass
@@ -1726,8 +1726,6 @@ class SkillBase(ABC):
         try:
             return await self.llm_process()
         except LLMError as err:
-            logger.log(err.log_level, err.dev_message, skill=type(self).__name__,
-                       call_index=len(self._llm_calls) + 1, exc_info=err)
             self._llm_errors.append(LlmErrorEntry(call_index=len(self._llm_calls) + 1,
                                                    error_type=type(err).__name__,
                                                    error_detail=str(err), retried=False))
@@ -2008,7 +2006,7 @@ FOR each mention in structured.output.output_items:
 # keep first occurrence per stock_code — the LLM is instructed not to repeat one
 # (system-design.md §9.4 Edge Case Rule 5), and two mentions can verify to the same code
 
-return EntityAnalysisResult(entities, skill_log=self._skill_log(), failure_reason=None)
+return EntityAnalysisResult(entities, skill_log=self._create_skill_log(), failure_reason=None)
 ```
 
 Raises one of the typed exceptions (§7.2) on any failure above — `SkillBase.run()` (§8.1) catches them, not this method.
@@ -2032,10 +2030,10 @@ return lookup_stock(mention.company_name)   # §4.2 name search
 
 `_code_printed(code, article_text)`: true when the article prints the code in a code-shaped form — `(0700)`, `（00700）`, `00700.HK`, `Stock Code: 700`, `股份代號：700` — with leading zeros optional. A bare number elsewhere in the text never counts, and a bracketed number counts only with at least 3 digits, so a list marker such as `(1)` can't confirm a wrong code like `00001`.
 
-`_skill_log()` maps `self`'s accumulated state onto `EntityAnalysisSkillLog` — called from both `llm_process()` (success) and `build_fail_result()` (failure).
+`_create_skill_log()` maps `self`'s accumulated state onto `EntityAnalysisSkillLog` — called from both `llm_process()` (success) and `build_fail_result()` (failure).
 
 ```python
-def _skill_log(self) -> EntityAnalysisSkillLog:
+def _create_skill_log(self) -> EntityAnalysisSkillLog:
     return EntityAnalysisSkillLog(
         skill_version=ENTITY_SKILL_VERSION,
         verified_entities=self._verified_entities,
@@ -2050,7 +2048,7 @@ def _skill_log(self) -> EntityAnalysisSkillLog:
     )
 
 def build_fail_result(self, err: LLMError) -> EntityAnalysisResult:
-    return EntityAnalysisResult(entity_events=None, skill_log=self._skill_log(), failure_reason=err)
+    return EntityAnalysisResult(entity_events=None, skill_log=self._create_skill_log(), failure_reason=err)
 ```
 
 #### Business Constraint Validation (post-verification)
@@ -2158,13 +2156,13 @@ except LLMSchemaViolationError as err:
     fallback, fallback_reason = True, "schema_violation"
     log warning brief_summary_fallback
 
-return BriefSummaryResult(output, skill_log=self._skill_log(fallback, fallback_reason), failure_reason=None)
+return BriefSummaryResult(output, skill_log=self._create_skill_log(fallback, fallback_reason), failure_reason=None)
 ```
 
-#### `_skill_log()` / `build_fail_result()`
+#### `_create_skill_log()` / `build_fail_result()`
 
 ```python
-def _skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> BriefSummarySkillLog:
+def _create_skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> BriefSummarySkillLog:
     return BriefSummarySkillLog(
         event_id=self._input.event.event_id,
         skill_version=BRIEF_SKILL_VERSION,
@@ -2180,7 +2178,7 @@ def _skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> BriefSum
     )
 
 def build_fail_result(self, err: LLMError) -> BriefSummaryResult:
-    return BriefSummaryResult(output=None, skill_log=self._skill_log(False, None), failure_reason=err)
+    return BriefSummaryResult(output=None, skill_log=self._create_skill_log(False, None), failure_reason=err)
 ```
 
 #### Data Structures
@@ -2353,13 +2351,13 @@ except LLMSchemaViolationError as err:
     fallback, fallback_reason = True, "schema_violation"
     log warning event_scoring_fallback
 
-return EventLLMScoringResult(output, skill_log=self._skill_log(fallback, fallback_reason), failure_reason=None)
+return EventLLMScoringResult(output, skill_log=self._create_skill_log(fallback, fallback_reason), failure_reason=None)
 ```
 
-#### `_skill_log()` / `build_fail_result()`
+#### `_create_skill_log()` / `build_fail_result()`
 
 ```python
-def _skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> EventLLMScoringSkillLog:
+def _create_skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> EventLLMScoringSkillLog:
     return EventLLMScoringSkillLog(
         event_id=self._input.event.event_id,
         skill_version=SCORING_SKILL_VERSION,
@@ -2375,7 +2373,7 @@ def _skill_log(self, fallback: bool, fallback_reason: Optional[str]) -> EventLLM
     )
 
 def build_fail_result(self, err: LLMError) -> EventLLMScoringResult:
-    return EventLLMScoringResult(output=None, skill_log=self._skill_log(False, None), failure_reason=err)
+    return EventLLMScoringResult(output=None, skill_log=self._create_skill_log(False, None), failure_reason=err)
 ```
 
 #### Data Structures
@@ -3194,9 +3192,9 @@ def create_cache_store() -> CacheStore:
 
 ### 11.1 `app/entity_analysis/entity_analysis_service.py` — `EntityAnalysisService`
 
-`EntityAnalysisService` is pure business logic: `find_entity_events()` only. `CleanedNewsConsumer` (§11.2) owns consumption of `stream:raw_news_cleaned` (consumer/reclaim loops, dedup guard, `WorkerPool` dispatch, ACK/backoff/dead-letter) and reacts to how `find_entity_events()` returns: normally (ACK); `LLMRateLimitError` (no ACK, backoff); any other `LLMError` (no ACK, already logged); anything else (no ACK, unanticipated bug, logged ERROR, §11.2).
+`EntityAnalysisService` is pure business logic: `find_entity_events()` only. `CleanedNewsConsumer` (§11.2) owns consumption of `stream:raw_news_cleaned` (consumer/reclaim loops, dedup guard, `WorkerPool` dispatch, ACK/backoff/dead-letter) and reacts to how `find_entity_events()` returns: normally (ACK); `LLMRateLimitError` (no ACK, backoff); any other `LLMError` (no ACK, logged at its own level); anything else (no ACK, unanticipated bug, logged ERROR, §11.2).
 
-Failures are exceptions rather than a status value because `find_entity_events()` can't enumerate every failure. Each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason`), so the consumer distinguishes `LLMRateLimitError` (needs `trigger_backoff()`) from other `LLMError`s (already logged). A non-`LLMError` (SADI fetch failure, DB write failure) is not handled here.
+Failures are exceptions rather than a status value because `find_entity_events()` can't enumerate every failure. Each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason`), so the consumer distinguishes `LLMRateLimitError` (needs `trigger_backoff()`) from other `LLMError`s and logs it. A non-`LLMError` (SADI fetch failure, DB write failure) is not handled here.
 
 #### Class: `EntityAnalysisService`
 
@@ -3376,7 +3374,7 @@ flowchart TD
 
 > **`hk_stock_list_not_ready` gate:** checked before the in-flight Set and before `EntityAnalysisService`, as a synchronous side-effect-free read. Messages are **not ACKed**: an empty list would make every entity `found=false` and produce a permanently-wrong empty result. The reclaim loop (§6.1) redelivers after `STREAM_CLAIM_TIMEOUT_MS`.
 
-> **`_process_one()` wraps everything from the Set-insert onward in `try`/`except LLMRateLimitError`/`except LLMError`/`except SAPIError`/`except Exception`** (in that order, since `LLMRateLimitError` subclasses `LLMError`, which subclasses `SAPIError`). `except LLMError` covers `LLMProviderError`/`LLMAuthenticationError`/`LLMSchemaViolationError`, re-raised as themselves by `find_entity_events()`. `except SAPIError` covers every other SAPI error (a SADI outage, a DB write failure): log it at its own `log_level` with its `dev_message`, and leave the message unACKed. Only the last is unanticipated: log ERROR `f"Unhandled exception: {exc!r}"` with `exc_info`, remove `cleaned_id` from `processing_cleaned_ids` in a `finally`, leave the message unACKed, and don't re-raise. The first two skip the ERROR log because `find_entity_events()` already logged `entity_analysis_completed`. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
+> **`_process_one()` wraps everything from the Set-insert onward in `try`/`except LLMRateLimitError`/`except SAPIError`/`except Exception`** (in that order, since `LLMRateLimitError` subclasses `LLMError`, which subclasses `SAPIError`). `except LLMRateLimitError` calls `trigger_backoff()`, then logs the error like the next clause. `except SAPIError` covers every other SAPI error — any other `LLMError` re-raised by `find_entity_events()`, a SADI outage, a DB write failure: log it at its own `log_level` with its `dev_message`, `cleaned_id` and `message_id`, and leave the message unACKed. Only the last is unanticipated: log ERROR `f"Unhandled exception: {exc!r}"` with `exc_info`, remove `cleaned_id` from `processing_cleaned_ids` in a `finally`, leave the message unACKed, and don't re-raise. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
 
 ```
 Purpose : The single entry point for dispatching one message, from either _consumer_loop()
@@ -4001,7 +3999,7 @@ def create_event_aggregation_store() -> EventAggregationStore:
 
 `ScoringService` is pure business logic: `score_event()` only. `ScoringConsumer` (§13.2) owns `stream:event_aggregated` consumption and reacts to how `score_event()` returns: normally (ACK, scored or stale alike, §13.4); `LLMRateLimitError` (no ACK, backoff); any other `LLMError` (no ACK, already anticipated); anything else (no ACK, unanticipated bug, §13.2).
 
-Exceptions rather than a status value, as in `find_entity_events()` (§11.1): each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason`), and `ScoringConsumer` distinguishes `LLMRateLimitError` from other `LLMError`s (already logged via `brief_summary_completed`/`event_scoring_completed`). Staleness (§13.4) is a normal return, since the consumer treats it like success.
+Exceptions rather than a status value, as in `find_entity_events()` (§11.1): each Skill `failure_reason` is re-raised as itself (`raise result.failure_reason`), and `ScoringConsumer` logs it and distinguishes `LLMRateLimitError` from other `LLMError`s. Staleness (§13.4) is a normal return, since the consumer treats it like success.
 
 #### `EventScore` — `app/models/event_score.py`
 
@@ -4252,7 +4250,7 @@ flowchart TD
 
 > **Neither Skill's `run()` raises:** `score_event()` branches on `result.failure_reason`. `result.skill_log` is always populated, and `ScoringService` logs it as-is (both Skills take `event.event_id` directly, unlike `EntityAnalysisSkill`, §8.2).
 
-> **`_process_one()` uses the same three-tier `try`/`except` as `CleanedNewsConsumer` (§11.2)**, from the `_in_process` Set-insert onward: `LLMRateLimitError` (backoff), `LLMError` (no extra log; `score_event()` already logged `brief_summary_completed`/`event_scoring_completed`), and `Exception` (log ERROR `f"Unhandled exception: {exc!r}"` with `exc_info`, remove `event_id` from `_in_process` in a `finally`, leave unACKed, don't re-raise). A repeating failure dead-letters at `delivery_count >= SCORING_MAX_RETRY` → `stream:scoring_dead_letter` (§6.1).
+> **`_process_one()` uses the same three-tier `try`/`except` as `CleanedNewsConsumer` (§11.2)**, from the `_in_process` Set-insert onward: `LLMRateLimitError` (backoff, then logged), `SAPIError` (logged at its own `log_level` with its `dev_message` and `event_id` — covers every other `LLMError` re-raised by `score_event()`), and `Exception` (log ERROR `f"Unhandled exception: {exc!r}"` with `exc_info`, remove `event_id` from `_in_process` in a `finally`, leave unACKed, don't re-raise). A repeating failure dead-letters at `delivery_count >= SCORING_MAX_RETRY` → `stream:scoring_dead_letter` (§6.1).
 
 #### `_reclaim_loop()` (§6.1's Reclaim and Dead Letter pattern, applied here)
 
