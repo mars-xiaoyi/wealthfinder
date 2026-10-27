@@ -114,6 +114,7 @@ async def fetch_one_with_postgres_error():
     with pytest.raises(DatabaseError) as excinfo:
         await client.fetch_one("SELECT 1")
 
+    assert excinfo.value.error_code == "COMMON-8000"
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
 
@@ -130,13 +131,20 @@ async def fetch_all_success():
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_cls"),
+    ("error", "expected_cls", "expected_code"),
     [
-        pytest.param(asyncpg.PostgresConnectionError("lost"), ServiceUnavailableError, id="lost"),
-        pytest.param(asyncpg.PostgresError("syntax error"), DatabaseError, id="postgres"),
+        pytest.param(
+            asyncpg.PostgresConnectionError("lost"),
+            ServiceUnavailableError,
+            "COMMON-5001",
+            id="lost",
+        ),
+        pytest.param(
+            asyncpg.PostgresError("syntax error"), DatabaseError, "COMMON-8000", id="postgres"
+        ),
     ],
 )
-async def fetch_all_failure(error, expected_cls):
+async def fetch_all_failure(error, expected_cls, expected_code):
     client, _, conn = _make_client()
     conn.fetch = AsyncMock(side_effect=error)
 
@@ -144,6 +152,7 @@ async def fetch_all_failure(error, expected_cls):
         await client.fetch_all("SELECT 1")
 
     assert type(excinfo.value) is expected_cls
+    assert excinfo.value.error_code == expected_code
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
 
@@ -225,15 +234,23 @@ async def transaction_commit_fails():
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_cls"),
+    ("error", "expected_cls", "expected_code"),
     [
         pytest.param(
-            asyncpg.ConnectionDoesNotExistError("lost"), ServiceUnavailableError, id="lost"
+            asyncpg.ConnectionDoesNotExistError("lost"),
+            ServiceUnavailableError,
+            "COMMON-5001",
+            id="lost",
         ),
-        pytest.param(asyncpg.StringDataRightTruncationError("too long"), DatabaseError, id="data"),
+        pytest.param(
+            asyncpg.StringDataRightTruncationError("too long"),
+            DatabaseError,
+            "COMMON-8000",
+            id="data",
+        ),
     ],
 )
-async def execute_returning_failure(error, expected_cls):
+async def execute_returning_failure(error, expected_cls, expected_code):
     """A failed statement is translated, not retried, and its transaction rolls back."""
     client, pool, conn = _make_transaction_client()
     conn.fetchrow.side_effect = error
@@ -243,6 +260,7 @@ async def execute_returning_failure(error, expected_cls):
             await tx.execute_returning("INSERT $1", 1)
 
     assert type(excinfo.value) is expected_cls
+    assert excinfo.value.error_code == expected_code
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
     assert conn.mock_calls == [
@@ -265,6 +283,7 @@ async def execute_returning_unique_violation():
             await tx.execute_returning("INSERT $1", 1)
 
     assert excinfo.value.constraint_name == "uq_entity_events_source_url_stock_code"
+    assert excinfo.value.error_code == "COMMON-8001"
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
     assert conn.mock_calls == [
@@ -333,15 +352,20 @@ async def transaction_open_retries_exhausted():
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_cls"),
+    ("error", "expected_cls", "expected_code"),
     [
         pytest.param(
-            asyncpg.InterfaceError("pool is closed"), ServiceUnavailableError, id="closed"
+            asyncpg.InterfaceError("pool is closed"),
+            ServiceUnavailableError,
+            "COMMON-5001",
+            id="closed",
         ),
-        pytest.param(asyncpg.PostgresError("permission denied"), DatabaseError, id="postgres"),
+        pytest.param(
+            asyncpg.PostgresError("permission denied"), DatabaseError, "COMMON-8000", id="postgres"
+        ),
     ],
 )
-async def transaction_open_not_retried(error, expected_cls):
+async def transaction_open_not_retried(error, expected_cls, expected_code):
     """A failure no fresh attempt can clear is raised at once."""
     client, pool, _ = _make_transaction_client()
     pool.acquire.side_effect = error
@@ -354,6 +378,7 @@ async def transaction_open_not_retried(error, expected_cls):
             pytest.fail("the transaction should not open")
 
     assert type(excinfo.value) is expected_cls
+    assert excinfo.value.error_code == expected_code
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
     assert pool.acquire.await_count == 1

@@ -40,7 +40,7 @@ def _request() -> Request:
         pytest.param(
             DatabaseError("syntax error", category=ErrorCategory.DB),
             500,
-            error_codes.INTERNAL_ERROR,
+            error_codes.DATABASE_ERROR,
             id="not_in_http_status",
         ),
     ],
