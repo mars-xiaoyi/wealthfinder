@@ -7,6 +7,8 @@ class ErrorCategory(StrEnum):
     COMMON = "COMMON"
     CONFIG = "CONFIG"
     DB = "DB"
+    ENTITY_ANALYSIS = "ENTITY_ANALYSIS"
+    LLM = "LLM"
     NEWS_CLIENT = "NEWS_CLIENT"
     REDIS = "REDIS"
     STOCK_LIST = "STOCK_LIST"

@@ -13,6 +13,7 @@ class ErrorType(StrEnum):
     GENERAL = "GENERAL"
     STORAGE = "STORAGE"
     PARSE = "PARSE"
+    LLM = "LLM"
 
 
 class SAPIError(Exception):

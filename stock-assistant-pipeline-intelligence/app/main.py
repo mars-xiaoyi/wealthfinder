@@ -11,6 +11,8 @@ from app.common.http_client import create_http_client
 from app.config import load_config
 from app.db.connection import create_db_client
 from app.entity_analysis.cleaned_news_consumer import CleanedNewsConsumer
+from app.entity_analysis.entity_analysis_service import create_entity_analysis_service
+from app.llm.vertex_adapter import create_llm_adapter
 from app.logger import configure_logging, get_logger
 from app.redis.state_client import create_state_client
 from app.redis.stream_client import create_stream_client
@@ -40,6 +42,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resources.push_async_callback(redis_state.close)
         http_client = create_http_client(config.http.timeout_s)
         resources.push_async_callback(http_client.aclose)
+        llm_adapter = create_llm_adapter(config.llm)
+        resources.push_async_callback(llm_adapter.close)
         create_news_client(http_client, config.entity_analysis.sadi_api_url)
 
         # Eager, blocking HK Stock List load. Unlike the infra above, a failure must not abort
@@ -50,6 +54,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             logger.critical("hk_stock_list_startup_load_failed", exc_info=True)
 
+        create_entity_analysis_service(config.entity_analysis)
         cleaned_news_consumer = CleanedNewsConsumer(config.entity_analysis, config.redis)
         consumer_task = asyncio.create_task(cleaned_news_consumer.start())
         # Registered last, so on shutdown the consumer stops before the clients it uses close.

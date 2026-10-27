@@ -15,6 +15,7 @@ from app.config import (
     EntityAnalysisConfig,
     HealthConfig,
     HttpConfig,
+    LLMConfig,
     RedisConfig,
 )
 
@@ -25,9 +26,11 @@ CONFIG = AppConfig(
     redis=RedisConfig(
         stream_url="redis://localhost/0", state_url="redis://localhost/1", reconnect_interval_s=5
     ),
+    llm=LLMConfig(vertex_project="wealthfinder", vertex_location="global", api_timeout_s=30),
     entity_analysis=EntityAnalysisConfig(
         batch_size=10,
         batch_timeout_ms=5000,
+        max_input_chars=30000,
         sadi_api_url="http://sadi:8000",
         consumer_name="sapi-entity-analysis-1",
     ),
@@ -45,12 +48,17 @@ def infra():
     calls.attach_mock(redis_stream.close, "redis_stream_close")
     calls.attach_mock(redis_state.close, "redis_state_close")
     calls.attach_mock(http_client.aclose, "http_client_aclose")
+    llm_adapter = MagicMock()
+    llm_adapter.close = AsyncMock()
+    calls.attach_mock(llm_adapter.close, "llm_adapter_close")
     create_db = AsyncMock(return_value=db)
     create_stream = AsyncMock(return_value=redis_stream)
     create_state = AsyncMock(return_value=redis_state)
     create_http = MagicMock(return_value=http_client)
     refresh = AsyncMock(return_value=2800)
+    create_llm = MagicMock(return_value=llm_adapter)
     create_news = MagicMock()
+    create_service = MagicMock()
 
     async def _consume_until_cancelled() -> None:
         calls.consumer_started()
@@ -66,7 +74,9 @@ def infra():
     calls.attach_mock(create_state, "create_state_client")
     calls.attach_mock(create_http, "create_http_client")
     calls.attach_mock(refresh, "refresh_hk_stock_list")
+    calls.attach_mock(create_llm, "create_llm_adapter")
     calls.attach_mock(create_news, "create_news_client")
+    calls.attach_mock(create_service, "create_entity_analysis_service")
     calls.attach_mock(consumer_cls, "CleanedNewsConsumer")
     with (
         mock.patch.object(main_module, "load_config", return_value=CONFIG),
@@ -75,7 +85,9 @@ def infra():
         mock.patch.object(main_module, "create_state_client", create_state),
         mock.patch.object(main_module, "create_http_client", create_http),
         mock.patch.object(main_module, "refresh_hk_stock_list", refresh),
+        mock.patch.object(main_module, "create_llm_adapter", create_llm),
         mock.patch.object(main_module, "create_news_client", create_news),
+        mock.patch.object(main_module, "create_entity_analysis_service", create_service),
         mock.patch.object(main_module, "CleanedNewsConsumer", consumer_cls),
     ):
         yield calls
@@ -90,13 +102,16 @@ STARTUP_CALLS = [
     "create_stream_client",
     "create_state_client",
     "create_http_client",
+    "create_llm_adapter",
     "create_news_client",
     "refresh_hk_stock_list",
+    "create_entity_analysis_service",
     "CleanedNewsConsumer",
     "consumer_started",
 ]
 SHUTDOWN_CALLS = [
     "consumer_cancelled",
+    "llm_adapter_close",
     "http_client_aclose",
     "redis_state_close",
     "redis_stream_close",
@@ -112,10 +127,12 @@ async def lifespan(infra):
         infra.create_stream_client.assert_awaited_once_with(CONFIG.redis.stream_url)
         infra.create_state_client.assert_awaited_once_with(CONFIG.redis.state_url)
         infra.create_http_client.assert_called_once_with(CONFIG.http.timeout_s)
+        infra.create_llm_adapter.assert_called_once_with(CONFIG.llm)
         infra.create_news_client.assert_called_once_with(
             infra.create_http_client.return_value, CONFIG.entity_analysis.sadi_api_url
         )
         infra.refresh_hk_stock_list.assert_awaited_once_with()
+        infra.create_entity_analysis_service.assert_called_once_with(CONFIG.entity_analysis)
         infra.CleanedNewsConsumer.assert_called_once_with(CONFIG.entity_analysis, CONFIG.redis)
 
     assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS

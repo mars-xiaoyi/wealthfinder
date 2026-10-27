@@ -3,10 +3,10 @@ from uuid import UUID
 
 import redis.exceptions
 
-from app.clients.news_client import get_news_client
 from app.common.errors import SAPIError
 from app.common.hk_stock_list import get_hk_stock_list_cache
 from app.config import EntityAnalysisConfig, RedisConfig
+from app.entity_analysis.entity_analysis_service import get_entity_analysis_service
 from app.logger import get_logger
 from app.redis.stream_client import (
     CONSUMER_GROUP_ENTITY_ANALYSIS,
@@ -21,10 +21,10 @@ _REDIS_UNREACHABLE = (redis.exceptions.ConnectionError, redis.exceptions.Timeout
 
 
 class CleanedNewsConsumer:
-    """Consumes stream:raw_news_cleaned and fetches each article from SADI."""
+    """Consumes stream:raw_news_cleaned and analyses each article."""
 
     def __init__(self, config: EntityAnalysisConfig, redis_config: RedisConfig) -> None:
-        self._news_client = get_news_client()
+        self._service = get_entity_analysis_service()
         self._redis_stream = get_redis_stream_client()
         self._config = config
         self._reconnect_interval_s = redis_config.reconnect_interval_s
@@ -60,9 +60,9 @@ class CleanedNewsConsumer:
                 await asyncio.sleep(self._reconnect_interval_s)
 
     async def _process_one(self, message: StreamMessage) -> None:
-        """Fetch one message's article and ACK the message once its outcome is final: fetched,
-        or not found in SADI. Any other outcome, including an HK Stock List not loaded yet,
-        leaves it un-ACKed."""
+        """Analyse one message's article and ACK the message once its outcome is final:
+        analysed, or not found in SADI. Any other outcome, including an HK Stock List not loaded
+        yet, leaves it un-ACKed."""
         if len(get_hk_stock_list_cache()) == 0:
             logger.warning("hk_stock_list_not_ready", message_id=message.id)
             return
@@ -76,11 +76,7 @@ class CleanedNewsConsumer:
             return
 
         try:
-            news = await self._news_client.fetch_cleaned_news(cleaned_id)
-            if news is None:
-                logger.warning("cleaned_news_not_found", cleaned_id=str(cleaned_id))
-            else:
-                logger.info("cleaned_news_fetched", cleaned_id=str(cleaned_id))
+            await self._service.find_entity_events(cleaned_id)
             await self._redis_stream.ack(
                 STREAM_RAW_NEWS_CLEANED, CONSUMER_GROUP_ENTITY_ANALYSIS, message.id
             )
