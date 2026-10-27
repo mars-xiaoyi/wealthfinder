@@ -189,6 +189,19 @@ async def transaction_rollback_fails():
             raise error
 
     assert excinfo.value is error
+    assert conn.mock_calls == [mock.call.execute("BEGIN"), mock.call.execute("ROLLBACK")]
+    pool.release.assert_awaited_once_with(conn)
+
+
+async def transaction_cancelled():
+    """A task cancelled inside the block still rolls back and releases its connection."""
+    client, pool, conn = _make_transaction_client()
+
+    with pytest.raises(asyncio.CancelledError):
+        async with client.transaction():
+            raise asyncio.CancelledError
+
+    assert conn.mock_calls == [mock.call.execute("BEGIN"), mock.call.execute("ROLLBACK")]
     pool.release.assert_awaited_once_with(conn)
 
 

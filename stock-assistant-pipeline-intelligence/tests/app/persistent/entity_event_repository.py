@@ -122,7 +122,7 @@ async def persist_entities_success(db, tx):
         _expected_args(TENCENT, tencent),
         _expected_args(HSBC, hsbc),
     ]
-    assert calls[0].args[0] == repository_module._INSERT_ENTITY_EVENT_SQL
+    assert [call.args[0] for call in calls] == [repository_module._INSERT_ENTITY_EVENT_SQL] * 2
 
 
 async def persist_entities_conflict(db, tx):
