@@ -1029,7 +1029,7 @@ When `VertexAIAdapter` (§8) sees a 401/403 from the provider, it raises `LLMAut
 
 **DB Write Failure**
 
-All DB write operations across all layers use a unified retry utility `_db_write_with_retry()`. Retry logic is handled at the asyncpg connection pool layer; business code does not implement retry logic directly — it is a private helper internal to `app/db/`, called only by `DatabaseClient`'s own write methods (`execute()`, `execute_returning()`, `execute_conditional_update()`), never by business-logic layers directly.
+All DB write operations across all layers use a unified retry utility `_db_write_with_retry()`. Retry logic is handled at the asyncpg connection pool layer; business code does not implement retry logic directly — it is a private helper internal to `app/db/`, called only by `DatabaseClient`'s own write methods (`execute()`, `execute_returning()`, `execute_conditional_update()`, and `transaction()` when it opens its connection), never by business-logic layers directly. Inside an open transaction a lost connection can't be retried — the transaction is gone with it — so the whole unit fails, rolls back, and is redone on redelivery.
 
 **Failure classification:**
 
@@ -1047,6 +1047,7 @@ Transient failures retry with exponential backoff up to a configured max attempt
 When `RedisStreamClient` is unreachable:
 
 - Fixed interval retry every `REDIS_RECONNECT_INTERVAL_S`
+- A publish retries in place rather than giving up the message: every layer publishes after its DB writes have committed, so riding out the outage there lets the message still be ACKed once the publish lands, instead of waiting for reclaim and a republish
 - On reconnect: Consumer Group position is preserved; processing resumes automatically from last ACKed message
 - Log warning on each failed attempt
 

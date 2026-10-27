@@ -144,8 +144,7 @@ sapi/
 │   │   ├── news_client.py              # httpx client: fetch cleaned article content from SADI (Entity Analysis Layer input)
 │   │   └── admin_client.py              # httpx client: fetch source authority config from Admin (§1.5)
 │   ├── db/
-│   │   ├── connection.py                # asyncpg connection pool + DatabaseClient
-│   │   ├── utils.py                     # _db_write_with_retry() unified write utility (system-design.md §12.1)
+│   │   ├── connection.py                # asyncpg connection pool + DatabaseClient + TransactionConnection; _db_write_with_retry() unified write retry (system-design.md §12.1)
 │   │   └── errors.py                    # UniqueConstraintError / DatabaseError (driver-agnostic)
 │   ├── redis/
 │   │   ├── stream_client.py             # RedisStreamClient — messaging + reconnect logic; stream name constants
@@ -441,8 +440,8 @@ class DatabaseConfig:
     url: str                # env: DATABASE_URL
     pool_size: int           # env: DB_POOL_SIZE (default 10)
     close_timeout_s: int     # env: DB_CLOSE_TIMEOUT_S (default 10) — bound on close() (§5.1)
-    max_retry: int           # env: DB_WRITE_MAX_RETRY
-    retry_base_wait_ms: int  # env: DB_RETRY_BASE_WAIT_MS
+    max_retry: int           # env: DB_WRITE_MAX_RETRY (default 3)
+    retry_base_wait_ms: int  # env: DB_RETRY_BASE_WAIT_MS (default 100)
 ```
 
 #### Class: `HttpConfig`
@@ -1075,7 +1074,7 @@ Raises  : UniqueConstraintError (app.db.errors) on a unique-constraint
           a connection failure / after all retries exhausted.
 ```
 
-Retry classification and exception translation are identical to SADI's `DatabaseClient.execute()` (backoff `wait_ms = config.retry_base_wait_ms × 2^(attempt-1)`, max 3 attempts; `UniqueViolationError → UniqueConstraintError` with no retry; connection failures → `ServiceUnavailableError`); see SADI's doc §5.1. Only this module imports `asyncpg`.
+Retry backoff and exception classification: §5.2. Only this module imports `asyncpg`.
 
 > **Unique-constraint violations are expected** (system-design.md §12.1): a duplicate `(source_url, stock_code)` in `entity_events` or `(event_id, entity_event_id)` in `event_entity_map` is an idempotent no-op. These writes use `INSERT ... ON CONFLICT ... DO NOTHING`, so they never raise `UniqueConstraintError`.
 
@@ -1118,11 +1117,13 @@ Returns : List of asyncpg.Record; empty list if no rows found
 #### Method: `transaction() -> AsyncContextManager[TransactionConnection]`
 
 ```
-Purpose : Acquire a dedicated pool connection and open an asyncpg transaction,
-          yielding a thin wrapper exposing execute()/execute_returning() bound
-          to that single connection (same retry/exception-translation
-          semantics, applied per-statement inside the open transaction).
+Purpose : Acquire a dedicated pool connection and open a transaction on it
+          (BEGIN), yielding a thin TransactionConnection wrapper exposing
+          execute()/execute_returning() bound to that single connection.
           Commits on clean exit; rolls back on any exception.
+          Opening — acquire + BEGIN — goes through _db_write_with_retry() (§5.2);
+          statements inside the open transaction get the same exception
+          translation but no retry (system-design.md §12.1).
 Used by : EventRepository's persist_events() (§10.2) — Upserting every active
           Redis Event to `events` and writing all of its entity_event_map
           rows must commit together as one unit, so a mid-flush failure
@@ -1176,27 +1177,35 @@ Purpose : Gracefully close the underlying connection pool, bounded by timeout_s
 Called  : In the FastAPI lifespan shutdown, registered on its exit stack (§16).
 ```
 
-### 5.2 `app/db/utils.py` — `_db_write_with_retry()`
+### 5.2 `_db_write_with_retry()` — `app/db/connection.py`
 
-All DB writes go through `_db_write_with_retry()` (system-design.md §12.1), a private helper in `app/db/` called only by `DatabaseClient.execute()` and `execute_returning()` (§5.1). The retry policy is defined once, whether the write goes through the pool or an open `transaction()` connection.
+All DB writes go through `_db_write_with_retry()` (system-design.md §12.1), a private module-level helper beside `DatabaseClient` in `connection.py`, called only by `DatabaseClient`'s write methods (§5.1): `execute()`/`execute_returning()` wrap a whole pooled statement in it, `transaction()` wraps opening its connection. The retry policy is defined once.
 
-#### Function: `_db_write_with_retry(conn_or_pool, config: DatabaseConfig, query: str, args: tuple, *, returning: bool = False) -> Optional[asyncpg.Record]`
+#### Function: `_db_write_with_retry[T](config: DatabaseConfig, write: Callable[[], Awaitable[T]]) -> T`
 
 ```
-Purpose : Execute one write statement against either a Pool or a single
-          Connection (transaction() passes its held Connection through here
-          so retries inside a transaction retry the same statement on the
-          same connection, not a fresh one from the pool).
-Params  : conn_or_pool — asyncpg.Pool or asyncpg.Connection
-          config       — DatabaseConfig (retry_base_wait_ms, max_retry)
-          query, args  — the statement to execute
-          returning    — if True, return the first row (or None on a
-                         no-op ON CONFLICT DO NOTHING); if False, return None
-Raises  : UniqueConstraintError / DatabaseError / ServiceUnavailableError
-          (app.db.errors) — same classification as SADI's DatabaseClient.execute()
+Purpose : Run write(), retrying it while it fails in a way a fresh attempt can
+          clear, and translate every asyncpg error into app.db.errors /
+          app.common.errors.
+Params  : config — DatabaseConfig (max_retry, retry_base_wait_ms)
+          write  — the attempt to run: acquire a connection and run one
+                   statement, or (transaction()) acquire one and BEGIN
+Returns : write()'s result.
+Raises  : ServiceUnavailableError once max_retry attempts have failed or the
+          database is unreachable; UniqueConstraintError / DatabaseError on any
+          other database failure, without retry.
 ```
 
-Retry/backoff formula and asyncpg exception classification: identical to SADI's `DatabaseClient.execute()` — see `stock-assistant-data-ingestion/docs/implementation.md` §5.1 for the full table (`TooManyConnectionsError`/`ConnectionDoesNotExistError` retried; `UniqueViolationError`/`DataError`/`NotNullViolationError` not retried; `PostgresConnectionError`/`InterfaceError` → `ServiceUnavailableError`; any other `PostgresError` → `DatabaseError` as a safety net).
+Backoff `wait_ms = config.retry_base_wait_ms × 2^(attempt-1)`, a WARNING `db_write_retrying` per retried attempt. Classification:
+
+| asyncpg error | Handling |
+|---|---|
+| `TooManyConnectionsError`, `PostgresConnectionError` (incl. `ConnectionDoesNotExistError`), `CannotConnectNowError`, `OSError` (refused/reset TCP) | retried; `ServiceUnavailableError` once `max_retry` attempts failed |
+| `InterfaceError` (closed pool/connection) | `ServiceUnavailableError`, no retry |
+| `UniqueViolationError` | `UniqueConstraintError(constraint_name)`, no retry |
+| any other `PostgresError` (`DataError`, `NotNullViolationError`, …) | `DatabaseError`, no retry |
+
+The same translation, without the retry, applies to `fetch_one()`/`fetch_all()` and to statements inside an open `transaction()`.
 
 ### 5.3 `app/db/errors.py`
 
@@ -1279,10 +1288,10 @@ CONSUMER_GROUP_CACHE        = "sapi-cache"
 
 ```python
 class RedisStreamClient:
-    def __init__(self, client: redis.asyncio.Redis): ...
+    def __init__(self, client: redis.asyncio.Redis, reconnect_interval_s: int): ...
 ```
 
-**Constructor:** accepts an already-connected `redis.asyncio.Redis` instance. Use `create_stream_client()` instead of calling this directly.
+**Constructor:** accepts an already-connected `redis.asyncio.Redis` instance and `REDIS_RECONNECT_INTERVAL_S` (`publish()`'s retry interval, below). Use `create_stream_client()` instead of calling this directly.
 
 #### Data Structures: `StreamMessage`, `ReclaimedMessage`
 
@@ -1303,7 +1312,7 @@ class ReclaimedMessage(StreamMessage):
 
 Same shape as `get_db_client()` (§5.1): raises `ServiceUnavailableError` if called before `create_stream_client()` has run.
 
-#### Function: `create_stream_client(redis_url: str) -> RedisStreamClient`
+#### Function: `create_stream_client(redis_url: str, reconnect_interval_s: int) -> RedisStreamClient`
 
 ```
 Purpose : Create a Redis connection pool, verify connectivity with PING,
@@ -1320,7 +1329,10 @@ Implementation is identical to SADI's `create_stream_client()` (`decode_response
 ```
 Purpose : Write a message to a Redis Stream (XADD). All fields must be strings
           — convert UUIDs, floats, etc. before calling. Callers always include
-          "v": "1" alongside the business fields.
+          "v": "1" alongside the business fields. While the stream Redis is
+          unreachable (redis.ConnectionError / redis.TimeoutError), logs WARNING
+          redis_stream_publish_retrying, sleeps reconnect_interval_s and retries
+          the same XADD — indefinitely, until it is written (cancellable).
 Returns : The Redis message ID.
 ```
 
@@ -1394,7 +1406,7 @@ async def ping(self) -> None:
 
 #### Reconnect behaviour
 
-Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`/`autoclaim()`/`publish()` let `redis.ConnectionError` and `redis.TimeoutError` through untranslated. Each layer's consumer loop catches them around its own calls, logs a WARNING (`entity_analysis_redis_stream_unreachable` in §11.2), sleeps `REDIS_RECONNECT_INTERVAL_S` and loops again — indefinitely, so no separate reconnect loop exists inside `RedisStreamClient`. Consumer Group position is preserved server-side across the outage; processing resumes from the last ACKed message once the connection returns.
+Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`/`autoclaim()` let `redis.ConnectionError` and `redis.TimeoutError` through untranslated. Each layer's consumer loop catches them around its own calls, logs a WARNING (`entity_analysis_redis_stream_unreachable` in §11.2), sleeps `REDIS_RECONNECT_INTERVAL_S` and loops again — indefinitely. `publish()` is the exception and retries in place (above; rationale: system-design.md §12.1). Consumer Group position is preserved server-side across the outage; processing resumes from the last ACKed message once the connection returns.
 
 #### Reclaim and Dead Letter pattern
 
@@ -3448,7 +3460,7 @@ The same `WorkerPool` class is used, as independent instances, by Entity Analysi
 | `LLMRateLimitError` | Caught inside `run()` → `result.failure_reason` is the `LLMRateLimitError`, never raised; `EntityAnalysisService.find_entity_events()` logs `entity_analysis_completed` and re-raises `LLMRateLimitError` itself; `CleanedNewsConsumer` calls `WorkerPool.trigger_backoff()`, does not ACK |
 | All entities filtered out | Valid `output_items=[]`; no row written, nothing published, `find_entity_events()` returns normally, `CleanedNewsConsumer` ACKs |
 | `cleaned_id` missing from SADI | `NewsClient.fetch_cleaned_news()` returns `None`; `EntityAnalysisService.find_entity_events()` logs warning, returns normally (not an error, system-design.md §3.6); `CleanedNewsConsumer` ACKs (retry can't help) |
-| DB write failure | `DatabaseClient.execute_returning()` raises `ServiceUnavailableError` after retries exhausted; `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s outer `except Exception`, no ACK, logs ERROR (genuinely unanticipated by this method) |
+| DB write failure | `EntityEventRepository.persist_entities()`'s transaction (§5.1) rolls back and raises `ServiceUnavailableError` (connection unusable / retries exhausted) or `DatabaseError`; `EntityAnalysisService.find_entity_events()` doesn't catch it — `CleanedNewsConsumer._process_one()`'s `except SAPIError` logs it at its own level, no ACK (§11.2) |
 | SADI API failure | `NewsClient` raises `ServiceUnavailableError` (`COMMON-5002`) or, for an unexpected body, `ParseError` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s `except SAPIError`, which logs it at its own `log_level` (WARNING for `COMMON-5002`, ERROR for `ParseError`); no ACK |
 | `RedisStreamClient` unreachable | `redis.ConnectionError`/`redis.TimeoutError` caught by `CleanedNewsConsumer._consumer_loop()` around its `read_from()`/`ack()` calls: WARNING `entity_analysis_redis_stream_unreachable`, sleep `REDIS_RECONNECT_INTERVAL_S`, read again (§6.1's reconnect behaviour) |
 | HK Stock List not ready (`len(get_hk_stock_list_cache()) == 0`) | `CleanedNewsConsumer._process_one()`'s first check, before the in-flight Set and before `EntityAnalysisService` is called at all (§11.1); log warning `hk_stock_list_not_ready`; no ACK — never reaches `news_client.fetch_cleaned_news()` or `entity_skill.run()` at all, so no entity ever gets a permanently-wrong empty-result outcome from this cause |
@@ -5273,7 +5285,7 @@ async def lifespan(app: FastAPI):
 
         db = await create_db_client(config.db)
         resources.push_async_callback(db.close, config.db.close_timeout_s)
-        redis_stream = await create_stream_client(config.redis.stream_url)
+        redis_stream = await create_stream_client(config.redis.stream_url, config.redis.reconnect_interval_s)
         resources.push_async_callback(redis_stream.close)
         redis_state = await create_state_client(config.redis.state_url)
         resources.push_async_callback(redis_state.close)
