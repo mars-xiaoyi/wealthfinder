@@ -150,18 +150,27 @@ def adapter(monkeypatch):
 
 
 async def find_entity_events_success(news_client, adapter, repository, redis_stream):
+    """Every EntityEvent is announced only after the whole article has been stored."""
     persisted = [_entity_event(TENCENT, UUID(int=1)), _entity_event(HSBC, UUID(int=2))]
     repository.persist_entities.return_value = persisted
+    calls = mock.MagicMock()
+    calls.attach_mock(repository.persist_entities, "persist_entities")
+    calls.attach_mock(redis_stream.publish, "publish")
 
     entity_events = await EntityAnalysisService(CONFIG).find_entity_events(CLEANED_ID)
 
     assert entity_events == persisted
     news_client.fetch_cleaned_news.assert_awaited_once_with(CLEANED_ID)
     repository.fetch_entity_event_ids_by_source_url.assert_awaited_once_with(ARTICLE.source_url)
-    repository.persist_entities.assert_awaited_once_with(
-        [_entity_event(TENCENT), _entity_event(HSBC)]
-    )
-    assert redis_stream.publish.await_args_list == _published(UUID(int=1), UUID(int=2))
+    assert calls.mock_calls == [
+        mock.call.persist_entities([_entity_event(TENCENT), _entity_event(HSBC)]),
+        mock.call.publish(
+            STREAM_ENTITY_EVENT_COMPLETED, {"entity_event_id": str(UUID(int=1)), "v": "1"}
+        ),
+        mock.call.publish(
+            STREAM_ENTITY_EVENT_COMPLETED, {"entity_event_id": str(UUID(int=2)), "v": "1"}
+        ),
+    ]
 
 
 async def find_entity_events_partly_persisted(news_client, adapter, repository, redis_stream):

@@ -82,6 +82,7 @@ async def fetch_one_no_row():
         pytest.param(asyncpg.InterfaceError("pool closed"), id="interface_error"),
         pytest.param(asyncpg.TooManyConnectionsError("too many"), id="too_many_connections"),
         pytest.param(OSError("refused"), id="os_error"),
+        pytest.param(asyncpg.CannotConnectNowError("starting up"), id="cannot_connect_now"),
     ],
 )
 async def fetch_one_with_connection_failures(error):
@@ -128,14 +129,21 @@ async def fetch_all_success():
     conn.fetch.assert_awaited_once_with("SELECT $1", 1)
 
 
-async def fetch_all_with_connection_failure():
+@pytest.mark.parametrize(
+    ("error", "expected_cls"),
+    [
+        pytest.param(asyncpg.PostgresConnectionError("lost"), ServiceUnavailableError, id="lost"),
+        pytest.param(asyncpg.PostgresError("syntax error"), DatabaseError, id="postgres"),
+    ],
+)
+async def fetch_all_failure(error, expected_cls):
     client, _, conn = _make_client()
-    error = asyncpg.PostgresConnectionError("lost")
     conn.fetch = AsyncMock(side_effect=error)
 
-    with pytest.raises(ServiceUnavailableError) as excinfo:
+    with pytest.raises(expected_cls) as excinfo:
         await client.fetch_all("SELECT 1")
 
+    assert type(excinfo.value) is expected_cls
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
 
@@ -206,7 +214,6 @@ async def transaction_commit_fails():
 @pytest.mark.parametrize(
     ("error", "expected_cls"),
     [
-        pytest.param(asyncpg.UniqueViolationError("dup"), UniqueConstraintError, id="unique"),
         pytest.param(
             asyncpg.ConnectionDoesNotExistError("lost"), ServiceUnavailableError, id="lost"
         ),
@@ -233,8 +240,9 @@ async def execute_returning_failure(error, expected_cls):
     pool.release.assert_awaited_once_with(conn)
 
 
-async def execute_returning_unique_violation_constraint_name():
-    client, _, conn = _make_transaction_client()
+async def execute_returning_unique_violation():
+    """Like any failed statement, but the error also names the violated constraint."""
+    client, pool, conn = _make_transaction_client()
     error = asyncpg.UniqueViolationError("dup")
     error.constraint_name = "uq_entity_events_source_url_stock_code"
     conn.fetchrow.side_effect = error
@@ -246,6 +254,12 @@ async def execute_returning_unique_violation_constraint_name():
     assert excinfo.value.constraint_name == "uq_entity_events_source_url_stock_code"
     assert excinfo.value.category is ErrorCategory.DB
     assert excinfo.value.__cause__ is error
+    assert conn.mock_calls == [
+        mock.call.execute("BEGIN"),
+        mock.call.fetchrow("INSERT $1", 1),
+        mock.call.execute("ROLLBACK"),
+    ]
+    pool.release.assert_awaited_once_with(conn)
 
 
 @pytest.mark.parametrize(

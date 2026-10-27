@@ -32,9 +32,9 @@ class EntityEventRepository:
 
     async def persist_entities(self, entities: list[EntityEvent]) -> list[EntityEvent]:
         """
-        Write the entities as one unit: either all of them are stored or none is. Returns the
-        ones newly stored, each with its entity_event_id and created_at set; an entity whose
-        article and stock already have a row is left out.
+        Write the entities as one unit: if any write fails, none is stored. Returns the ones
+        newly stored, each with its entity_event_id and created_at set; an entity whose article
+        and stock already have a row is left out.
         Raises ServiceUnavailableError if the database is unreachable, DatabaseError on any
         other database failure.
         """

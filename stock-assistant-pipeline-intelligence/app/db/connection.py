@@ -38,7 +38,7 @@ def _translated_errors() -> Iterator[None]:
             f"DB connection error: {exc!r}", category=ErrorCategory.DB
         ) from exc
     except asyncpg.PostgresError as exc:
-        raise DatabaseError(str(exc), category=ErrorCategory.DB) from exc
+        raise DatabaseError(f"DB error: {exc!r}", category=ErrorCategory.DB) from exc
 
 
 async def _db_write_with_retry[T](config: DatabaseConfig, write: Callable[[], Awaitable[T]]) -> T:
