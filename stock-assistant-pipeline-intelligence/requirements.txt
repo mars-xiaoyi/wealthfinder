@@ -11,6 +11,9 @@ openpyxl==3.1.5
 # HK Stock List name matching (traditional to simplified Chinese)
 opencc==1.4.2
 
+# LLM (Vertex AI)
+google-genai==2.33.0
+
 # Logging
 structlog==26.1.0
 

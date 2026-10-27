@@ -8,3 +8,9 @@ SERVICE_UNAVAILABLE = (
 )
 UPSTREAM_UNAVAILABLE = "COMMON-5002"  # Third-party tools or outside services unavailable
 PARSE_ERROR = "COMMON-6000"  # Structured or unstructured content cannot be parsed
+LLM_ERROR = "COMMON-7000"  # LLM call failed
+LLM_RATE_LIMITED = "COMMON-7001"  # LLM provider rate limit hit
+LLM_PROVIDER_ERROR = "COMMON-7002"  # LLM provider error, network error or timeout
+LLM_AUTHENTICATION_FAILED = "COMMON-7003"  # LLM provider rejected the credentials
+LLM_SCHEMA_VIOLATION = "COMMON-7004"  # LLM response did not match the output schema
+LLM_REQUEST_REJECTED = "COMMON-7005"  # LLM provider rejected the request itself
