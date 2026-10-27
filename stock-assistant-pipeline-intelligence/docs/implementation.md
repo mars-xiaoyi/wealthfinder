@@ -1215,7 +1215,7 @@ from app.common.errors import SAPIError   # §15.1
 class UniqueConstraintError(SAPIError):
     """Raised on a unique-constraint violation not already absorbed by ON CONFLICT DO NOTHING."""
     error_type = ErrorType.STORAGE
-    error_code = error_codes.INTERNAL_ERROR
+    error_code = error_codes.UNIQUE_CONSTRAINT_VIOLATED
 
     def __init__(self, constraint_name: str):
         super().__init__(f"unique constraint violated: {constraint_name}")
@@ -1224,7 +1224,7 @@ class UniqueConstraintError(SAPIError):
 class DatabaseError(SAPIError):
     """Raised on any other data-integrity failure."""
     error_type = ErrorType.STORAGE
-    error_code = error_codes.INTERNAL_ERROR
+    error_code = error_codes.DATABASE_ERROR
 ```
 
 Both subclass `SAPIError` (§15.1) so a catch-all `except Exception` can't swallow them as unanticipated bugs.
@@ -4978,6 +4978,8 @@ LLM_PROVIDER_ERROR = "COMMON-7002"         # LLM provider error, network error o
 LLM_AUTHENTICATION_FAILED = "COMMON-7003"  # LLM provider rejected the credentials
 LLM_SCHEMA_VIOLATION = "COMMON-7004"       # LLM response did not match the output schema
 LLM_REQUEST_REJECTED = "COMMON-7005"       # LLM provider rejected the request itself
+DATABASE_ERROR = "COMMON-8000"             # Database failure other than an unreachable database
+UNIQUE_CONSTRAINT_VIOLATED = "COMMON-8001" # Write violated a unique constraint
 MALFORMED_REQUEST = "COMMON-4000"          # Request body is not valid JSON
 VALIDATION_FAILED = "COMMON-4001"          # Request fields failed validation
 NOT_FOUND = "COMMON-4004"                  # Requested resource does not exist
