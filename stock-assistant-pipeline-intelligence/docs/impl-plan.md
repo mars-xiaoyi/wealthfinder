@@ -169,7 +169,7 @@ This document does not introduce new design — every ticket below implements so
 - `lookup_stock_completed` carries every §4.2 field, at WARNING above the threshold.
 - Unit-tested against a seeded `HKStockListCache`.
 **Docs:** impl.md §4.2; design.md §9.2, §9.2.1. Validated by: Entity Analysis: Post-Release Tuning Validation (Q-16 at scale, I-1's real-traffic part).
-**Explicitly deferred:** `_name_consistent()` calling `name_matches_stock()`, and the `_verify_mention()` call site (LLM Entity Extraction).
+**Explicitly deferred:** `_name_consistent()` calling `name_matches_stock()`, and the `_verify_entity()` call site (LLM Entity Extraction).
 
 ---
 
@@ -195,15 +195,15 @@ This document does not introduce new design — every ticket below implements so
 **Scope:** Run `EntityAnalysisSkill` on each fetched article and act on its result — no persistence or publishing yet (impl.md §7, §8.1, §8.2, §11.1 steps 1–2 and 4–6, up to building `EntityEvent`s).
 - `app/config.py`: `LLMConfig` minus `rate_limit_backoff_s`; `EntityAnalysisConfig` gains `max_input_chars`.
 - `app/llm/`: `adapter.py` (`GenerationConfig`, `Message`, `StructuredLLMResponse`, `LLMAdapter`), `errors.py` (§7.2), `vertex_adapter.py` — `VertexAIAdapter.generate_structured()` (native structured output, `HttpOptions` timeout, no SDK retries, thinking tokens counted as output, error mapping) + `create_llm_adapter()`/`get_llm_adapter()` (§7.1–§7.3); `google-genai==2.33.0` in `requirements.txt`; the `COMMON-7000`–`7005` error codes and `ErrorCategory.LLM` (§15.1).
-- `app/models/`: `enums.py` (§3.1), `versioned_metadata.py` (§3.2), `AnalysisOutcome`/`EntityEvent` in `entity_event.py` (§11.1).
-- `app/skills/`: `skill_base.py` (§8.1); `entity_analysis_skill.py` (§8.2) — one structured-output call on the body cut to `max_input_chars`, verbatim system prompt and few-shot examples, `_verify_mention()` (code on the list and `name_matches_stock()`, else the code printed in the article, else `lookup_stock()`), each verified company returned as a `VerifiedEntity` with its `Stock`, dropped mentions, business-constraint validation, dedup backstop.
+- `app/models/`: `versioned_metadata.py` (§3.2); `entity_event.py` with `EventTypeEnum`/`SentimentEnum` (§3.1) and `AnalysisOutcome`/`EntityEvent` (§11.1).
+- `app/skills/`: `skill_base.py` (§8.1); `entity_analysis_skill.py` (§8.2) — one structured-output call on the body cut to `max_input_chars`, verbatim system prompt and few-shot examples, `_verify_entity()` (code on the list and `name_matches_stock()`, else the code printed in the article, else `lookup_stock()`), each verified company returned as a `VerifiedEntity` with its `Stock`, unverified entities recorded, business-constraint validation, dedup backstop.
 - `app/entity_analysis/entity_analysis_service.py`: `EntityAnalysisService` + singleton (§11.1), getting only `NewsClient`; `find_entity_events()` runs steps 1–2 and 4–6 and logs `entity_analysis_completed` without `entity_event_ids`.
 - `CleanedNewsConsumer._process_one()`: after the readiness gate, calls the Service instead of `NewsClient`; an `LLMError` the Service re-raises is caught and logged by the existing `except SAPIError`, with the `cleaned_id`, and leaves the message un-ACKed (§11.2). The existing catch-all stays as it is.
 - `app/main.py`: `create_llm_adapter()` (closed on shutdown) and `create_entity_analysis_service()` in the lifespan (§16).
 **Acceptance criteria** (per impl.md §7.2/§7.3/§8.1/§8.2/§11.1/§11.4):
 - One `generate_structured()` call per article with `_GENERATION_CONFIG` (`gemini-3.1-flash-lite`, temperature 0, max output tokens 16384, §8's table); the body is cut to `ENTITY_ANALYSIS_MAX_INPUT_CHARS`, and `input_truncated` says whether it was.
-- `_verify_mention()` follows §8.2: code normalization per design.md §9.2; a listed code is accepted on a name match or a code-shaped printing in the article (a bare number never counts, and a bracketed one only with at least 3 digits); otherwise the name goes through `lookup_stock()`; an unresolved mention is dropped into `dropped_mentions` with `not_in_hk_stock_list`.
-- Every row of §8.2's Business Constraint Validation table applied and logged without setting `failure_reason`; two mentions verifying to the same code keep the first.
+- `_verify_entity()` follows §8.2: code normalization per design.md §9.2; a listed code is accepted on a name match or a code-shaped printing in the article (a bare number never counts, and a bracketed one only with at least 3 digits); otherwise the name goes through `lookup_stock()`; an unresolved entity is recorded in `unverified_entities` with `not_in_hk_stock_list`.
+- Every row of §8.2's Business Constraint Validation table applied and logged without setting `failure_reason`; two entities verifying to the same code keep the first.
 - `VertexAIAdapter`: 429 → `LLMRateLimitError`, 401/403 → `LLMAuthenticationError`, any other 4xx → `LLMRequestError`, any other API error, network error or timeout → `LLMProviderError`, unparseable output → `LLMSchemaViolationError`, each with §7.2's error code and log level; `output_tokens` includes thinking tokens; one SDK attempt per call, timed out at `LLM_API_TIMEOUT_S`.
 - `SkillBase.run()`: every LLM exception → `failure_reason` is the caught error, returned rather than logged; anything else propagates uncaught.
 - `find_entity_events()`: one `EntityEvent` per verified entity, carrying the `Stock` it was verified against; a Skill failure logs `entity_analysis_completed` and re-raises the original exception.

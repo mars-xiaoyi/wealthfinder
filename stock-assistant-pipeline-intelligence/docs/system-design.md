@@ -773,9 +773,9 @@ EntityAnalysisSkill's structured-output call (§9.4) returns, for every company 
 
 1. The code is in the list and the listed name agrees with the model's name (one is an ordered subsequence of the other after normalization). This catches a real company carrying the wrong code.
 2. Or the article itself prints that code in a code-shaped form (`(0700)`, `00700.HK`, `Stock Code: 700`). The article's own label is trusted where names differ, such as an English legal name against a Chinese short name.
-3. Otherwise a name search over the list, `lookup_stock()` (below). A miss drops the mention.
+3. Otherwise a name search over the list, `lookup_stock()` (below). A miss drops the entity.
 
-A mention that resolves through none of these is dropped, never guessed at. Exact rules: implementation.md §8.2 (`_verify_mention()`).
+An entity that resolves through none of these is dropped, never guessed at. Exact rules: implementation.md §8.2 (`_verify_entity()`).
 
 **Why verification is code-side rather than an LLM tool loop.** Measured on real SADI articles (2026-10-24/25): articles almost always print the code, and the model knows most HKEX codes, so verification is a deterministic check rather than a search the model has to drive. One call per article instead of three to four removes the per-call failure exposure (timeouts and 429s compound per round) and the loop's own failure modes — repeated lookups of an already-verified code until the round cap, and dense market wraps needing more rounds than any fixed cap — at a seventh to a fifteenth of the cost, with equal or better entity accuracy (F1 0.962 against 0.930 for the tool loop on 127 unseen articles). The trade-off is articles that name companies without printing any code: they rely on the model's own code knowledge plus the name search, and recall there is lower (F1 0.91 against 0.98 when every code is stripped from the test set, a worst case). About 6% of real articles name a listed company with no code anywhere in the article, mostly sector roundups; single-company stories almost always print it.
 
@@ -788,7 +788,7 @@ A mention that resolves through none of these is dropped, never guessed at. Exac
 
 - **Normalization:** traditional characters are folded to simplified (OpenCC), so variants such as 恆/恒 and 滙/匯 compare equal. Full-width characters are folded to ASCII, case and whitespace are ignored, and HKEX counter markers (`－Ｗ`, `-SW`) are dropped. Each name is also compared with its legal suffix (有限公司, Limited) removed, and then its generic tail (控股, Holdings, Group) too.
 - **Ordered subsequence:** a Chinese abbreviation is an ordered subsequence of the full name, with characters taken from anywhere in it (農行 ⊂ 農業銀行, 國壽 ⊂ 中國人壽), and a listed short name is an ordered subsequence of the issuer's legal name (赤峰黃金 ⊂ 赤峰吉隆黃金礦業集團). The search ranks hits by how compactly the query sits inside the name. English names match word by word, with a word matching a longer word it is a prefix of (DEV ⊂ DEVELOPMENT).
-- **A tie between companies is a miss, not a guess.** A wrong match becomes a false entity silently, while a miss drops one mention, and the article usually prints the code that step 2 accepts. Breaking ties by lowest stock code was measured and rejected: it turned 9 misses into 3 right answers and 6 wrong ones.
+- **A tie between companies is a miss, not a guess.** A wrong match becomes a false entity silently, while a miss drops one entity, and the article usually prints the code that step 2 accepts. Breaking ties by lowest stock code was measured and rejected: it turned 9 misses into 3 right answers and 6 wrong ones.
 
 Exact algorithm: implementation.md §4.2 (company-name matching).
 
@@ -941,7 +941,7 @@ entity_analysis_completed.cleaned_id
 entity_analysis_completed.entity_event_ids[]
     → JOIN entity_events on entity_event_id, one row per array element
       (0 rows joined for an article with no verified entities)
-    → Analyse: dropped_mentions patterns, input_truncated rate,
+    → Analyse: unverified_entities patterns, input_truncated rate,
                token consumption per article, latency trends by skill_version
 
 brief_summary_completed.event_id

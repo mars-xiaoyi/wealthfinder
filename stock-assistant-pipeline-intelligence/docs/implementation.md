@@ -105,7 +105,7 @@ sapi/
 ├── app/
 │   ├── skills/
 │   │   ├── skill_base.py                # SkillInput/SkillResult base types + LlmCallMetric/LlmErrorEntry + SkillBase: run() template method + llm_process/build_fail_result — parent of all three Skills (§8.1)
-│   │   ├── entity_analysis_skill.py     # EntityAnalysisSkill; EntityAnalysisInput; llm_process (one structured-output call); _verify_mention; EntityMention/LLMOutput/EntityAnalysisResult (AnalysisOutcome itself lives in app/models/entity_event.py, §11.1)
+│   │   ├── entity_analysis_skill.py     # EntityAnalysisSkill; EntityAnalysisInput; llm_process (one structured-output call); _verify_entity; ExtractedEntity/LLMOutput/EntityAnalysisResult (AnalysisOutcome itself lives in app/models/entity_event.py, §11.1)
 │   │   ├── brief_summary_skill.py       # BriefSummarySkill; BriefSummaryInput; llm_process; input construction; fallback; BriefSummaryResult (BriefSummary itself is in app/models/event.py)
 │   │   └── event_scoring_skill.py       # EventLLMScoringSkill; EventLLMScoringInput; llm_process; fallback; EventLLMScoringResult (LLMScore itself is in app/models/event_score.py)
 │   ├── entity_analysis/
@@ -156,9 +156,8 @@ sapi/
 │   │   ├── event_score_repository.py    # EventScoreRepository: persist_score_if_not_stale(), fetch_scores() — event_scores reads/writes
 │   │   └── cache_store.py                # CacheStore: morning_brief:* key ownership — version counter, versioned SET/DEL, orphan scan (§10.4)
 │   ├── models/
-│   │   ├── enums.py                     # EventTypeEnum, SentimentEnum — shared domain vocabulary
 │   │   ├── versioned_metadata.py        # VersionedMetadata[T] (no serialization method — each write site builds its own dict) — shared by entity_event.py/event.py/event_score.py
-│   │   ├── entity_event.py              # AnalysisOutcome (EntityAnalysisSkill's output schema, §8.2) + EntityEvent — the entity_events row itself: Skill-output hand-off, persist target, and read-back shape (§11.1, §12.1)
+│   │   ├── entity_event.py              # EventTypeEnum/SentimentEnum (§3.1) + AnalysisOutcome (EntityAnalysisSkill's output schema, §8.2) + EntityEvent — the entity_events row itself: Skill-output hand-off, persist target, and read-back shape (§11.1, §12.1)
 │   │   ├── event.py                     # Event dataclass + BriefSummary (BriefSummarySkill's output type, reused directly)
 │   │   ├── event_score.py               # EventScore dataclass + RuleScore (compute_rule_score()'s own return type, reused directly) + LLMScore (Skill's own output type, reused directly)
 │   │   └── event_entity_map.py          # EventEntityMap dataclass
@@ -194,14 +193,14 @@ sapi/
 
 Data models are plain Python dataclasses, one per DB table (system-design.md §10). Pydantic schemas for the API live in `app/api/schemas.py`; Skill inputs and Result wrappers live in each Skill's own module (§8). The exceptions are the Skill output schemas `AnalysisOutcome`, `BriefSummary` and `LLMScore`: each is also the type its DB-model field wraps, so it is defined in `app/models/` (§11.1, §3.3, §13.1).
 
-### 3.1 `app/models/enums.py`
+### 3.1 `EventTypeEnum`, `SentimentEnum` — `app/models/entity_event.py`
 
-`EventTypeEnum` and `SentimentEnum` are shared domain vocabulary used by `EntityEvent`/`Event` (§11.1, §3.3) and the API schemas, so they live in `app/models/`; `app/api/schemas.py` (§3.5) imports them.
+The event vocabulary of an entity's analysis, defined in `app/models/entity_event.py` beside `AnalysisOutcome` (§11.1), which they describe. `Event` (§3.3) and `app/api/schemas.py` (§3.5) import them from there.
 
 ```python
-from enum import Enum
+from enum import StrEnum
 
-class EventTypeEnum(str, Enum):
+class EventTypeEnum(StrEnum):
     EARNINGS = "EARNINGS"
     BUYBACK = "BUYBACK"
     MA = "MA"
@@ -211,7 +210,7 @@ class EventTypeEnum(str, Enum):
     DIVIDEND = "DIVIDEND"
     GENERAL_ANNOUNCEMENT = "GENERAL_ANNOUNCEMENT"
 
-class SentimentEnum(str, Enum):
+class SentimentEnum(StrEnum):
     POSITIVE = "POSITIVE"
     NEUTRAL = "NEUTRAL"
     NEGATIVE = "NEGATIVE"
@@ -315,7 +314,7 @@ class EventEntityMap:
 
 ### 3.5 `app/api/schemas.py` — Pydantic Schemas
 
-These mirror `docs/api.md` §3. `EventTypeEnum` and `SentimentEnum` are imported from `app.models.enums` (§3.1).
+These mirror `docs/api.md` §3. `EventTypeEnum` and `SentimentEnum` are imported from `app.models.entity_event` (§3.1).
 
 ```python
 from pydantic import BaseModel, Field
@@ -324,7 +323,7 @@ from typing import List, Optional, Union
 from datetime import datetime
 from enum import Enum
 
-from app.models.enums import EventTypeEnum, SentimentEnum
+from app.models.entity_event import EventTypeEnum, SentimentEnum
 
 class HealthStatus(str, Enum):
     HEALTHY = "healthy"
@@ -613,7 +612,7 @@ config = get_config()
 
 ### 4.2 HK Stock List — `app/common/hk_stock_list.py`
 
-Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s verification step (§8.2) reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. The two name checks of `EntityAnalysisSkill._verify_mention()` (§8.2) live here too, because both read the cache's name index: `name_matches_stock()` (step 1) and `lookup_stock()` (step 3).
+Its own section because it isn't only an LLM concern: `EntityAnalysisSkill`'s verification step (§8.2) reads it, `POST /admin/hk-stock-list-sync` (§15.5) refreshes it, and `GET /health` (§15.2) gates readiness on it. The two name checks of `EntityAnalysisSkill._verify_entity()` (§8.2) live here too, because both read the cache's name index: `name_matches_stock()` (step 1) and `lookup_stock()` (step 3).
 
 **In-process only, no Redis** (rationale: system-design.md §9.2.1). One shared mutable `HKStockListCache` instance holds the fetch result.
 
@@ -697,7 +696,7 @@ def get_hk_stock_list_cache() -> HKStockListCache:
 
 #### Company-name matching
 
-One normalizer and one name index serve both name checks in `_verify_mention()` (§8.2): `name_matches_stock()` (step 1) and `lookup_stock()` (step 3). Rationale: system-design.md §9.2. Traditional-to-simplified folding needs `opencc` (runtime dependency). Everything below is private except the index types and the two checks.
+One normalizer and one name index serve both name checks in `_verify_entity()` (§8.2): `name_matches_stock()` (step 1) and `lookup_stock()` (step 3). Rationale: system-design.md §9.2. Traditional-to-simplified folding needs `opencc` (runtime dependency). Everything below is private except the index types and the two checks.
 
 **Normalization.** Each name has up to three variants, distinct, longest first: the normalized name, then without its legal suffix, then also without its generic tail (騰訊控股有限公司 → 腾讯控股有限公司, 腾讯控股, 腾讯):
 
@@ -795,9 +794,9 @@ The tightest span is the earliest-ending match, started as late as that end allo
 #### Function: `lookup_stock(name: str) -> Optional[Stock]`
 
 ```
-Purpose : Name search over the HK Stock List: step 3 of EntityAnalysisSkill._verify_mention() (§8.2),
-          for a mention whose code is missing or does not check out.
-Params  : name — the mention's company_name as the LLM wrote it
+Purpose : Name search over the HK Stock List: step 3 of EntityAnalysisSkill._verify_entity() (§8.2),
+          for an extracted entity whose code is missing or does not check out.
+Params  : name — the extracted entity's company_name as the LLM wrote it
 Returns : Stock on a unique best match, None on a miss (no match, or a tie between companies).
 ```
 
@@ -808,7 +807,7 @@ def lookup_stock(name: str) -> Optional[Stock]:
     return hk_stock_list_cache.entries[code] if code else None
 ```
 
-No cache parameter: it reads `.entries` and `.name_index` off one `get_hk_stock_list_cache()` instance. It always searches by name: codes are checked in `_verify_mention()` step 1, which handles code normalization (system-design.md §9.2).
+No cache parameter: it reads `.entries` and `.name_index` off one `get_hk_stock_list_cache()` instance. It always searches by name: codes are checked in `_verify_entity()` step 1, which handles code normalization (system-design.md §9.2).
 
 #### Performance verification — `lookup_stock_completed` log event
 
@@ -1563,6 +1562,7 @@ from app.common.errors import ErrorType, SAPIError   # §15.1
 
 class LLMError(SAPIError):
     """Common base for the typed exceptions below."""
+    error_type = ErrorType.LLM
     error_code = error_codes.LLM_ERROR
 
 class LLMRateLimitError(LLMError):
@@ -1590,7 +1590,6 @@ class LLMSchemaViolationError(LLMError):
     """The response did not parse into the output schema (e.g. JSON cut off at
     max_output_tokens). Not retried at this layer — the calling Skill applies its own
     fallback policy (§5.9, §8.4–8.5)."""
-    error_type = ErrorType.PARSE
     error_code = error_codes.LLM_SCHEMA_VIOLATION
 ```
 
@@ -1748,7 +1747,7 @@ class SkillBase(ABC):
 
 ### 8.2 `app/skills/entity_analysis_skill.py` — EntityAnalysisSkill
 
-Identifies the stock entities mentioned in one cleaned article and classifies each into an event, in one structured-output call: the model lists every company it finds with the code the article prints (or the HKEX code it knows) and its name, plus `event_type_primary`/`event_type_secondary`, `sentiment_label`/`sentiment_score`, `headline`, and `entity_summary`. Code then verifies each listed company against the HK Stock List (`_verify_mention()`, below); only verified companies make it into the result — unverified ones are dropped, not guessed at. Design rationale: system-design.md §9.2–§9.4. `EntityAnalysisService` (§11.1) is its only caller, constructing a fresh instance per `run()` call.
+Identifies the stock entities mentioned in one cleaned article and classifies each into an event, in one structured-output call: the model lists every company it finds with the code the article prints (or the HKEX code it knows) and its name, plus `event_type_primary`/`event_type_secondary`, `sentiment_label`/`sentiment_score`, `headline`, and `entity_summary`. Code then verifies each listed company against the HK Stock List (`_verify_entity()`, below); only verified companies make it into the result — unverified ones are dropped, not guessed at. Design rationale: system-design.md §9.2–§9.4. `EntityAnalysisService` (§11.1) is its only caller, constructing a fresh instance per `run()` call.
 
 #### Input Schema
 
@@ -1898,14 +1897,13 @@ output_items: [
 
 #### Output Schemas
 
-`EntityMention` is the schema the structured-output call returns; `_verify_mention()` turns each verified one into an `AnalysisOutcome` (defined in `app/models/entity_event.py`, §11.1, because `EntityEvent.analysis_outcome` wraps it).
+`ExtractedEntity` is the schema the structured-output call returns; `_verify_entity()` turns each verified one into an `AnalysisOutcome` (defined in `app/models/entity_event.py`, §11.1, because `EntityEvent.analysis_outcome` wraps it).
 
 ```python
 from pydantic import BaseModel
-from app.models.entity_event import AnalysisOutcome   # §3.2/§11.1
-from app.models.enums import EventTypeEnum, SentimentEnum   # §3.1
+from app.models.entity_event import AnalysisOutcome, EventTypeEnum, SentimentEnum   # §3.1/§11.1
 
-class EntityMention(BaseModel):
+class ExtractedEntity(BaseModel):
     stock_code: str | None             # the code the article prints, else the HKEX code the model knows, else null
     company_name: str                  # as written in the article
     event_type_primary: EventTypeEnum
@@ -1916,7 +1914,7 @@ class EntityMention(BaseModel):
     entity_summary: str                # <=100 Traditional Chinese characters
 
 class LLMOutput(BaseModel):
-    output_items: list[EntityMention]    # may be empty
+    output_items: list[ExtractedEntity]    # may be empty
 
 @dataclass
 class VerifiedEntity:
@@ -1942,7 +1940,7 @@ class EntityAnalysisResult(SkillResult):   # base: app/skills/skill_base.py, §8
 
 ```python
 @dataclass
-class DroppedMention:
+class UnverifiedEntity:
     stock_code: Optional[str]
     company_name: str
     reason: str                # "not_in_hk_stock_list"
@@ -1951,7 +1949,7 @@ class DroppedMention:
 class EntityAnalysisSkillLog:
     skill_version: str
     verified_entities: list[str]                 # verified stock_codes
-    dropped_mentions: list[DroppedMention]
+    unverified_entities: list[UnverifiedEntity]
     input_truncated: bool                        # body was cut at ENTITY_ANALYSIS_MAX_INPUT_CHARS
     llm_calls: list[LlmCallMetric]
     total_input_tokens: int
@@ -1973,7 +1971,7 @@ class EntityAnalysisSkill(SkillBase):   # SkillBase — app/skills/skill_base.py
         # Safe on self for the same reason as SkillBase's own state (§8.1, §11.1):
         # fresh instance per run() call.
         self._verified_entities: list[str] = []   # verified stock codes, in output order
-        self._dropped: list[DroppedMention] = []
+        self._unverified: list[UnverifiedEntity] = []
         self._input_truncated = False
 ```
 
@@ -1991,12 +1989,12 @@ append LlmCallMetric(call_index=1, purpose="structured_output", ...from structur
 
 article_text = self._input.title + body
 entities = []
-FOR each mention in structured.output.output_items:
-    stock = _verify_mention(mention, article_text)
+FOR each entity in structured.output.output_items:
+    stock = _verify_entity(entity, article_text)
     if stock is None:
-        append DroppedMention(mention.stock_code, mention.company_name, reason="not_in_hk_stock_list") to self._dropped
+        append UnverifiedEntity(entity.stock_code, entity.company_name, reason="not_in_hk_stock_list") to self._unverified
         continue
-    outcome = AnalysisOutcome(stock_code=stock.stock_code, **mention's analysis fields)
+    outcome = AnalysisOutcome(stock_code=stock.stock_code, **entity's analysis fields)
     apply Business Constraint Validation (table below) to outcome
     if outcome.stock_code in self._verified_entities:
         log BusinessValidationError (duplicate stock_code, dropped)  # does not set failure_reason — same
@@ -2004,29 +2002,29 @@ FOR each mention in structured.output.output_items:
     self._verified_entities.append(outcome.stock_code)
     entities.append(VerifiedEntity(stock, outcome))
 # keep first occurrence per stock_code — the LLM is instructed not to repeat one
-# (system-design.md §9.4 Edge Case Rule 5), and two mentions can verify to the same code
+# (system-design.md §9.4 Edge Case Rule 5), and two entities can verify to the same code
 
 return EntityAnalysisResult(entities, skill_log=self._create_skill_log(), failure_reason=None)
 ```
 
 Raises one of the typed exceptions (§7.2) on any failure above — `SkillBase.run()` (§8.1) catches them, not this method.
 
-#### `_verify_mention(mention, article_text) -> Optional[Stock]`
+#### `_verify_entity(entity, article_text) -> Optional[Stock]`
 
-Resolves one `EntityMention` against `self._hk_stock_list_cache` (rationale: system-design.md §9.2):
+Resolves one `ExtractedEntity` against `self._hk_stock_list_cache` (rationale: system-design.md §9.2):
 
 ```
-code = mention.stock_code normalized per system-design.md §9.2 (trim, drop ".HK", zero-pad 2–5 digits to 5;
+code = entity.stock_code normalized per system-design.md §9.2 (trim, drop ".HK", zero-pad 2–5 digits to 5;
        anything else → no code)
 entries = self._hk_stock_list_cache.entries
 if code in entries:
     stock = entries[code]
-    if _name_consistent(mention.company_name, stock) or _code_printed(code, article_text):
+    if name_matches_stock(entity.company_name, stock) or _code_printed(code, article_text):
         return stock
-return lookup_stock(mention.company_name)   # §4.2 name search
+return lookup_stock(entity.company_name)   # §4.2 name search
 ```
 
-`_name_consistent(name, stock)`: `name_matches_stock(name, stock)` (§4.2), the same normalization the name search uses.
+`name_matches_stock()` (§4.2) uses the same normalization as the name search.
 
 `_code_printed(code, article_text)`: true when the article prints the code in a code-shaped form — `(0700)`, `（00700）`, `00700.HK`, `Stock Code: 700`, `股份代號：700` — with leading zeros optional. A bare number elsewhere in the text never counts, and a bracketed number counts only with at least 3 digits, so a list marker such as `(1)` can't confirm a wrong code like `00001`.
 
@@ -2037,7 +2035,7 @@ def _create_skill_log(self) -> EntityAnalysisSkillLog:
     return EntityAnalysisSkillLog(
         skill_version=ENTITY_SKILL_VERSION,
         verified_entities=self._verified_entities,
-        dropped_mentions=self._dropped,
+        unverified_entities=self._unverified,
         input_truncated=self._input_truncated,
         llm_calls=self._llm_calls,
         total_input_tokens=sum(c.input_tokens for c in self._llm_calls),
@@ -2059,7 +2057,7 @@ def build_fail_result(self, err: LLMError) -> EntityAnalysisResult:
 | `headline` | ≤20 chars | Truncate; log `BusinessValidationError` |
 | `entity_summary` | ≤100 chars | Truncate; log `BusinessValidationError` |
 | `event_type_secondary` | must differ from `event_type_primary` | Set to `null`; log `BusinessValidationError` |
-| `stock_code` | must resolve through `_verify_mention()` | Dropped before validation, recorded in `dropped_mentions` — not a truncation case |
+| `stock_code` | must resolve through `_verify_entity()` | Dropped before validation, recorded in `unverified_entities` — not a truncation case |
 | `stock_code` | no duplicates within one article | Keep the first occurrence, drop the rest; log `BusinessValidationError` |
 
 Error handling (which exceptions get caught where, and what `EntityAnalysisService` does with each `failure_reason`) is covered once, in §8.5's cross-Skill table and §11.2's flowchart callouts — not repeated here.
@@ -3266,10 +3264,10 @@ One shape for an `entity_events` row, on both sides: `find_entity_events()` buil
 from pydantic import BaseModel
 
 from app.common.stock import Stock   # §4.2
-from app.models.enums import EventTypeEnum, SentimentEnum   # §3.1
+# EventTypeEnum, SentimentEnum: defined above in this module (§3.1)
 
 class AnalysisOutcome(BaseModel):
-    """One verified entity from EntityAnalysisSkill (§8.2), built from a verified EntityMention;
+    """One verified entity from EntityAnalysisSkill (§8.2), built from a verified ExtractedEntity;
     wrapped by EntityEvent.analysis_outcome."""
     stock_code: str
     event_type_primary: EventTypeEnum
@@ -5004,6 +5002,7 @@ class ErrorType(StrEnum):
     GENERAL = "GENERAL"
     STORAGE = "STORAGE"
     PARSE = "PARSE"
+    LLM = "LLM"
 
 class SAPIError(Exception):
     """Base for every error SAPI raises, so a catch-all `except Exception` (§11.2/§13.2, the
