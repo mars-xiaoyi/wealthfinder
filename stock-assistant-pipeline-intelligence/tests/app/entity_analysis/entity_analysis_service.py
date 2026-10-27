@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from unittest import mock
 from unittest.mock import AsyncMock
 from uuid import UUID
 
@@ -25,6 +26,10 @@ from app.llm.errors import (
 )
 from app.models.entity_event import AnalysisOutcome, EntityEvent, EventTypeEnum, SentimentEnum
 from app.models.versioned_metadata import VersionedMetadata
+from app.persistent import entity_event_repository as entity_event_repository_module
+from app.persistent.entity_event_repository import EntityEventRepository
+from app.redis import stream_client as stream_client_module
+from app.redis.stream_client import STREAM_ENTITY_EVENT_COMPLETED, RedisStreamClient
 from app.skills.entity_analysis_skill import ExtractedEntity, LLMOutput
 
 CONFIG = EntityAnalysisConfig(
@@ -60,7 +65,7 @@ def _extracted(stock_code: str, company_name: str) -> ExtractedEntity:
     )
 
 
-def _entity_event(stock: Stock) -> EntityEvent:
+def _entity_event(stock: Stock, entity_event_id: UUID | None = None) -> EntityEvent:
     return EntityEvent(
         source_id=CLEANED_ID,
         source_url=ARTICLE.source_url,
@@ -79,7 +84,18 @@ def _entity_event(stock: Stock) -> EntityEvent:
             ),
         ),
         stock=stock,
+        entity_event_id=entity_event_id,
+        created_at=None if entity_event_id is None else datetime(2026, 9, 8, 2, 0, tzinfo=UTC),
     )
+
+
+def _published(*entity_event_ids: UUID) -> list:
+    return [
+        mock.call(
+            STREAM_ENTITY_EVENT_COMPLETED, {"entity_event_id": str(entity_event_id), "v": "1"}
+        )
+        for entity_event_id in entity_event_ids
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +118,22 @@ def news_client(monkeypatch):
     return client
 
 
+@pytest.fixture(autouse=True)
+def repository(monkeypatch):
+    repo = AsyncMock(spec=EntityEventRepository)
+    repo.fetch_entity_event_ids_by_source_url.return_value = []
+    repo.persist_entities.return_value = []
+    monkeypatch.setattr(entity_event_repository_module, "_entity_event_repository", repo)
+    return repo
+
+
+@pytest.fixture(autouse=True)
+def redis_stream(monkeypatch):
+    client = AsyncMock(spec=RedisStreamClient)
+    monkeypatch.setattr(stream_client_module, "_redis_stream_client", client)
+    return client
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     llm_adapter = AsyncMock(spec=LLMAdapter)
@@ -117,26 +149,61 @@ def adapter(monkeypatch):
     return llm_adapter
 
 
-async def find_entity_events_success(news_client, adapter):
+async def find_entity_events_success(news_client, adapter, repository, redis_stream):
+    persisted = [_entity_event(TENCENT, UUID(int=1)), _entity_event(HSBC, UUID(int=2))]
+    repository.persist_entities.return_value = persisted
+
     entity_events = await EntityAnalysisService(CONFIG).find_entity_events(CLEANED_ID)
 
-    assert entity_events == [_entity_event(TENCENT), _entity_event(HSBC)]
+    assert entity_events == persisted
     news_client.fetch_cleaned_news.assert_awaited_once_with(CLEANED_ID)
+    repository.fetch_entity_event_ids_by_source_url.assert_awaited_once_with(ARTICLE.source_url)
+    repository.persist_entities.assert_awaited_once_with(
+        [_entity_event(TENCENT), _entity_event(HSBC)]
+    )
+    assert redis_stream.publish.await_args_list == _published(UUID(int=1), UUID(int=2))
 
 
-async def find_entity_events_no_entities(news_client, adapter):
+async def find_entity_events_partly_persisted(news_client, adapter, repository, redis_stream):
+    """Only the EntityEvents actually stored are returned and announced."""
+    persisted = [_entity_event(HSBC, UUID(int=2))]
+    repository.persist_entities.return_value = persisted
+
+    entity_events = await EntityAnalysisService(CONFIG).find_entity_events(CLEANED_ID)
+
+    assert entity_events == persisted
+    assert redis_stream.publish.await_args_list == _published(UUID(int=2))
+
+
+async def find_entity_events_no_entities(news_client, adapter, repository, redis_stream):
     adapter.generate_structured.return_value = StructuredLLMResponse(
         output=LLMOutput(output_items=[]), input_tokens=1500, output_tokens=10, latency_ms=500
     )
 
     assert await EntityAnalysisService(CONFIG).find_entity_events(CLEANED_ID) == []
+    repository.persist_entities.assert_awaited_once_with([])
+    redis_stream.publish.assert_not_awaited()
 
 
-async def find_entity_events_not_found(news_client, adapter):
+async def find_entity_events_not_found(news_client, adapter, repository, redis_stream):
     news_client.fetch_cleaned_news.return_value = None
 
     assert await EntityAnalysisService(CONFIG).find_entity_events(CLEANED_ID) == []
     adapter.generate_structured.assert_not_awaited()
+    repository.fetch_entity_event_ids_by_source_url.assert_not_awaited()
+    repository.persist_entities.assert_not_awaited()
+    redis_stream.publish.assert_not_awaited()
+
+
+async def find_entity_events_already_persisted(news_client, adapter, repository, redis_stream):
+    """A redelivered article that is already stored is announced again, not re-analysed."""
+    repository.fetch_entity_event_ids_by_source_url.return_value = [UUID(int=1), UUID(int=2)]
+
+    assert await EntityAnalysisService(CONFIG).find_entity_events(CLEANED_ID) == []
+    repository.fetch_entity_event_ids_by_source_url.assert_awaited_once_with(ARTICLE.source_url)
+    adapter.generate_structured.assert_not_awaited()
+    repository.persist_entities.assert_not_awaited()
+    assert redis_stream.publish.await_args_list == _published(UUID(int=1), UUID(int=2))
 
 
 @pytest.mark.parametrize(
@@ -149,7 +216,9 @@ async def find_entity_events_not_found(news_client, adapter):
         pytest.param(LLMSchemaViolationError, id="schema_violation"),
     ],
 )
-async def find_entity_events_failure_reason_raised(news_client, adapter, error_cls):
+async def find_entity_events_failure_reason_raised(
+    news_client, adapter, repository, redis_stream, error_cls
+):
     """Whichever LLM error the analysis failed with is raised as itself, not a new one."""
     error = error_cls("call failed", category=ErrorCategory.LLM)
     adapter.generate_structured.side_effect = error
@@ -159,6 +228,8 @@ async def find_entity_events_failure_reason_raised(news_client, adapter, error_c
 
     assert type(exc_info.value) is error_cls
     assert exc_info.value is error
+    repository.persist_entities.assert_not_awaited()
+    redis_stream.publish.assert_not_awaited()
 
 
 def get_entity_analysis_service_not_initialized():

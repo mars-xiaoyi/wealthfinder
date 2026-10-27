@@ -20,7 +20,13 @@ from app.config import (
 )
 
 CONFIG = AppConfig(
-    db=DatabaseConfig(url="postgresql://localhost/sapi", pool_size=10, close_timeout_s=10),
+    db=DatabaseConfig(
+        url="postgresql://localhost/sapi",
+        pool_size=10,
+        close_timeout_s=10,
+        max_retry=3,
+        retry_base_wait_ms=100,
+    ),
     http=HttpConfig(timeout_s=120),
     health=HealthConfig(check_timeout_s=2),
     redis=RedisConfig(
@@ -58,6 +64,7 @@ def infra():
     refresh = AsyncMock(return_value=2800)
     create_llm = MagicMock(return_value=llm_adapter)
     create_news = MagicMock()
+    create_repository = MagicMock()
     create_service = MagicMock()
 
     async def _consume_until_cancelled() -> None:
@@ -76,6 +83,7 @@ def infra():
     calls.attach_mock(refresh, "refresh_hk_stock_list")
     calls.attach_mock(create_llm, "create_llm_adapter")
     calls.attach_mock(create_news, "create_news_client")
+    calls.attach_mock(create_repository, "create_entity_event_repository")
     calls.attach_mock(create_service, "create_entity_analysis_service")
     calls.attach_mock(consumer_cls, "CleanedNewsConsumer")
     with (
@@ -87,6 +95,7 @@ def infra():
         mock.patch.object(main_module, "refresh_hk_stock_list", refresh),
         mock.patch.object(main_module, "create_llm_adapter", create_llm),
         mock.patch.object(main_module, "create_news_client", create_news),
+        mock.patch.object(main_module, "create_entity_event_repository", create_repository),
         mock.patch.object(main_module, "create_entity_analysis_service", create_service),
         mock.patch.object(main_module, "CleanedNewsConsumer", consumer_cls),
     ):
@@ -104,6 +113,7 @@ STARTUP_CALLS = [
     "create_http_client",
     "create_llm_adapter",
     "create_news_client",
+    "create_entity_event_repository",
     "refresh_hk_stock_list",
     "create_entity_analysis_service",
     "CleanedNewsConsumer",
@@ -124,13 +134,16 @@ async def lifespan(infra):
         await asyncio.sleep(0)  # let the consumer Task start
         assert _call_names(infra) == STARTUP_CALLS
         infra.create_db_client.assert_awaited_once_with(CONFIG.db)
-        infra.create_stream_client.assert_awaited_once_with(CONFIG.redis.stream_url)
+        infra.create_stream_client.assert_awaited_once_with(
+            CONFIG.redis.stream_url, CONFIG.redis.reconnect_interval_s
+        )
         infra.create_state_client.assert_awaited_once_with(CONFIG.redis.state_url)
         infra.create_http_client.assert_called_once_with(CONFIG.http.timeout_s)
         infra.create_llm_adapter.assert_called_once_with(CONFIG.llm)
         infra.create_news_client.assert_called_once_with(
             infra.create_http_client.return_value, CONFIG.entity_analysis.sadi_api_url
         )
+        infra.create_entity_event_repository.assert_called_once_with()
         infra.refresh_hk_stock_list.assert_awaited_once_with()
         infra.create_entity_analysis_service.assert_called_once_with(CONFIG.entity_analysis)
         infra.CleanedNewsConsumer.assert_called_once_with(CONFIG.entity_analysis, CONFIG.redis)
