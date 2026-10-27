@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import http.server
 import json
+import os
 import socket
 import subprocess
 import threading
@@ -37,7 +38,12 @@ OPTIONAL_ENV = (
     "ENTITY_ANALYSIS_BATCH_TIMEOUT_MS",
     "SADI_API_URL",
     "HOSTNAME",
+    "VERTEX_AI_LOCATION",
+    "LLM_API_TIMEOUT_S",
+    "ENTITY_ANALYSIS_MAX_INPUT_CHARS",
 )
+# A project id for cases that never call Vertex AI; nothing is sent to it.
+PLACEHOLDER_VERTEX_PROJECT = "sapi-integration-test"
 HKEX_URL_CONSTANTS = ("_ACTIVESTOCK_EN_URL", "_ACTIVESTOCK_ZH_URL", "_LIST_OF_SECURITIES_URL")
 # Nothing listens on port 1, so a connection is refused at once.
 REFUSED_URL = "http://127.0.0.1:1"
@@ -218,6 +224,16 @@ def app_env(infra: Infra, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     infra.restore_all()
 
 
+@pytest.fixture(autouse=True)
+def vertex_project(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cases marked vertex call the real Vertex AI, with the developer's VERTEX_AI_PROJECT and
+    application default credentials; every other case gets a placeholder project."""
+    if request.node.get_closest_marker("vertex") is None:
+        monkeypatch.setenv("VERTEX_AI_PROJECT", PLACEHOLDER_VERTEX_PROJECT)
+    elif not os.environ.get("VERTEX_AI_PROJECT"):
+        pytest.fail("vertex cases need VERTEX_AI_PROJECT and application default credentials.")
+
+
 @pytest.fixture
 def hkex_urls(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
     """Point HKEX URLs elsewhere: hkex_urls(every=url) for all three, or per constant name
@@ -297,6 +313,8 @@ class SADIRequest:
 class _Behaviour:
     status: int
     delay_s: float
+    title: str = "騰訊控股公佈第四季業績"
+    body: str = "騰訊控股第四季廣告收入錄得強勁增長"
 
 
 class _SADIServer(http.server.ThreadingHTTPServer):
@@ -312,7 +330,7 @@ class _SADIHandler(http.server.BaseHTTPRequestHandler):
         stub.requests.append(SADIRequest(cleaned_id, time.monotonic()))
         behaviour = stub.behaviours.get(cleaned_id, _Behaviour(200, 0.0))
         time.sleep(behaviour.delay_s)
-        body = json.dumps(_sadi_body(cleaned_id, behaviour.status)).encode()
+        body = json.dumps(_sadi_body(cleaned_id, behaviour)).encode()
         self.send_response(behaviour.status)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -322,17 +340,17 @@ class _SADIHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _sadi_body(cleaned_id: str, status: int) -> dict[str, object]:
-    """SADI's GET /v1/cleaned_news/{cleaned_id} response body for a status."""
-    if status == 404:
+def _sadi_body(cleaned_id: str, behaviour: _Behaviour) -> dict[str, object]:
+    """SADI's GET /v1/cleaned_news/{cleaned_id} response body for a behaviour."""
+    if behaviour.status == 404:
         return {"error_code": "COMMON-4004", "message": "Resource not found", "detail": {}}
-    if status == 503:
+    if behaviour.status == 503:
         return {"error_code": "COMMON-5001", "message": "Service unavailable", "detail": {}}
     return {
         "cleaned_id": cleaned_id,
         "raw_id": str(uuid.uuid4()),
-        "title_cleaned": "騰訊控股公佈第四季業績",
-        "body_cleaned": "騰訊控股第四季廣告收入錄得強勁增長",
+        "title_cleaned": behaviour.title,
+        "body_cleaned": behaviour.body,
         "published_at": "2025-01-15T00:00:00Z",
         "source_name": "MINGPAO",
         "source_url": f"https://finance.mingpao.com/{cleaned_id}",
@@ -358,6 +376,10 @@ class StubSADI:
 
     def respond(self, cleaned_id: uuid.UUID, status: int, delay_s: float = 0.0) -> None:
         self.behaviours[str(cleaned_id)] = _Behaviour(status, delay_s)
+
+    def serve(self, cleaned_id: uuid.UUID, title: str, body: str) -> None:
+        """Answer cleaned_id with 200 and an article of this title and body."""
+        self.behaviours[str(cleaned_id)] = _Behaviour(200, 0.0, title, body)
 
     def requests_for(self, cleaned_id: uuid.UUID) -> list[SADIRequest]:
         return [r for r in self.requests if r.cleaned_id == str(cleaned_id)]

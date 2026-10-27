@@ -36,7 +36,10 @@ CONSUMER_ENV = {
 }
 POLL_INTERVAL_S = 0.05
 SETTLE_S = 0.5
+# Bound on Vertex AI-backed work: one analysis took up to 18 s in the LLM skill spike.
+VERTEX_WAIT_S = 60
 GATE_EVENT = "hk_stock_list_not_ready"
+COMPLETED_EVENT = "entity_analysis_completed"
 REAL_HKEX_URLS = {name: getattr(hk_stock_list, name) for name in HKEX_URL_CONSTANTS}
 
 # A trimmed copy of HKEX's three files: 00700 and 09988 are equities, 02800 is an ETF.
@@ -192,6 +195,17 @@ async def _wait_pending(streams: StreamProbe, message_id: str, timeout_s: float)
     await _wait_for(is_pending, timeout_s)
 
 
+def _completed(
+    logs: list[MutableMapping[str, Any]], cleaned_id: uuid.UUID
+) -> list[MutableMapping[str, Any]]:
+    """The entity_analysis_completed records for cleaned_id."""
+    return [
+        log
+        for log in logs
+        if log["event"] == COMPLETED_EVENT and log["cleaned_id"] == str(cleaned_id)
+    ]
+
+
 async def _wait_group_created(streams: StreamProbe) -> None:
     """Wait until the consumer has created its group, i.e. is up and reading."""
 
@@ -222,18 +236,21 @@ async def start_existing_group(start_consumer, streams):
     assert await streams.group_names() == [CONSUMER_GROUP_ENTITY_ANALYSIS]
 
 
+@pytest.mark.vertex
 async def start_fetch_and_ack(start_consumer, streams, stub_sadi):
     """More messages than one batch: each cleaned_id reaches SADI as a canonical UUID, once,
-    and every message is ACKed."""
-    cleaned_ids = [uuid.uuid4() for _ in range(12)]
+    is analysed once, and every message is ACKed."""
+    cleaned_ids = [uuid.uuid4() for _ in range(6)]
 
-    async with start_consumer():
-        entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in cleaned_ids}
-        await _wait_acked(streams, stub_sadi, entries, 10)
-        await asyncio.sleep(SETTLE_S)
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in cleaned_ids}
+            await _wait_acked(streams, stub_sadi, entries, 3 * VERTEX_WAIT_S)
+            await asyncio.sleep(SETTLE_S)
 
     assert sorted(r.cleaned_id for r in stub_sadi.requests) == sorted(map(str, cleaned_ids))
     assert await streams.pending() == {}
+    assert [len(_completed(logs, cleaned_id)) for cleaned_id in cleaned_ids] == [1] * 6
 
 
 async def start_not_found_acked(start_consumer, streams, stub_sadi):
@@ -250,12 +267,15 @@ async def start_not_found_acked(start_consumer, streams, stub_sadi):
     assert await streams.pending() == {}
     not_found = [log for log in logs if log["event"] == "cleaned_news_not_found"]
     assert [log["log_level"] for log in not_found] == ["warning"]
+    assert _completed(logs, cleaned_id) == []
 
 
 async def start_sadi_error_left_pending(start_consumer, streams, stub_sadi):
-    """A SADI failure leaves its message pending, and the next message is still handled."""
+    """A SADI failure leaves its message pending without analysing it, and the next message
+    is still handled."""
     failing, healthy = uuid.uuid4(), uuid.uuid4()
     stub_sadi.respond(failing, 503)
+    stub_sadi.respond(healthy, 404)  # ACKed without reaching Vertex AI
 
     async with start_consumer():
         with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
@@ -271,6 +291,7 @@ async def start_sadi_error_left_pending(start_consumer, streams, stub_sadi):
         ("warning", ErrorCategory.NEWS_CLIENT)
     ]
     assert not [log for log in logs if log["log_level"] in ("error", "critical")]
+    assert _completed(logs, failing) == []
 
 
 async def start_sadi_timeout_left_pending(start_consumer, streams, stub_sadi):
@@ -278,14 +299,17 @@ async def start_sadi_timeout_left_pending(start_consumer, streams, stub_sadi):
     full delay."""
     slow, healthy = uuid.uuid4(), uuid.uuid4()
     stub_sadi.respond(slow, 200, delay_s=3)
+    stub_sadi.respond(healthy, 404)  # ACKed without reaching Vertex AI
 
-    async with start_consumer():
-        slow_message_id = await streams.add(slow)
-        await _wait_for(lambda: _requested(stub_sadi, slow), 5)
-        healthy_message_id = await streams.add(healthy)
-        await _wait_acked(streams, stub_sadi, {healthy: healthy_message_id}, 6)
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            slow_message_id = await streams.add(slow)
+            await _wait_for(lambda: _requested(stub_sadi, slow), 5)
+            healthy_message_id = await streams.add(healthy)
+            await _wait_acked(streams, stub_sadi, {healthy: healthy_message_id}, 6)
 
     assert (await streams.pending())[slow_message_id] == 1
+    assert _completed(logs, slow) == []
 
 
 async def _requested(stub: StubSADI, cleaned_id: uuid.UUID) -> bool:
@@ -296,18 +320,21 @@ async def start_sadi_unreachable_then_back(start_consumer, streams, stub_sadi):
     """With SADI down, the message stays pending and the app keeps serving; once SADI is
     back, the same app instance handles new messages."""
     unreachable, recovered = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.respond(recovered, 404)  # ACKed without reaching Vertex AI
 
-    async with start_consumer() as client:
-        stub_sadi.stop()
-        unreachable_message_id = await streams.add(unreachable)
-        await _wait_pending(streams, unreachable_message_id, 5)
-        await asyncio.wait_for(client.get("/v1/health"), 3)
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer() as client:
+            stub_sadi.stop()
+            unreachable_message_id = await streams.add(unreachable)
+            await _wait_pending(streams, unreachable_message_id, 5)
+            await asyncio.wait_for(client.get("/v1/health"), 3)
 
-        stub_sadi.start()
-        recovered_message_id = await streams.add(recovered)
-        await _wait_acked(streams, stub_sadi, {recovered: recovered_message_id}, 5)
+            stub_sadi.start()
+            recovered_message_id = await streams.add(recovered)
+            await _wait_acked(streams, stub_sadi, {recovered: recovered_message_id}, 5)
 
     assert (await streams.pending())[unreachable_message_id] == 1
+    assert _completed(logs, unreachable) == []
 
 
 @pytest.mark.parametrize("outage", ["stop", "pause"])
@@ -315,6 +342,7 @@ async def start_stream_redis_outage(start_consumer, streams, stub_sadi, infra, o
     """While the stream Redis is down the consumer warns and retries without raising, and
     resumes from the group's position once it is back, on the same app instance."""
     resumed = uuid.uuid4()
+    stub_sadi.respond(resumed, 404)  # ACKed without reaching Vertex AI
     redis_stream = infra.redis_stream
 
     async with start_consumer() as client:
@@ -348,15 +376,20 @@ async def start_stream_redis_outage(start_consumer, streams, stub_sadi, infra, o
         )
 
 
+@pytest.mark.vertex
 async def start_postgres_and_state_redis_down(start_consumer, streams, stub_sadi, infra):
-    """The consumer needs only the stream Redis and SADI."""
+    """Analysing an article needs only the stream Redis, SADI and Vertex AI."""
     cleaned_id = uuid.uuid4()
 
-    async with start_consumer():
-        infra.postgres.stop()
-        infra.redis_state.stop()
-        message_id = await streams.add(cleaned_id)
-        await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 5)
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            infra.postgres.stop()
+            infra.redis_state.stop()
+            message_id = await streams.add(cleaned_id)
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, VERTEX_WAIT_S)
+            await asyncio.sleep(SETTLE_S)
+
+    assert len(_completed(logs, cleaned_id)) == 1
 
 
 async def start_resumes_after_restart(start_consumer, streams, stub_sadi):
@@ -364,6 +397,8 @@ async def start_resumes_after_restart(start_consumer, streams, stub_sadi):
     down is handled, and nothing already ACKed is requested again."""
     before = [uuid.uuid4(), uuid.uuid4()]
     after = uuid.uuid4()
+    for cleaned_id in [*before, after]:
+        stub_sadi.respond(cleaned_id, 404)  # ACKed without reaching Vertex AI
 
     async with start_consumer():
         entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in before}
@@ -449,6 +484,7 @@ async def start_hk_stock_list_loaded(start_consumer, hkex_feed, streams, stub_sa
     """With the HK Stock List loaded, from the trimmed feed or the real HKEX, a message is
     fetched and ACKed with no gate record."""
     cleaned_id = uuid.uuid4()
+    stub_sadi.respond(cleaned_id, 404)  # ACKed without reaching Vertex AI
     hkex_feed(feed)
     env = REAL_HKEX_ENV if feed == "real" else {}
 
@@ -467,6 +503,7 @@ async def start_hk_stock_list_becomes_ready(start_consumer, hkex_feed, streams, 
     """Once the HK Stock List loads on the running app, new messages are handled; the one
     gated before stays pending."""
     gated, handled = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.respond(handled, 404)  # ACKed without reaching Vertex AI
     hkex_feed("empty")
 
     with structlog.testing.capture_logs() as logs:
@@ -483,3 +520,148 @@ async def start_hk_stock_list_becomes_ready(start_consumer, hkex_feed, streams, 
     assert _gated(logs) == [("warning", gated_message_id)]
     assert [r.cleaned_id for r in stub_sadi.requests] == [str(handled)]
     assert pending == {gated_message_id: 1}
+
+
+# Hand-written, not one of the system prompt's few-shot examples. Both codes are printed, and
+# both companies are stable HKEX listings; swap a reference that stops being valid rather than
+# weaken an assertion.
+LISTED_TITLE = "匯豐控股及友邦保險公佈季度業績"
+LISTED_BODY = (
+    "匯豐控股（00005）公佈第三季除稅前利潤按年上升10%，超出市場預期。"  # noqa: RUF001
+    "友邦保險（01299）新業務價值按年增長15%，並宣佈增加股份回購。"  # noqa: RUF001
+)
+UNLISTED_TITLE = "輝達公佈季度業績"
+UNLISTED_BODY = "美國晶片公司輝達公佈季度業績，數據中心收入按年大增，股價盤後上升。"  # noqa: RUF001
+# A project id the developer's credentials cannot access: Vertex AI answers 403.
+INACCESSIBLE_VERTEX_PROJECT = "sapi-it-no-access-7f3a9c"
+LLM_ERROR_TYPES = {
+    "LLMRateLimitError",
+    "LLMProviderError",
+    "LLMRequestError",
+    "LLMAuthenticationError",
+    "LLMSchemaViolationError",
+}
+
+
+async def _wait_completed(
+    logs: list[MutableMapping[str, Any]], cleaned_id: uuid.UUID, timeout_s: float
+) -> None:
+    async def completed() -> bool:
+        return bool(_completed(logs, cleaned_id))
+
+    await _wait_for(completed, timeout_s)
+
+
+@pytest.mark.vertex
+async def start_listed_companies_verified(start_consumer, hkex_feed, streams, stub_sadi):
+    """An article naming two listed companies is analysed in one call and both are verified
+    against the real HK Stock List; the message is ACKed."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, LISTED_TITLE, LISTED_BODY)
+    hkex_feed("real")
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(**REAL_HKEX_ENV):
+            started = time.monotonic()
+            message_id = await streams.add(cleaned_id)
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, VERTEX_WAIT_S)
+            elapsed_ms = (time.monotonic() - started) * 1000
+            await asyncio.sleep(SETTLE_S)
+
+    [record] = _completed(logs, cleaned_id)
+    assert record["log_level"] == "info"
+    assert record["source_url"] == f"https://finance.mingpao.com/{cleaned_id}"
+    assert record["skill_version"] == "v1.0.0"
+    assert set(record["verified_entities"]) == {"00005", "01299"}
+    assert record["unverified_entities"] == []
+    assert record["input_truncated"] is False
+    # The Skill records the constraint fixes it applies as BusinessValidationError entries.
+    assert [e for e in record["llm_errors"] if e["error_type"] in LLM_ERROR_TYPES] == []
+    assert "entity_event_ids" not in record
+    [call] = record["llm_calls"]
+    assert (call["call_index"], call["purpose"]) == (1, "structured_output")
+    assert call["input_tokens"] > 1000  # the system prompt alone is about 1,800 tokens
+    assert call["output_tokens"] > 0
+    assert 0 < call["latency_ms"] <= elapsed_ms
+    assert (
+        record["total_input_tokens"],
+        record["total_output_tokens"],
+        record["total_latency_ms"],
+    ) == (call["input_tokens"], call["output_tokens"], call["latency_ms"])
+    assert await streams.pending() == {}
+
+
+@pytest.mark.vertex
+async def start_no_listed_company(start_consumer, hkex_feed, streams, stub_sadi):
+    """An article about a company with no HK listing verifies nothing and is still ACKed."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, UNLISTED_TITLE, UNLISTED_BODY)
+    hkex_feed("real")
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(**REAL_HKEX_ENV):
+            message_id = await streams.add(cleaned_id)
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, VERTEX_WAIT_S)
+            await asyncio.sleep(SETTLE_S)
+
+    [record] = _completed(logs, cleaned_id)
+    assert record["verified_entities"] == []
+    assert [e for e in record["llm_errors"] if e["error_type"] in LLM_ERROR_TYPES] == []
+    assert await streams.pending() == {}
+
+
+@pytest.mark.vertex
+@pytest.mark.parametrize(
+    ("env", "body", "error_type", "log_level", "error_code"),
+    [
+        pytest.param(
+            {"VERTEX_AI_PROJECT": INACCESSIBLE_VERTEX_PROJECT},
+            "騰訊控股第四季廣告收入錄得強勁增長",
+            "LLMAuthenticationError",
+            "critical",
+            error_codes.LLM_AUTHENTICATION_FAILED,
+            id="authentication_failed",
+        ),
+        pytest.param(
+            {"LLM_API_TIMEOUT_S": "1"},
+            "騰訊控股公佈業績。" * 3400,  # cut to 30,000 characters, too slow for 1 s
+            "LLMProviderError",
+            "warning",
+            error_codes.LLM_PROVIDER_ERROR,
+            id="timeout",
+        ),
+        pytest.param(
+            {"VERTEX_AI_LOCATION": "nowhere-1"},
+            "騰訊控股第四季廣告收入錄得強勁增長",
+            "LLMRequestError",
+            "error",
+            error_codes.LLM_REQUEST_REJECTED,
+            id="unknown_location",
+        ),
+    ],
+)
+async def start_llm_failure_left_pending(
+    start_consumer, streams, stub_sadi, env, body, error_type, log_level, error_code
+):
+    """A failed Vertex AI call is logged once, by the consumer, at its error's own level with
+    the cleaned_id; the message stays pending and the next one is still handled."""
+    failing, next_message = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.serve(failing, "騰訊控股公佈第四季業績", body)
+    stub_sadi.respond(next_message, 404)  # ACKed without reaching Vertex AI
+
+    with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
+        async with start_consumer(**env):
+            failing_message_id = await streams.add(failing)
+            await _wait_completed(logs, failing, VERTEX_WAIT_S)
+            next_message_id = await streams.add(next_message)
+            await _wait_acked(streams, stub_sadi, {next_message: next_message_id}, 5)
+
+    llm_records = [log for log in logs if str(log.get("error_code", "")).startswith("COMMON-7")]
+    assert [
+        (log["log_level"], log["error_code"], log["category"], log["cleaned_id"])
+        for log in llm_records
+    ] == [(log_level, error_code, ErrorCategory.LLM, str(failing))]
+    [record] = _completed(logs, failing)
+    assert [e["error_type"] for e in record["llm_errors"]] == [error_type]
+    assert record["verified_entities"] == []
+    assert await streams.pending() == {failing_message_id: 1}
