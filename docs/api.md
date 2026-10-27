@@ -78,6 +78,8 @@ Applicable across all services. Use `COMMON` prefix.
 | `COMMON-7003` | — | LLM provider rejected the credentials (internal only) |
 | `COMMON-7004` | — | LLM response did not match the output schema (internal only) |
 | `COMMON-7005` | — | LLM provider rejected the request itself (internal only) |
+| `COMMON-8000` | 500 | Database failure other than an unreachable database |
+| `COMMON-8001` | 500 | A write violated a unique constraint |
 
 ### 1.4 Validation Error Detail
 
@@ -639,6 +641,8 @@ No service-specific error codes defined in MVP.
 | `COMMON-7003` | — | LLM authentication failed |
 | `COMMON-7004` | — | LLM schema violation |
 | `COMMON-7005` | — | LLM request rejected |
+| `COMMON-8000` | 500 | Database error |
+| `COMMON-8001` | 500 | Unique constraint violated |
 
 ---
 
