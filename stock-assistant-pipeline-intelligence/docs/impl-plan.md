@@ -494,7 +494,7 @@ This document does not introduce new design — every ticket below implements so
 - Every item above has a written answer with evidence (raw responses printed, or measured numbers).
 - The few-shot examples are written into impl.md §8.3/§8.4, ready to copy verbatim, and approved.
 - Any design-changing answer is written back into impl.md (§8.3/§8.4, §8's table) as a fix and approved before the Skill tickets start.
-**Docs:** impl.md §7.1, §8, §8.3, §8.4, §18 (I-3); design.md §9.5, §9.6, §14 (Q-8).
+**Docs:** impl.md §7.1, §8, §8.3, §8.4, §18; design.md §9.5, §9.6, §14 (Q-8).
 **Explicitly deferred:** both Skills' max tokens at real volume (Scoring: Post-Release Tuning Validation).
 **PM note:** time-box length to be set.
 

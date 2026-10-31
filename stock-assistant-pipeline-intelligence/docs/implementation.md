@@ -1702,7 +1702,7 @@ Three Skills (rationale: system-design.md §9.1), each owning its prompt, output
 
 Every Skill makes `generate_structured` calls only. Each module holds its row as a constant, `_GENERATION_CONFIG = GenerationConfig(model=..., temperature=..., max_output_tokens=...)` (§7.1), and passes it on every Adapter call it makes; a model change is a Skill version bump (system-design.md §9.1.1).
 
-All three rows are measured on real SADI articles, and `gemini-3.1-flash-lite` does not think by default. EntityAnalysisSkill's largest output was 13,917 tokens (a 121-company weekly calendar); every other article stayed under 4,400. Over 574 aggregated Events, BriefSummarySkill's largest output was 240 tokens (p95 177) and EventLLMScoringSkill's 89 (p95 78); every call finished within 14 s, inside `LLM_API_TIMEOUT_S`.
+All three rows are measured on real SADI articles, and `gemini-3.1-flash-lite` does not think by default. EntityAnalysisSkill's largest output was 13,917 tokens (a 121-company weekly calendar); every other article stayed under 4,400. Over 574 aggregated Events, BriefSummarySkill's largest output was 240 tokens (p95 177) and EventLLMScoringSkill's 89 (p95 79); the slowest call across two full runs took 14 s, inside `LLM_API_TIMEOUT_S`.
 
 Each module defines a version constant (`ENTITY_SKILL_VERSION`, `BRIEF_SKILL_VERSION`, `SCORING_SKILL_VERSION`, all `"v1.0.0"`) per system-design.md §9.1.1 and sets it as `skill_log.skill_version` (§8.6). Callers read the version from `result.skill_log.skill_version` (§11.1, §13.4) and never re-import the constant.
 
