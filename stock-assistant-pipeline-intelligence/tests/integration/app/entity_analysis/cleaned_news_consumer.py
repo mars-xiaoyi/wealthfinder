@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import dataclasses
 import functools
 import io
@@ -93,6 +94,35 @@ class StreamProbe:
             {"cleaned_id": str(cleaned_id), "v": "1"},
         )
         return message_id
+
+    async def add_fields(self, fields: dict[str, str]) -> str:
+        """XADD a stream:raw_news_cleaned message with exactly these fields; returns its id."""
+        message_id: str = await self._client.xadd("stream:raw_news_cleaned", fields)
+        return message_id
+
+    async def hold_as_ghost(self, *messages: dict[str, str]) -> list[str]:
+        """XADD messages and read them as consumer ghost, so they are left pending the way a
+        consumer that died would leave them (delivery count 1). Call before the app starts.
+        Returns their stream ids."""
+        with contextlib.suppress(redis.exceptions.ResponseError):  # the group already exists
+            await self._client.xgroup_create(
+                "stream:raw_news_cleaned", "sapi-entity-analysis", id="0", mkstream=True
+            )
+        message_ids = [await self.add_fields(fields) for fields in messages]
+        await self._client.xreadgroup(
+            "sapi-entity-analysis", "ghost", {"stream:raw_news_cleaned": ">"}
+        )
+        return message_ids
+
+    async def dead_letters(self) -> list[tuple[str, dict[str, str]]]:
+        """(stream id, fields) of every stream:entity_analysis_dead_letter entry, oldest
+        first."""
+        entries = await self._client.xrange("stream:entity_analysis_dead_letter")
+        return [(message_id, fields) for message_id, fields in entries]
+
+    async def acl(self, *args: str) -> None:
+        """Run ACL with these arguments on the stream Redis, as its default user."""
+        await self._client.execute_command("ACL", *args)
 
     async def group_names(self) -> list[str]:
         """Names of the stream's consumer groups; none while the stream does not exist."""
@@ -1094,3 +1124,365 @@ async def start_state_redis_down(
     rows = await entity_events.rows(_source_url(cleaned_id))
     assert len(rows) == 1
     assert await streams.published() == _announcements(rows)
+
+
+# Reclaim and dead-letter routing. A short claim timeout makes the reclaim loop redeliver
+# within the test; RECLAIM_ENV's retry budget is overridden where a case needs more attempts.
+
+RECLAIM_ENV = {"STREAM_CLAIM_TIMEOUT_MS": "1500", "ENTITY_ANALYSIS_MAX_RETRY": "3"}
+# For cases that need more redeliveries than RECLAIM_ENV allows before dead-lettering.
+MANY_RETRIES_ENV = {**RECLAIM_ENV, "ENTITY_ANALYSIS_MAX_RETRY": "10"}
+CLAIM_TIMEOUT_S = 1.5
+# _wait_attempts() sees a failure up to one poll after it is logged.
+CLAIM_TIMING_SLACK_S = 2 * POLL_INTERVAL_S
+DEAD_LETTERED_EVENT = "entity_analysis_message_dead_lettered"
+SWEEP_FAILED_EVENT = "entity_analysis_reclaim_sweep_failed"
+ACL_USER = "sapi_test"
+ACL_PASSWORD = "pw"
+
+
+def _failed_attempts(
+    logs: list[MutableMapping[str, Any]], cleaned_id: uuid.UUID
+) -> list[MutableMapping[str, Any]]:
+    """The SAPIError records the consumer logged for cleaned_id: one per failed attempt."""
+    return [log for log in logs if "error_code" in log and log.get("cleaned_id") == str(cleaned_id)]
+
+
+async def _wait_attempts(
+    logs: list[MutableMapping[str, Any]], cleaned_id: uuid.UUID, count: int, timeout_s: float
+) -> list[float]:
+    """Wait until cleaned_id has failed count times; returns when each failure was first
+    seen (time.monotonic())."""
+    seen: list[float] = []
+
+    async def failed_enough() -> bool:
+        while len(seen) < len(_failed_attempts(logs, cleaned_id)):
+            seen.append(time.monotonic())
+        return len(seen) >= count
+
+    await _wait_for(failed_enough, timeout_s)
+    return seen
+
+
+def _dead_lettered(logs: list[MutableMapping[str, Any]]) -> list[tuple[object, ...]]:
+    """(log_level, message_id, delivery_count, reason) of each dead-letter record."""
+    return [
+        (log["log_level"], log["message_id"], log["delivery_count"], log["reason"])
+        for log in logs
+        if log["event"] == DEAD_LETTERED_EVENT
+    ]
+
+
+def _assert_dead_letter(
+    fields: dict[str, str],
+    message_id: str,
+    original: dict[str, str],
+    delivery_count: int,
+    started: datetime,
+) -> None:
+    """fields is the dead-letter entry for message_id, whose original fields were original."""
+    assert set(fields) == {"message_id", "fields", "delivery_count", "failed_at", "v"}
+    assert fields["message_id"] == message_id
+    assert json.loads(fields["fields"]) == original
+    assert fields["delivery_count"] == str(delivery_count)
+    assert fields["v"] == "1"
+    failed_at = datetime.fromisoformat(fields["failed_at"])
+    assert failed_at.tzinfo == UTC
+    assert started <= failed_at <= datetime.now(UTC)
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    ["sadi_503", "sadi_slow", "sadi_unreachable", "llm_provider_error", "llm_schema_violation"],
+)
+async def start_reclaimed_until_cause_clears(
+    start_consumer, streams, stub_sadi, fake_llm, entity_events, trigger
+):
+    """A message whose processing fails is redelivered no sooner than the claim timeout, and
+    once the cause clears it is stored, announced once and ACKed, without being
+    dead-lettered."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM]
+    if trigger == "sadi_503":
+        stub_sadi.respond(cleaned_id, 503)
+    elif trigger == "sadi_slow":
+        stub_sadi.respond(cleaned_id, 200, delay_s=3)  # CONSUMER_ENV's HTTP_TIMEOUT_S is 1
+    elif trigger == "llm_provider_error":
+        fake_llm.error = LLMProviderError("scripted failure", category=ErrorCategory.LLM)
+    elif trigger == "llm_schema_violation":
+        fake_llm.error = LLMSchemaViolationError("scripted failure", category=ErrorCategory.LLM)
+
+    with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
+        async with start_consumer(**MANY_RETRIES_ENV):
+            if trigger == "sadi_unreachable":
+                stub_sadi.stop()
+            message_id = await streams.add(cleaned_id)
+            attempts = await _wait_attempts(logs, cleaned_id, 2, 15)
+
+            if trigger == "sadi_unreachable":
+                stub_sadi.start()
+            stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+            fake_llm.error = None
+
+            async def acked() -> bool:
+                return message_id not in await streams.pending()
+
+            await _wait_for(acked, 15)
+            await asyncio.sleep(SETTLE_S)
+
+    assert attempts[1] - attempts[0] >= CLAIM_TIMEOUT_S - CLAIM_TIMING_SLACK_S
+    rows = await entity_events.rows(_source_url(cleaned_id))
+    assert len(rows) == 1
+    _assert_row(rows[0], cleaned_id, TENCENT_ITEM)
+    assert await streams.published() == _announcements(rows)
+    assert await streams.dead_letters() == []
+    assert _dead_lettered(logs) == []
+
+
+@pytest.mark.parametrize("trigger", ["sadi_503", "llm_provider_error"])
+async def start_retries_exhausted_dead_lettered(
+    start_consumer, streams, stub_sadi, fake_llm, entity_events, trigger
+):
+    """A message that keeps failing is dead-lettered with its original fields once delivered
+    ENTITY_ANALYSIS_MAX_RETRY times, then ACKed, and is not processed again."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    if trigger == "sadi_503":
+        stub_sadi.respond(cleaned_id, 503)
+    else:
+        fake_llm.error = LLMProviderError("scripted failure", category=ErrorCategory.LLM)
+    started = datetime.now(UTC)
+
+    with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
+        async with start_consumer(**RECLAIM_ENV):
+            message_id = await streams.add(cleaned_id)
+
+            async def dead_lettered() -> bool:
+                return bool(await streams.dead_letters())
+
+            await _wait_for(dead_lettered, 15)
+            attempts_when_dead_lettered = len(_failed_attempts(logs, cleaned_id))
+            await asyncio.sleep(2 * CLAIM_TIMEOUT_S)  # two more sweeps
+
+    [(_entry_id, fields)] = await streams.dead_letters()
+    _assert_dead_letter(fields, message_id, {"cleaned_id": str(cleaned_id), "v": "1"}, 3, started)
+    assert await streams.pending() == {}
+    # Deliveries 1 and 2 are processed and fail; delivery 3 is dead-lettered unprocessed.
+    assert attempts_when_dead_lettered == 2
+    assert len(_failed_attempts(logs, cleaned_id)) == 2
+    assert len(stub_sadi.requests_for(cleaned_id)) == 2
+    assert fake_llm.calls == (0 if trigger == "sadi_503" else 2)
+    assert _dead_lettered(logs) == [("warning", message_id, 3, "retries_exhausted")]
+    assert await entity_events.rows(_source_url(cleaned_id)) == []
+
+
+async def start_gated_message_reclaimed_once_list_loaded(
+    start_consumer, hkex_feed, streams, stub_sadi, fake_llm, entity_events
+):
+    """A message held by the HK Stock List gate is redelivered and processed once the list
+    loads, without restarting the app."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM]
+    hkex_feed("empty")
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(**MANY_RETRIES_ENV):
+            message_id = await streams.add(cleaned_id)
+            await _wait_gated(logs, 1, 3)
+            assert stub_sadi.requests == []
+            assert message_id in await streams.pending()
+
+            hkex_feed("loaded")
+            assert await hk_stock_list.refresh_hk_stock_list() == LOADED_FEED_ENTRIES
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 10)
+            await asyncio.sleep(SETTLE_S)
+
+    assert {level for level, _message_id in _gated(logs)} == {"warning"}
+    assert len(stub_sadi.requests_for(cleaned_id)) == 1
+    rows = await entity_events.rows(_source_url(cleaned_id))
+    assert len(rows) == 1
+    assert await streams.published() == _announcements(rows)
+    assert await streams.pending() == {}
+    assert await streams.dead_letters() == []
+
+
+async def start_abandoned_message_recovered(start_consumer, streams, stub_sadi, fake_llm):
+    """A message left pending by a consumer that died is claimed by the app after the claim
+    timeout, processed and ACKed."""
+    cleaned_id = uuid.uuid4()
+    [message_id] = await streams.hold_as_ghost({"cleaned_id": str(cleaned_id), "v": "1"})
+    assert await streams.pending() == {message_id: 1}
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(**RECLAIM_ENV):
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 10)
+            await asyncio.sleep(SETTLE_S)
+
+    assert len(stub_sadi.requests_for(cleaned_id)) == 1
+    assert fake_llm.calls == 1
+    assert [record["entity_event_ids"] for record in _completed(logs, cleaned_id)] == [[]]
+    assert await streams.pending() == {}
+    assert await streams.dead_letters() == []
+
+
+MALFORMED_MESSAGES = [
+    {"cleaned_id": "not-a-uuid", "v": "1"},
+    {"v": "1"},
+    {"cleaned_id": "00000000-0000-0000-0000-000000000001"},
+    {"cleaned_id": "00000000-0000-0000-0000-000000000002", "v": "2"},
+]
+
+
+@pytest.mark.parametrize("path", ["read", "reclaim"])
+async def start_malformed_messages_dead_lettered(start_consumer, streams, stub_sadi, path):
+    """Messages this layer can never process (invalid or missing cleaned_id, missing or
+    unrecognised v) are dead-lettered with their original fields and ACKed without reaching
+    SADI, on the read and the reclaim path; the valid message behind them is processed."""
+    valid = uuid.uuid4()
+    stub_sadi.respond(valid, 404)  # ACKed without reaching the LLM
+    valid_fields = {"cleaned_id": str(valid), "v": "1"}
+    started = datetime.now(UTC)
+
+    with structlog.testing.capture_logs() as logs:
+        if path == "reclaim":
+            *malformed_ids, valid_id = await streams.hold_as_ghost(
+                *MALFORMED_MESSAGES, valid_fields
+            )
+        async with start_consumer(**RECLAIM_ENV):
+            if path == "read":
+                malformed_ids = [await streams.add_fields(m) for m in MALFORMED_MESSAGES]
+                valid_id = await streams.add_fields(valid_fields)
+            await _wait_acked(streams, stub_sadi, {valid: valid_id}, 10)
+
+            async def all_dead_lettered() -> bool:
+                return len(await streams.dead_letters()) >= len(MALFORMED_MESSAGES)
+
+            await _wait_for(all_dead_lettered, 5)
+            await asyncio.sleep(SETTLE_S)
+
+    delivery_count = 1 if path == "read" else 2
+    dead_letters = await streams.dead_letters()
+    assert len(dead_letters) == len(MALFORMED_MESSAGES)
+    by_message_id = {fields["message_id"]: fields for _entry_id, fields in dead_letters}
+    assert set(by_message_id) == set(malformed_ids)
+    for message_id, original in zip(malformed_ids, MALFORMED_MESSAGES, strict=True):
+        _assert_dead_letter(
+            by_message_id[message_id], message_id, original, delivery_count, started
+        )
+    assert sorted(_dead_lettered(logs)) == sorted(
+        ("warning", message_id, delivery_count, "malformed") for message_id in malformed_ids
+    )
+    assert [r.cleaned_id for r in stub_sadi.requests] == [str(valid)]
+    assert await streams.pending() == {}
+
+
+async def start_in_flight_duplicate_skipped(start_consumer, streams, stub_sadi, fake_llm):
+    """While a message's article is still being analysed, sweeps that claim the same message
+    skip it: SADI and the LLM are called once, and the message is ACKed once the analysis
+    finishes."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = []
+    fake_llm.hold = asyncio.Event()
+
+    async with start_consumer(**MANY_RETRIES_ENV):
+        message_id = await streams.add(cleaned_id)
+        await asyncio.wait_for(fake_llm.entered.wait(), 5)
+        await asyncio.sleep(4)  # at least two sweeps claim the message meanwhile
+        pending_while_held = await streams.pending()
+        fake_llm.hold.set()
+
+        async def acked() -> bool:
+            return message_id not in await streams.pending()
+
+        await _wait_for(acked, 5)
+        await asyncio.sleep(SETTLE_S)
+
+    # Delivered once by the read and at least twice more by sweeps, all while in flight.
+    assert pending_while_held[message_id] >= 3
+    assert len(stub_sadi.requests_for(cleaned_id)) == 1
+    assert fake_llm.calls == 1
+    assert await streams.dead_letters() == []
+
+
+async def start_failing_sweep_survives(start_consumer, streams, stub_sadi, infra):
+    """A sweep that fails is logged and retried on the next tick, while the consumer loop
+    keeps processing; once the cause clears, the stalled message is reclaimed by the same app
+    instance. Stopping the app logs no failed sweep."""
+    stalled, fresh = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.respond(stalled, 404)  # ACKed without reaching the LLM
+    stub_sadi.respond(fresh, 404)
+    [stalled_id] = await streams.hold_as_ghost({"cleaned_id": str(stalled), "v": "1"})
+    await streams.acl(
+        "SETUSER", ACL_USER, "on", f">{ACL_PASSWORD}", "~*", "&*", "+@all", "-xautoclaim"
+    )
+    stream_url = f"redis://{ACL_USER}:{ACL_PASSWORD}@127.0.0.1:{infra.redis_stream.port}/0"
+    try:
+        with structlog.testing.capture_logs() as logs:
+            async with start_consumer(**RECLAIM_ENV, REDIS_STREAM_URL=stream_url):
+
+                def failed_sweeps() -> list[MutableMapping[str, Any]]:
+                    return [log for log in logs if log["event"] == SWEEP_FAILED_EVENT]
+
+                async def two_sweeps_failed() -> bool:
+                    return len(failed_sweeps()) >= 2
+
+                await _wait_for(two_sweeps_failed, 3 * CLAIM_TIMEOUT_S + 1)
+                fresh_id = await streams.add(fresh)
+                await _wait_acked(streams, stub_sadi, {fresh: fresh_id}, 5)
+                assert stalled_id in await streams.pending()
+                assert stub_sadi.requests_for(stalled) == []
+
+                await streams.acl("SETUSER", ACL_USER, "+xautoclaim")
+                await _wait_acked(
+                    streams, stub_sadi, {stalled: stalled_id}, 2 * CLAIM_TIMEOUT_S + 1
+                )
+                failed_while_running = len(failed_sweeps())
+    finally:
+        await streams.acl("DELUSER", ACL_USER)
+
+    assert {log["log_level"] for log in failed_sweeps()} == {"warning"}
+    assert all(log["exc_info"] for log in failed_sweeps())
+    assert len(failed_sweeps()) == failed_while_running
+    assert not [log for log in logs if log["log_level"] in ("error", "critical")]
+    assert len(stub_sadi.requests_for(stalled)) == 1
+    assert await streams.pending() == {}
+    assert await streams.dead_letters() == []
+
+
+async def start_stream_redis_outage_reclaims_after(start_consumer, streams, stub_sadi, infra):
+    """While the stream Redis is down both loops warn and keep running; once it is back, a
+    message left pending before the outage is reclaimed and a new one is read, on the same
+    app instance."""
+    stalled, fresh = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.respond(stalled, 503)
+    stub_sadi.respond(fresh, 404)  # ACKed without reaching the LLM
+    redis_stream = infra.redis_stream
+
+    # A claim timeout longer than the wait before the outage, so the stalled message is
+    # still pending, unclaimed, when Redis stops.
+    async with start_consumer(**{**MANY_RETRIES_ENV, "STREAM_CLAIM_TIMEOUT_MS": "3000"}):
+        stalled_id = await streams.add(stalled)
+        await _wait_for(lambda: _requested(stub_sadi, stalled), 5)
+        await asyncio.sleep(1.5)  # the delivery reaches the append-only file within a second
+        with structlog.testing.capture_logs() as logs:
+            redis_stream.stop()
+            await asyncio.sleep(4)
+        redis_stream.restore()
+        await streams.reconnect()
+        stub_sadi.respond(stalled, 404)
+        await _wait_acked(streams, stub_sadi, {stalled: stalled_id}, 10)
+        fresh_id = await streams.add(fresh)
+        await _wait_acked(streams, stub_sadi, {fresh: fresh_id}, 5)
+
+    unreachable = [
+        log for log in logs if log["event"] == "entity_analysis_redis_stream_unreachable"
+    ]
+    assert len(unreachable) >= 2
+    assert {log["log_level"] for log in unreachable} == {"warning"}
+    assert not [log for log in logs if log["event"] == SWEEP_FAILED_EVENT]
+    assert not [log for log in logs if log["log_level"] in ("error", "critical")]
+    assert len(stub_sadi.requests_for(stalled)) >= 2
+    assert await streams.pending() == {}
