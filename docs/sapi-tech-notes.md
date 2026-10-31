@@ -2,88 +2,277 @@
 
 Learning notes from designing SAPI, the Redis Streams–based pipeline in this repo (Entity Analysis → Aggregation → Scoring → Cache). SAPI's binding design lives in `stock-assistant-pipeline-intelligence/docs/` (`impl.md` = `implementation.md`, `design.md` = `system-design.md` below); nothing here is a design decision for it.
 
-- **Part 1** lists concrete problems found while designing SAPI: what went wrong, why it was easy to miss, and the fix. It ends with the project's development tooling (§1.11).
-- **Part 2** covers the general topics behind them, for future investigation. Each ends with questions worth digging into.
+- **Part 1** gives SAPI's technical highlights for a reader new to the project: what the system does, then what was decided and why, with measured results where there are any. It stands alone, without the design docs. Its LLM items come from two spikes, whose full write-ups are `poc/sapi/fuzzy-match/README.md` and `poc/sapi/llm-skill/README.md`.
+- **Part 2** covers the general topics behind those highlights, for future investigation. Each ends with questions worth digging into.
 
 ---
 
-# Part 1 — Tech items highlighted from SAPI
+# Part 1 — Technical highlights
 
-## 1.1 Wait or spawn, and when to check a pause
+## 0. The system in one minute
 
-`WorkerPool.dispatch()` caps concurrent Entity Analysis LLM calls with an `asyncio.Semaphore`. The spec didn't say whether `dispatch()` waits for the work or spawns it in the background, and its docstring and prose disagreed on whether the rate-limit pause is checked before or after acquiring a slot.
-- **Why it was easy to miss:** both read as implementation details, but one choice decides where backpressure lives, and the other is a time-of-check vs time-of-use race: a worker that checked "not paused" before waiting for a slot starts work during a pause.
-- **Fix:** `dispatch()` waits for the work, and callers gather a whole batch. The pause is checked after acquiring, in a loop (impl.md §11.3).
-- **Topic:** §2.1.
+**What it is.** Mars Wealthfinder turns Hong Kong financial news into a ranked *Morning Brief*: the stock-moving events an investment researcher should read first. SAPI is its intelligence service. It takes cleaned articles from four sources (HKEX exchange filings, Ming Pao, AASTOCKS, Yahoo Finance HK). For each article it works out which listed companies the article is about. It then groups related articles into one story per stock, scores each story with rules plus an LLM, and serves the ranked list.
 
-## 1.2 A lost publish that a retry could never recover
+**Pipeline.** Four layers. Each is an independent consumer, the layers are connected by Redis Streams (a persistent message queue with at-least-once delivery), and Postgres is the system of record:
 
-Entity Analysis writes an article's EntityEvents to Postgres, then publishes them. A crash between the two left the message unacknowledged. On redelivery the LLM ran again, every insert hit `ON CONFLICT DO NOTHING`, and conflicting rows were dropped from the result, so the never-published EntityEvent stayed unpublished for good.
-- **Why it was easy to miss:** the idempotent insert, the thing that made redelivery "safe", is exactly what hid the missing publish. And because LLM output isn't deterministic, a rerun may not even produce the same entities.
-- **Fix:** write one article's rows in one transaction; before running the LLM, check whether rows already exist for the article, and if so republish their IDs instead of reanalysing (impl.md §11.1 step 3, design.md §3.4). The next layer absorbs the duplicate signal.
-- **Topics:** §2.2, §2.4.
+```
+article → Entity Analysis (LLM: which companies, what kind of event, what sentiment)
+        → Aggregation    (merge mentions of the same stock and event type into one story)
+        → Scoring        (rules + LLM)
+        → Cache          → Morning Brief API
+```
 
-## 1.3 A pause longer than the lease dead-letters healthy messages
+Stack: Python 3.12, asyncio, FastAPI, Redis Streams, PostgreSQL, Vertex AI (Gemini).
 
-With `RATE_LIMIT_BACKOFF_S=60`, a backoff longer than `STREAM_CLAIM_TIMEOUT_MS` lets the reclaim loop claim messages read before the pause. Their delivery count rises toward `ENTITY_ANALYSIS_MAX_RETRY` without a single real attempt.
-- **Why it was easy to miss:** the broker counts deliveries, not attempts, and the lease clock starts at delivery, not when work starts.
-- **Fix:** a deployment constraint, `RATE_LIMIT_BACKOFF_S * 1000 < STREAM_CLAIM_TIMEOUT_MS` (impl.md §11.3); the real values are tuned from production (Q-9).
-- **Topic:** §2.3.
+**Terms used below.**
 
-## 1.4 An in-progress marker that behaved like "done"
+| Term | Meaning |
+|---|---|
+| **Mention** | one company in one article, with its event type and sentiment (`EntityEvent` in the code) |
+| **Story** | all mentions of one stock and one event type within a sliding time window, up to a maximum total span (`Event` in the code) |
+| **Group** | the key a story is built under: (stock, event type). Each group has at most one live story. |
+| **Flush** | Aggregation keeps live stories in Redis, and periodically writes them to Postgres and tells Scoring which ones changed |
+| **HK Stock List** | the exchange's official list of about 2,800 listed equities, used to verify stock codes |
+| **Acknowledge / redeliver** | a consumer marks a message done. A message not acknowledged within a timeout is redelivered, and after N deliveries it goes to a dead-letter queue. |
 
-Aggregation keeps an in-memory set, `_enqueued`, so the same EntityEvent isn't processed twice at once. As first designed, an ID was removed only by the success callback. A failed DB read or merge left it behind, so every redelivery was skipped as "already in progress" until it was dead-lettered. A few seconds of DB trouble became a permanently lost EntityEvent.
-- **Why it was easy to miss:** the success path is the one you test. The leak shows only when something fails, recovers, and the message is redelivered. The set also lives on an object that survives the layer's auto-restart.
-- **Fix:** a failure callback that releases the ID without acknowledging, on every exit path (impl.md §12.1, §12.2).
-- **Topic:** §2.4.
+**Why it's hard.**
+- **An LLM in the hot path:** every article costs money and seconds, the provider rate-limits, and the output is non-deterministic, so it has to be verified.
+- **Company names in two languages and two scripts:** abbreviations, traditional vs simplified Chinese, the same company listed on more than one counter.
+- **At-least-once delivery across Postgres and Redis, which share no transaction:** every step must survive crashes and duplicate messages without losing or double-counting anything.
 
-## 1.5 Skipping unchanged rows silently dropped publishes
+Sections A and B are the strongest stories. A covers the LLM design and how it was evaluated (results measured on real articles). B covers reliability problems caught in design review, before any of that code was written.
 
-The Aggregation flush upserts every active Event and publishes `stream:event_aggregated` so Scoring re-scores it. To stop re-scoring unchanged Events, the write skipped rows whose `aggregation_updated_at` hadn't advanced, and only written rows were published. A crash between commit and publish then made the next flush a no-op, so the Event was never scored.
-- **Why it was easy to miss:** each half was correct on its own. "The retry is a no-op" plus "publish only what I just wrote" is what drops the message.
-- **Fix:** a transactional outbox as a column, `events.published_aggregation_updated_at`. The write makes a row pending in the same transaction; every flush publishes whatever is pending, then marks it (impl.md §10.2, §12.1; design.md §4.5).
-- **Topic:** §2.5.
+---
 
-## 1.6 An older snapshot overwriting newer state
+## A. LLM design and evaluation
 
-A flush reads a snapshot of every active Event from Redis, then writes it. In between, a group could merge again and have its Event replaced and persisted with newer state. The flush then wrote the older snapshot over it, and nothing ever corrected it, because the Event's Redis slot now held its successor.
-- **Why it was easy to miss:** "write only if it changed" (`IS DISTINCT FROM`) looks like enough, but older is also different.
-- **Fix:** write only if newer: `WHERE events.aggregation_updated_at < EXCLUDED.aggregation_updated_at` (impl.md §10.2).
-- **Topic:** §2.2 (conditional writes).
+### A1. One LLM call plus checks in code: more accurate, and with the model choice in A2, 8× cheaper and ~35× faster at p95
 
-## 1.7 One Redis slot per group lost a replaced Event's last merges
+**Problem.** For each article, the system must find the listed companies it is about (by stock code) and classify the event and its sentiment. The original design had the LLM verify each company by calling a stock-lookup tool in a loop, then make a second call to produce the final answer.
 
-Each group keeps one active Event in one Redis key. When an article fell outside the sliding window or broke the hard cap, the new Event overwrote that key, and every merge into the old Event since the last flush was lost.
-- **Why it was easy to miss:** the hard-cap path is a normal, frequent case, not an edge case, and the key layout made the overwrite invisible.
-- **Fix:** persist and publish the replaced Event before overwriting its key (impl.md §12.1).
+**Approach.** A time-boxed spike against the live Vertex AI API compared five design and model combinations on 127 real articles that no design was tuned on. The labels came for free: articles print stock codes next to company names. Each combination was measured on accuracy, cost, tail latency and failure rate.
 
-## 1.8 A TTL that could expire before any flush
+**Finding.** The tool loop was solving a problem the inputs had already solved. Articles almost always print the code, and the model already knows most HKEX codes: 94% of its tool calls only confirmed a code it already had. The check itself is deterministic, so it moved out of the model. One structured-output call returns each company with its code. Ordinary code then accepts the code if the official list's name for it agrees with the model's, or if the article prints it, and otherwise falls back to a name search (A3).
 
-Each merge resets the active Event's TTL to `min(window, remaining lifespan)`. Near the hard cap the remaining lifespan can be seconds, shorter than the flush interval, and `int()` can round it to `0`, which makes `EXPIRE` delete the key at once. Acknowledged merges then vanished unflushed.
-- **Why it was easy to miss:** the existing rule (flush interval far below the window) assumed the TTL is about the window, which isn't true near the cap.
-- **Fix:** add a grace period of two flush intervals, so every key outlives at least one flush. Merging is unaffected, because the decision comes from the Event's own span (impl.md §12.4).
+| Design and model | Accuracy (entity F1) | $ per 1,000 articles | p95 latency per article |
+|---|---|---|---|
+| Tool loop, Gemini 3.8 Flash | 0.930 | 8.74 | 217 s |
+| One call + code checks, same model | 0.947 | 2.98 | 130 s |
+| **One call + code checks, Gemini 3.1 Flash-Lite (A2)** | **0.962** | **1.14** | **6 s** |
 
-## 1.9 A late article splitting a live story
+The design change alone (first two rows) made the step more accurate and 3× cheaper. The model change (A2) did the rest. The final configuration had zero failed calls on this set. The loop exactly as first specified, with default settings, cost $23.09 per 1,000 articles on an earlier test set.
 
-`merge_or_create()` starts a new Event whenever an article falls outside the window, including when it's *older* than the active Event. A late backfill article would take over the group's slot, close the live Event early, and make the next current article start a third Event, splitting one story into pieces.
-- **Why it was easy to miss:** out-of-order handling was designed for small skews (min/max on timestamps), not for an article a day late.
-- **Fix, for now:** log `aggregation_late_entity_event_skipped` and skip it. Merging it into its older Event waits until logs show how often it happens (design.md §4.4).
+**Trade-off accepted.** About 6% of real articles name companies without printing any code (mostly sector round-ups). Those rely on the model's memory plus the name search. In a worst-case test with every code stripped, F1 is 0.913 against the loop's 0.984.
 
-## 1.10 A concurrency cap that mostly limited idle workers
+**Why it's subtle.** "Let the model check its work with a tool" sounds like the robust choice. The loop also had failure modes of its own. In one tool-calling mode the model must call a tool every turn, so the loop never ends. In the other it sometimes repeated a lookup until it hit the round limit. Dense market round-ups took 4–6 rounds of 10–16 lookups each.
 
-Aggregation runs one `GroupCoroutine` per `(exchange, stock_code, event_type_primary)` group, and each live group holds one `AGG_MAX_CONCURRENT` permit until it has been idle for `AGG_GROUP_IDLE_TIMEOUT_S` (impl.md §12.1, §12.3). A morning with more distinct active stocks than permits makes `process_entity_event()` wait for a permit inside the consumer loop, which also runs the flush triggers (§12.2), so intake and flushing stall together. Nothing is lost, but the output lags.
-- **Why it was easy to miss:** the cap looks like a resource limit, but it counts live objects, not running work, and waiting for it on the read path turns a capacity issue into "data stopped being persisted".
-- **Status:** open — size `AGG_MAX_CONCURRENT` above the peak number of active groups, and measure it in production.
-- **Topic:** §2.6.
+**Shows:** questioning an accepted design with measurements, moving deterministic work out of the model, and stating the trade-off explicitly. Background: §2.8.
 
-## 1.11 Development tooling
+### A2. Choosing the model by what the pipeline pays for
 
-- **uv** — creates the virtualenv and installs pinned dependencies. Chosen because it is much faster than pip and the repo already uses it (SADI's `requirements.lock` is compiled with `uv pip compile`).
-- **pytest + pytest-asyncio** — runs the unit tests; pytest-asyncio lets `async def` tests run without a per-test decorator (`asyncio_mode = "auto"`). Chosen because pytest is the Python standard and SADI already uses both, so tests look the same across services.
-- **ruff** — lints and formats the code in one tool, replacing flake8, isort and black. Chosen because a single fast tool with one config is easier to keep consistent than three. One choice follows from it: FastAPI route dependencies are written as `Annotated[T, Depends(...)]`, FastAPI's recommended form, which also satisfies ruff's `B008` rule against function calls in argument defaults.
-- **mypy (strict)** — checks types statically. Chosen to enforce the repo rule that values crossing a module boundary are strongly typed; strict mode rejects untyped functions and implicit `Any` in `app/`. Tests are checked too, but may leave their functions unannotated.
+**Problem.** Which Gemini model should run on every article? The instinct is "the strongest one we can afford".
 
-pytest, ruff and mypy are configured in the service's `pyproject.toml`; test-only dependencies are pinned in `requirements-test.txt`.
+**Approach.** Each candidate was measured on four things: accuracy against a quality ceiling, cost per article, tail latency, and failure rate under the real (shared) quota. In the same one-call design:
+
+| Model | Entity F1 | $ per 1,000 articles | Failed attempts (all spike runs) |
+|---|---|---|---|
+| Gemini 3.8 Flash (low thinking) | 0.947 | 2.98 | 7.6% of 1,376 attempts |
+| **Gemini 3.1 Flash-Lite** | **0.962** | **1.14** | **0.6% of 838** (p95 8 s) |
+
+During one ~20-minute provider capacity episode, 3.8 Flash failed all four attempts on 74 of 127 articles. Gemini 3.1 Pro was only run in the original tool loop, where it scored F1 0.703 at $41.33 per 1,000 articles, missing up to 30 companies on dense round-ups, so it went no further.
+
+**The noise floor.** For event type and sentiment, Pro served as the reference. Flash-Lite agreed with Pro on 89% of event types and 91% of sentiments, but Pro agrees with *itself* (two runs on the same articles) on only 95% and 97%. That self-agreement is the ceiling, and a gap smaller than the reference's own disagreement isn't evidence of a quality difference. Routing exchange filings to the bigger model bought nothing measurable.
+
+**Decision.** Gemini 3.1 Flash-Lite. Known weaknesses, accepted and handled: it rates some negative exchange filings as neutral (a share placing at a 19.5% discount, for example), and some of its summaries exceed the 100-character limit, which code truncates.
+
+**Shows:** evaluating models on cost, tail latency and reliability rather than benchmark quality alone, using self-agreement as a noise floor, and not over-buying capability. Background: §2.8.
+
+### A3. Matching company names: replacing an intuitive algorithm with a measured one
+
+**Problem.** When the model's stock code doesn't check out, the system searches the official list by company name. The original algorithm scored names by shared characters above a 0.6 threshold. On 475 labeled mentions from real articles it got 263 right, 80 wrong and missed 132. Inside the full pipeline it added 19 wrong matches and gained nothing.
+
+**Why it's subtle.**
+- **A wrong match is silent.** It returns a real, plausible stock code, and nothing downstream flags it. A miss only drops one mention.
+- **Chinese abbreviations keep the full name's characters in order, taken from anywhere in the name.** 農行 is short for 農業銀行 (Agricultural Bank of China), and 國壽 for 中國人壽 (China Life). Counting shared characters ignores order. Generic words (地產 "property", 銀行 "bank") match almost everything.
+- **The data had traps of its own:**
+  - The same company is listed on both an HKD and an RMB counter with the same name, so the two tied and file order picked the winner.
+  - Variant characters (恆/恒) look identical to a reader but not to `==`.
+  - The order of the normalization steps changed what a rule actually did.
+- **The fallback runs for only ~1.5% of companies,** so overall accuracy hides its damage unless it is measured on its own.
+
+**Approach.**
+- **Research:** the literature confirms that Chinese abbreviations are ordered subsequences of the full name, and that normalization matters at least as much as the choice of similarity measure.
+- **A labeled set built from free labels:** the `name(code)` pairs articles print, plus exchange filing headers, foreign tickers as "should not match" cases, and hand-collected hard cases.
+- **Ten rounds of changes,** each kept or rejected on the development half by *correct − 2 × wrong*, because a wrong answer costs more than no answer. Breaking ties by lowest stock code, for example, was rejected: it turned 9 misses into 3 right answers and 6 wrong ones.
+
+**Decision.**
+- **The matcher:** ordered-subsequence matching on normalized names (script and width folding, legal suffixes and generic words stripped), with no threshold, and a tie between companies counts as a miss.
+- **Data clean-up at load:** duplicate counters are dropped when the list loads.
+- **Shared normalization:** one normalizer serves both name checks.
+
+**Result.**
+
+| Set | Old algorithm (right / wrong / missed) | New (right / wrong / missed) |
+|---|---|---|
+| 475 labeled mentions | 263 / 80 / 132 | **431 / 12 / 32** |
+| Held-out exchange filings, scored once | 1 / 2 / 46 | **42 / 2 / 5** |
+| Held-out news and filings, scored once against a pass bar set in advance | 106 / 10 / 82 | **187 / 2 / 9** (1.0% wrong; the bar was ≤ 3%) |
+
+The matcher answers in p99 ~5 ms over the whole list, so it doesn't need a worker thread. What string matching can't solve (irregular abbreviations, mainland companies' English legal names) is documented, with an alias table as the known remedy.
+
+**Shows:** replacing intuition with labeled data, designing for the asymmetric cost of errors, experimental discipline (held-out sets, a pre-set pass bar, rejected rounds recorded), and knowing where a technique stops working. Background: §2.7.
+
+### A4. Making the numbers behind a decision reproducible
+
+**Problem.** In review, every figure in the LLM spike's write-up was re-derived from the committed run records, and several didn't hold:
+- **Label leakage.** The "every code stripped" worst-case set still contained the answer for some exchange filings: in a synthetic title, and in a `Stock code (if listed) 00595` line. The models used it.
+- **A moving input.** The evaluation scripts read the prompt live from the design doc. Once the doc was updated with the new design, they no longer ran the prompt that had produced the results.
+- **Inconsistent denominators.** One model's failure rate was per successful call, the other's per attempt.
+- **Stale or misattributed figures.** One figure came from an earlier version of the verifier, and one result was credited to the wrong variant.
+- **Data hygiene.** Third-party article titles had been committed inside run records.
+
+**Why it's subtle.** Each number was right when it was written. The drift came from later changes to shared inputs (prompt, verifier, normalizer) without a re-run. And a "codes stripped" test set built with regular expressions is only as clean as its patterns.
+
+**Decision.**
+- **Frozen inputs:** a versioned prompt copy and a snapshot of the stock list.
+- **Scripted figures:** every split and figure is derived by a script, and each metric states one denominator.
+- **Leakage checks and re-scoring:** constructed test sets are scanned for leaked labels, and stored model outputs are re-scored offline after every verifier change.
+- **No third-party text** is committed.
+
+**Shows:** treating the numbers behind a design decision like code that needs review, and handling data governance. Background: §2.10.
+
+### A5. De-risking an external API before committing to a design
+
+**Problem.** The design was written from documentation. Running it against the live API before any production code was written turned up six behaviours the docs didn't make obvious:
+- **No default timeout.** SDK calls hung for ~260 s. With an explicit timeout a hang becomes a clean `504`, and the SDK makes exactly one attempt unless retries are configured.
+- **A library's retry broke the protocol.** The structured-output library (Instructor) retried by sending the error back as a *model* message, which Gemini rejects. The API's native structured output already enforces the schema, so the library was dropped.
+- **Hidden tokens.** "Thinking" tokens are billed as output and count against the output limit, so a limit sized from visible output can truncate answers.
+- **Region and quota.** Current models are served only from the `global` endpoint. The quota is a shared pool: rate limits arrived at 4 or fewer concurrent calls, and there is no fixed requests-per-minute figure to size concurrency against.
+- **Input size.** One exchange filing was 2 million characters, so input is capped at 30,000 before the call.
+- **A cost lever that didn't apply.** Prompt caching needs ≥ 4,096 tokens, and the prompt is ~1,800.
+
+**Shows:** treating a third-party dependency as unknown until measured, and turning each surprise into an explicit setting (timeout, retry owner, token budget, input cap). Background: §2.9.
+
+---
+
+## B. Reliability in an at-least-once pipeline
+
+All of these were caught while reviewing the design, before implementation. Each one is a way to lose or corrupt data silently.
+
+### B1. An idempotent insert that hid a lost message
+
+**Problem.** Entity Analysis saves an article's mentions to Postgres, then publishes one message per mention to Aggregation. A crash between the two leaves the incoming article message unacknowledged, so it is redelivered. As first designed, the retry ran the LLM again and re-inserted. Every insert was a no-op because the rows already existed, and only newly inserted rows were published. So the lost message was never sent, and those mentions never reached a story.
+
+**Why it's subtle.** The idempotent insert, the thing that made retries "safe", is exactly what hid the missing publish. And LLM output is non-deterministic, so a rerun might not even find the same companies.
+
+**Decision.** Save an article's mentions in one transaction. On every delivery, first check whether the article already has saved mentions. If it does, republish their IDs and skip the LLM entirely. The next layer already ignores duplicates.
+
+**Shows:** reasoning about the crash point between two systems, and making a retry recover from saved state instead of redoing paid, non-deterministic work. Background: §2.2, §2.4.
+
+### B2. The dual-write problem: a transactional outbox in one column
+
+**Problem.** Each flush writes live stories to Postgres and publishes "re-score this story" to Scoring. To avoid paying for LLM re-scoring of unchanged stories, the write skipped unchanged rows and only what it wrote was published. A crash after the commit but before the publish meant the retry found nothing changed, wrote nothing and published nothing, so the story was never scored.
+
+**Why it's subtle.** Each half was correct on its own. It is the classic dual-write problem: Postgres and Redis share no transaction, so "save" and "notify" can't be made atomic directly.
+
+**Decision.** A transactional outbox, kept as a column instead of a separate table. In the same transaction as the write, a story is marked "pending publish": its last-change timestamp is newer than its last-published one. After the commit, every pending story is published and then marked published. A crash leaves the marker in place, and the next flush publishes it.
+
+**Outcome.** Every committed change is published at least once, and unchanged stories still cost no LLM calls.
+
+**Shows:** recognising a known distributed-systems pattern and fitting it with the least machinery (one column, no separate relay process). Background: §2.5.
+
+### B3. An "in progress" marker that behaved like "done"
+
+**Problem.** Aggregation keeps an in-memory set of mentions currently being processed, so a redelivered copy isn't processed twice at once. An entry was removed only on success. A failure, such as a few seconds of database trouble, left it behind. Every redelivery was then skipped as "already in progress" until the message was dead-lettered, so a brief outage became permanently lost data.
+
+**Why it's subtle.** The success path is the one you test. The leak only appears when something fails, recovers, and the message is redelivered. The set also lives on an object that survives the layer's automatic restart.
+
+**Decision.** Release the marker on every exit path. A failure releases it without acknowledging, so the retry runs normally. General rule: an in-memory guard is for concurrency only, never for correctness.
+
+**Shows:** thinking in three states (not started / in progress / done) rather than two, and designing for the fail–recover–redeliver path. Background: §2.4.
+
+### B4. An older snapshot overwriting newer data
+
+**Problem.** A flush reads a snapshot of all live stories from Redis, then writes them. In between, a story could be closed, replaced, and saved with newer state. The flush then wrote the older snapshot over it, and nothing would ever correct it.
+
+**Why it's subtle.** "Write only if changed" looks like enough, but an older version is also "changed".
+
+**Decision.** A conditional write that applies only if the incoming version is newer, compared by last-change timestamp. This is optimistic concurrency control, with no locks.
+
+**Shows:** spotting a lost-update race, and choosing versioned conditional writes over locking. Background: §2.2.
+
+### B5. Acknowledged work that lived only in Redis
+
+Live stories sit in Redis between flushes, after their input messages have been acknowledged, so the queue can no longer redeliver them. The design had two ways to lose that state:
+- **Replacement.** Each group has one Redis key for its live story. When a mention falls outside the time window, or the story reaches its maximum span (a frequent, normal case), the new story overwrote the key. Every merge into the old story since the last flush was lost. **Fix:** save and publish the replaced story before overwriting.
+- **Expiry.** Each live story's key expires after `min(window, remaining span)`. Near the maximum span the remaining time can be a few seconds, shorter than the flush interval, and rounding to whole seconds can make it 0, which deletes the key at once. **Fix:** add a grace period of two flush intervals, so every key outlives at least one flush. Merge decisions use the story's own timestamps, so they are unaffected.
+
+**Why it's subtle.** Once a message is acknowledged, the broker can no longer help. The safety rule "the expiry ≈ the window, which is far longer than the flush interval" stops holding at the edge of the story's lifespan.
+
+**Shows:** following a piece of state through its whole lifecycle, and checking the edge cases of time arithmetic.
+
+### B6. A rate-limit pause that dead-lettered healthy messages
+
+**Problem.** On a rate-limit response (HTTP 429), the whole worker pool pauses for 60 s. Messages already read wait without being processed. The queue's redelivery timeout treats them as stalled, so it redelivers them and counts another delivery each time, and after N deliveries they are dead-lettered without a single real attempt.
+
+**Why it's subtle.** The broker counts deliveries, not attempts, and its timeout starts at delivery, not when work starts. Two settings that are each sensible interact badly.
+
+**Decision.** A documented deployment constraint: the pause must be shorter than the redelivery timeout. The real values are tuned from production.
+
+**Shows:** reasoning about interactions between independent timeouts. Background: §2.3.
+
+---
+
+## C. Concurrency
+
+### C1. Where backpressure lives, and a check-then-act race
+
+**Problem.** LLM calls are capped by a semaphore. The spec didn't say whether dispatching work waits for it to finish or spawns it in the background. Its two descriptions also disagreed on whether the rate-limit pause is checked before or after a worker takes a slot.
+
+**Why it's subtle.** Both read as implementation details, but they aren't:
+- **Spawning in the background** puts no limit on how much is read. Work piles up in memory, and its redelivery timeouts keep running (see B6).
+- **Checking the pause before taking a slot** is a time-of-check/time-of-use race. A worker sees "not paused" and waits for a slot. Meanwhile another worker hits the rate limit. The first worker then starts *during* the pause.
+
+**Decision.** Dispatch waits, and the reader processes one batch at a time. The pause is checked after taking the slot, in a loop, right before the call.
+
+**Shows:** precision about concurrency semantics, and finding races in a spec before they become code. Background: §2.1.
+
+### C2. A concurrency cap that mostly limited idle workers (open, by choice)
+
+**Problem.** Aggregation runs one serial worker per group, so a story is only ever updated by one task at a time. Workers are capped by a semaphore, but each worker holds its permit for its whole life, including the idle time before it shuts down. On a busy morning with more active stocks than permits, a new group waits for a permit inside the read loop, and that same loop also triggers flushes. So intake and saving stall together. Nothing is lost, but the output lags.
+
+**Why it's subtle.** The cap looks like a resource limit, but it counts live objects, not running work. And waiting for it on the read path turns a capacity issue into "data stopped being saved".
+
+**Decision.** A deliberate scope call:
+- **For the first release:** size the cap above the measured peak number of active groups.
+- **Deferred, with a written plan:** the proper fix (hold a permit only while working) changes the worker lifecycle. It is documented as a known limitation, with the metric to watch after release.
+
+**Shows:** scoping a fix, and shipping a documented mitigation instead of an unmeasured redesign. Background: §2.6.
+
+---
+
+## D. Domain semantics
+
+### D1. A late article splitting a live story
+
+**Problem.** A new story starts whenever a mention falls outside the time window, including when it is *older* than the live story (a crawler backfilling a day late). The late mention would take the group's only live slot and close the live story early. The next current article would then start a third story, so one story would be split into pieces.
+
+**Why it's subtle.** Out-of-order handling was designed for small timing skews (taking min/max of timestamps), not for an article a day late.
+
+**Decision.** Log and skip late mentions for now. Merging them into the older story they belong to waits until the logs show how often this happens.
+
+**Shows:** handling a rare case simply, and adding instrumentation before building for it.
+
+---
+
+## Appendix — Development tooling
+
+- **uv** manages the virtualenv and pinned dependencies: much faster than pip, and the repo already uses it.
+- **pytest + pytest-asyncio** run the tests, the same as the sibling service.
+- **ruff** lints and formats in one tool, replacing flake8, isort and black.
+- **mypy (strict)** enforces the repo rule that any value crossing a module boundary is strongly typed.
+
+All four are configured in the service's `pyproject.toml`. Test-only dependencies are pinned in `requirements-test.txt`.
 
 ---
 
@@ -117,7 +306,7 @@ There are two possible orders:
 
 General rule: **check a condition as close as possible to the action it guards, with nothing that can yield in between.** The same rule is behind any check-then-insert dedup guard.
 
-SAPI: §1.1.
+SAPI: §C1.
 
 ### To investigate
 - Structured concurrency: what it guarantees, and why "no orphan tasks" is a correctness property, not just tidiness.
@@ -163,7 +352,7 @@ SAPI is at-least-once at every layer: Redis Streams consumer groups, `XACK` only
 | **Transactional outbox** | Write the business row and an "outgoing message" row in one DB transaction; a separate relay publishes from the outbox. | Removes the "saved but not published" crash window on the producer side. |
 | **Broker transactions** | e.g. Kafka's transactional producer commits consumer offsets and output messages atomically. | Strong, but only while every effect stays inside the broker. An external API call is still at-least-once. |
 
-SAPI: §1.2 (an idempotent insert hiding a lost publish), §1.6 (a version check that has to mean "newer", not just "different").
+SAPI: §B1 (an idempotent insert hiding a lost publish), §B4 (a version check that has to mean "newer", not just "different").
 
 ### Side effects you can't make idempotent
 Some work can't be safely repeated or undone: an LLM call costs money, an email is sent, a payment is charged. Ways to handle it:
@@ -208,7 +397,7 @@ Ways around it:
 - Base the DLQ decision on **real attempts**, tracked by the application, not the broker's delivery count.
 - On a pause, stop reading new messages, so the pause doesn't age messages you've already taken.
 
-SAPI: §1.3.
+SAPI: §B6.
 
 ### To investigate
 - How each broker in the table really behaves at the edges: what happens to in-flight work when a lease expires, and whether the old consumer finds out.
@@ -269,7 +458,7 @@ Success commits both, so the message is never processed again. A failure or cras
 - When work is handed off asynchronously, a failure inside that work may never reach the code that owns the marker.
 - **Test the redelivery path explicitly:** fail once, recover, redeliver, and assert that the second delivery actually runs and succeeds only once.
 
-SAPI: §1.2 (patterns 2 and 4 together in Entity Analysis), §1.4 (pattern 4 without a failure callback).
+SAPI: §B1 (patterns 2 and 4 together in Entity Analysis), §B3 (pattern 4 without a failure callback).
 
 ### To investigate
 - The inbox pattern vs idempotency keys vs natural keys: when a separate processed-messages table is worth its extra write.
@@ -323,7 +512,7 @@ Takeaways:
 - The outbox gives **at-least-once**, never exactly-once. Pair it with idempotent consumers.
 - Watch for **"the retry is a no-op, so nothing gets re-sent"**: an idempotent write that skips unchanged rows, combined with "publish only what I just wrote", silently drops messages lost to a crash. The pending marker is what breaks that link.
 
-SAPI: §1.2, §1.5.
+SAPI: §B1, §B2.
 
 ### To investigate
 - Outbox relay designs: polling with `SELECT … FOR UPDATE SKIP LOCKED`, Postgres `LISTEN/NOTIFY`, or CDC on the outbox table. Ordering guarantees with multiple relay instances.
@@ -361,7 +550,7 @@ Ways around it:
 
 General rule: **a concurrency limit should guard the scarce resource itself** (connections, CPU, an API quota), **not a proxy for it** (number of objects alive).
 
-SAPI: §1.10.
+SAPI: §C2.
 
 ### To investigate
 - How actor runtimes bound per-key actors: Akka's passivation, Orleans' grain deactivation and activation limits.
@@ -371,8 +560,178 @@ SAPI: §1.10.
 
 ---
 
+## 2.7 Matching names against a reference list
+
+Mapping a free-text mention ("騰訊", "Tencent", "騰訊控股有限公司") to exactly one record in a reference list is called *entity linking* or *record linkage*. It comes up with company names, people, addresses and product catalogues. Three questions decide most of the result: how you normalize, which matcher shape fits how the names actually vary, and what a wrong answer costs compared with no answer.
+
+### Normalize first
+
+Normalization often does more than the matcher. In the fuzzy-matching spike, exact match after normalization alone was right 126 times on the dev half with zero wrong answers. Stripping legal suffixes added 19 more, still with none wrong. Typical steps:
+- **Script and width folding:** traditional→simplified (OpenCC), full-width→ASCII (Unicode NFKC does the width part), casefolding.
+- **Variant characters** that NFKC doesn't fold (恆/恒, 滙/匯).
+- **Legal suffixes** (有限公司, Limited, Co., Ltd.) and **generic tails** (控股, 集團, Holdings, Group).
+- **List-specific markers and duplicate rows** (HKEX's `－Ｒ`/`－Ｔ` counters).
+
+Apply the *same* function to both sides, and prepare the list side once at load, not on every call.
+
+### Pick the matcher that models how names vary
+
+| Family | Handles well | Fails on |
+|---|---|---|
+| Exact after normalization | spelling variants the normalizer folds | anything shortened |
+| Edit distance (Levenshtein, Jaro-Winkler) | typos, one-character differences | abbreviations: 農行 vs 農業銀行 is a large edit |
+| Token measures (`token_set_ratio`, `WRatio`) | reordered words, Latin names | CJK text has no word boundaries |
+| Character n-gram TF-IDF + cosine | fast approximate search over large lists | short queries share n-grams with many names |
+| **Ordered subsequence** | **Chinese abbreviations, which keep characters in order from anywhere in the name** | short real names inside longer ones (瑞銀 ⊂ 華泰瑞銀) |
+
+General rule: **choose the similarity measure from the process that generates the variation** (typing errors, abbreviation, translation, reordering), not from what a library offers by default.
+
+### A wrong answer costs more than no answer
+
+A miss drops one mention. A wrong match invents a false entity that flows on silently. Score matchers with an asymmetric utility (the spike used correct − 2 × wrong), and prefer designs that can say "don't know":
+- **A tie is a miss.** Breaking ties by lowest stock code turned 9 misses into 3 right answers and 6 wrong ones, so it was rejected.
+- **Who else can recover a miss?** In Entity Analysis the article's printed code and the model's own knowledge come first, so the name search only needs to be right when it answers, not to answer often.
+- **Measure the component inside its pipeline.** §4.2's matcher looked mediocre in isolation, but only end-to-end F1 showed it was *worse than nothing* (§A3).
+
+### What rules can't do
+- Irregular abbreviations (中海油 = 中國海洋石油) need an **alias table**: the standard remedy, but it needs upkeep, and can't be tested fairly on the data it was seeded from.
+- Cross-language names need the code, the other-language name, or a knowledge base.
+
+### Cost
+Precompute the comparison forms at load, pre-filter candidates cheaply (here, names whose characters aren't nested with the query's), and index where you can (English word prefix → stocks). S8 runs at p99 ~5 ms over 2,798 stocks, small enough to stay on the event loop.
+
+SAPI: §A3.
+
+### To investigate
+- Record-linkage theory: the Fellegi–Sunter model, and blocking/indexing for large lists.
+- Unicode normalization forms (NFC vs NFKC), CJK compatibility and variant characters, and OpenCC's configurations (`t2s` vs `hk2s`).
+- Learned entity linking: dense retrieval plus a cross-encoder re-ranker, and when it beats rules on a list this small.
+- Alias tables and knowledge bases (Wikidata company aliases): sourcing, upkeep, and evaluating them without leakage.
+- Romanization and pinyin matching for names that appear only in English.
+- Precision–coverage curves as a way to choose an operating point for a matcher.
+
+---
+
+## 2.8 LLMs in a pipeline: extract with the model, verify in code
+
+An LLM step in a data pipeline is best treated as an unreliable but capable extractor whose output code checks. The design question is **which part only the model can do, and which part code can do deterministically.**
+
+### Split the work
+- **The model:** read prose, decide which companies an article is about, classify events and sentiment, recall facts it knows (an HKEX code).
+- **Code:** check that the code exists, that the name agrees with the listed name, that the article actually prints the code, that enums and lengths are valid, and dedup. These checks are cheap, deterministic and testable, and they catch hallucinated entities.
+- **Ground the output in the source text** wherever possible (the "article prints the code" check). It is the cheapest hallucination detector there is.
+
+### One structured call or a tool loop?
+
+| | One structured-output call, then code checks | Tool-calling loop |
+|---|---|---|
+| Round trips | one | one per round, plus a final answer |
+| Cost and latency | bounded and predictable | grow with how dense the input is |
+| Termination | trivial | must be designed: forced-call modes never stop, free modes can repeat calls, so you need round caps |
+| Needed when | the answer can be checked after the call | the model must fetch information it can't know, and it can't be checked afterwards |
+
+Rule: **if verification can run after the call, run it after the call.** A tool earns its place when it gives the model information it needs to *reason* further, not when it only confirms something code can confirm.
+
+### Choosing a model
+- **Set a ceiling first:** run the strongest model against itself. A gap smaller than its self-disagreement isn't a quality difference.
+- **Then compare what the pipeline pays for:** cost per unit of work (with thinking tokens billed as output), tail latency (p95 and max, not the mean), and failure rate under real load and a shared quota.
+- Choose the **smallest model that clears the bar**, and route to a bigger one only for a slice where routing measurably helps.
+
+### Schema-valid is not correct
+Structured output guarantees the shape: fields, types, enums. It doesn't guarantee the content. Keep business validation (length limits, allowed combinations, cross-field rules) in code after the call, and decide per rule whether to fix (truncate) or reject.
+
+SAPI: §A1, §A2.
+
+### To investigate
+- Constrained decoding: how JSON-schema output is enforced at the token level, and what it does to quality.
+- Evaluating LLM output: agreement ceilings, Cohen's kappa, and LLM-as-judge pitfalls (position and self-preference bias).
+- Model cascades and routing (e.g. FrugalGPT): when a cheap-first, escalate-on-doubt design pays off.
+- Prompt and skill versioning in production, and how a prompt change is rolled out and compared (design.md §9.1.1).
+- Thinking or reasoning budgets: when they help extraction tasks, and what they do to cost and tail latency.
+
+---
+
+## 2.9 Calling a hosted LLM API in production
+
+A hosted LLM is a slow, rate-limited, paid, non-deterministic remote dependency. Everything that applies to a remote API applies, and a few things are specific to LLMs.
+
+### Timeouts and retries
+- **Always set a timeout explicitly.** An SDK default can be "none", and one hung call then holds a worker for minutes.
+- **Know who retries.** The SDK (`retry_options`), a wrapper library, and your own code can each retry. Pick one owner, or the attempts multiply. Libraries can also retry in ways the provider rejects (Instructor's model-turn re-ask, §A5).
+- **A paid call is a side effect you can't undo** (§2.4, pattern 5). Cap attempts, and avoid redoing a call whose result was already stored (§B1).
+
+### Classify errors by what to do next
+
+| Error | Meaning | Action |
+|---|---|---|
+| 429 | rate limit or quota | pause the whole pool, then retry (§2.1) |
+| 5xx / 504 | provider trouble or a deadline hit | retry with backoff, bounded |
+| other 4xx, schema failures | the request itself is wrong | don't retry; fix the code or prompt |
+| 401 / 403 | credentials or project | alert a human |
+
+SAPI's mapping is in impl.md §7.2.
+
+### Tokens, quotas and inputs
+- **Count all three token kinds:** input, visible output and thinking. Thinking counts against `max_output_tokens`.
+- **Know the quota model.** Fixed RPM gives you a number to size concurrency against. A dynamic shared pool returns 429s at low concurrency and gives no such number. Provisioned throughput buys a guarantee. Also check which regions actually serve the model.
+- **Bound the input before the call.** Real documents can be orders of magnitude larger than test ones.
+- **Check feature thresholds before counting on them.** Context caching has a minimum prompt size.
+
+SAPI: §A5.
+
+### To investigate
+- Provisioned throughput vs on-demand pricing, and the break-even volume.
+- Hedged requests for tail latency, and why they're risky for paid, non-idempotent calls.
+- Batch prediction APIs: cheaper asynchronous processing for work that isn't latency-sensitive.
+- LLM observability: per-call token, latency and cost logs, and alerting on cost drift.
+- Provider fallback (a second model or region) and how it interacts with evaluated quality.
+
+---
+
+## 2.10 Running a spike as a measured experiment
+
+A spike answers a design question with evidence. Both Entity Analysis spikes worked because they were run like small experiments, and the PR review of one showed how easily such an experiment drifts (§A4).
+
+### Build the test set from real data
+- **Look for labels the data gives you for free:** news articles print `name(code)`, and HKEX announcements print the issuer's code in the header. Foreign tickers (`name(TICKER.US)`) give negatives, cases where the right answer is "no match".
+- **Add hand-collected hard cases** (abbreviations, ambiguous prefixes, A/H names), and adjudicate by reading wherever the automatic gold has gaps.
+
+### Keep tuning data and judging data apart
+- **Split dev and test by a hash of the query or the company,** so the same company never sits in both halves. Tune on dev; look at test only to confirm.
+- **Score a held-out set exactly once,** on a frozen version, against a pass bar written down *before* scoring. The fuzzy-matching spike's bar was "more right than `WRatio`, and at most 3% wrong".
+- **Reserve untouched data for whoever implements the design** (here, 288 articles neither spike read).
+- **Record rejected rounds with their numbers** (S9, S10), so nobody has to re-run them to know why they were dropped.
+
+### Measure in context, cheaply
+Component accuracy and end-to-end accuracy can disagree (§A3). **Store raw model outputs, then replay them offline** with one component swapped: the fuzzy-matching spike compared five fallbacks on the LLM spike's stored outputs with no API calls and no LLM randomness between variants.
+
+### Make every figure reproducible
+- Freeze the inputs: prompt copies, list snapshots, commit hashes.
+- Derive every split and number from a committed script, never from a hand edit.
+- State one denominator per metric (per attempt vs per success).
+- Scan constructed test sets for leaked labels.
+- Re-score after any change to a shared component.
+- Commit no third-party text, and gitignore raw exports.
+
+### Small samples
+127 articles is small. 0.954 vs 0.962 is a handful of entities. Read the actual errors behind a difference before believing the score, and treat gaps within the reference model's own disagreement as ties.
+
+SAPI: §A1–§A5.
+
+### To investigate
+- Bootstrap confidence intervals and paired tests (McNemar's test) for small evaluation sets.
+- Overfitting to a dev set through repeated tuning: adaptive data analysis, the "garden of forking paths", and reusable holdouts.
+- Pre-registration: why fixing the pass bar in advance matters.
+- A taxonomy of data leakage (Kaufman et al., "Leakage in Data Mining").
+- LLM evaluation tooling (promptfoo, Inspect, OpenAI Evals) vs the hand-rolled scripts used here.
+
+---
+
 ## Further reading
 - Martin Kleppmann, *Designing Data-Intensive Applications*: chapters 8 (distributed system problems), 9 (consistency), 11 (stream processing).
 - Gregor Hohpe & Bobby Woolf, *Enterprise Integration Patterns*: Idempotent Receiver, Dead Letter Channel, Guaranteed Delivery, Competing Consumers.
 - Confluent's posts on Kafka exactly-once semantics.
 - microservices.io (Chris Richardson): Transactional Outbox, Idempotent Consumer, Saga.
+- Chip Huyen, *AI Engineering*: the chapters on evaluation methodology and on building inference pipelines around a model.
+- Peng, Yu & Dredze, "An Empirical Study of Chinese Name Matching and Applications" (ACL 2015), and the study of Chinese abbreviations as ordered subsequences at [arXiv 1712.06289](https://ar5iv.arxiv.org/html/1712.06289): the two papers behind the fuzzy-matching spike's direction.
+- Kaufman, Rosset & Perlich, "Leakage in Data Mining: Formulation, Detection, and Avoidance" (KDD 2011).
