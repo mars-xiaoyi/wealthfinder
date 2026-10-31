@@ -166,8 +166,7 @@ sapi/
 │   │   ├── errors.py                    # SAPIError base + NotFoundError / ServiceUnavailableError / ParseError / ...
 │   │   ├── http_client.py               # get_http_client()/create_http_client() — shared httpx.AsyncClient singleton (§4.2); translate_client_errors decorator (§9)
 │   │   ├── stock.py                     # Stock dataclass — the HK Stock List's entry type, also used by EntityAnalysisSkill (§4.2)
-│   │   ├── hk_stock_list.py             # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; name index; lookup_stock + name_matches_stock; no Redis (§4.2)
-│   │   └── supervised.py                # run_supervised() — leak-free concurrent-coroutine supervision, used by every layer's start() (§6.1)
+│   │   └── hk_stock_list.py             # HKStockListCache + get_hk_stock_list_cache(); HKEXnews fetch + equity filter; name index; lookup_stock + name_matches_stock; no Redis (§4.2)
 │   ├── layer_tasks.py                   # register_layer_tasks()/get_layer_tasks() — the four layer Tasks, for GET /health's liveness check (§15.6)
 │   ├── logger.py                        # Unified system logger; structlog; stdout JSON output (§4.3)
 │   ├── config.py                        # App config: env var loading
@@ -473,7 +472,8 @@ class RedisConfig:
     stream_url: str                 # env: REDIS_STREAM_URL
     state_url: str                  # env: REDIS_STATE_URL
     reconnect_interval_s: int       # env: REDIS_RECONNECT_INTERVAL_S (default 5)
-    stream_claim_timeout_ms: int    # env: STREAM_CLAIM_TIMEOUT_MS
+    stream_claim_timeout_ms: int    # env: STREAM_CLAIM_TIMEOUT_MS (default 300000 — above the longest legitimate
+                                    # processing of one message and above RATE_LIMIT_BACKOFF_S: system-design.md §12.1)
 ```
 
 #### Class: `LLMConfig`
@@ -495,7 +495,7 @@ class EntityAnalysisConfig:
     batch_size: int                       # env: ENTITY_ANALYSIS_BATCH_SIZE (default 10)
     batch_timeout_ms: int                 # env: ENTITY_ANALYSIS_BATCH_TIMEOUT_MS (default 5000)
     max_concurrent: int                   # env: ENTITY_ANALYSIS_MAX_CONCURRENT
-    max_retry: int                        # env: ENTITY_ANALYSIS_MAX_RETRY
+    max_retry: int                        # env: ENTITY_ANALYSIS_MAX_RETRY (default 3)
     max_input_chars: int                  # env: ENTITY_ANALYSIS_MAX_INPUT_CHARS (default 30000) — article body cut before
                                            # the LLM call (§8.2); HKEX announcements reach 2,000,000+ chars
     sadi_api_url: str                     # env: SADI_API_URL — local dev default: http://localhost:8000
@@ -1304,7 +1304,7 @@ class StreamMessage:
 
 @dataclass
 class ReclaimedMessage(StreamMessage):
-    delivery_count: int   # XAUTOCLAIM's native redelivery counter — system-design.md §12.1's "Retry Count via delivery_count"
+    delivery_count: int   # deliveries so far, this claim included — system-design.md §12.1's "Retry Count via delivery_count"
 ```
 
 #### Function: `get_redis_stream_client() -> RedisStreamClient`
@@ -1362,11 +1362,15 @@ Purpose : Acknowledge a processed message (XACK). Call ONLY after every write
 #### Method: `autoclaim(stream, group, consumer, min_idle_ms, count) -> list[ReclaimedMessage]`
 
 ```
-Purpose : Reclaim messages pending (unACKed) longer than min_idle_ms (XAUTOCLAIM).
-Returns : List of ReclaimedMessage. delivery_count is XAUTOCLAIM's native
-          redelivery counter — system-design.md §12.1's "Retry Count via delivery_count"
-          policy reads this directly, no separate Redis state is needed to
-          track attempts.
+Purpose : Reclaim messages pending (unACKed) longer than min_idle_ms (XAUTOCLAIM, from
+          start id 0-0), then read each claimed message's delivery counter with
+          XPENDING <stream> <group> <id> <id> 1 — one pipelined round trip for the batch.
+          XAUTOCLAIM itself returns only the claimed ids and fields; the counter it
+          increments lives in the pending entry. A message with no pending entry left was
+          ACKed by the other loop since the claim, and is left out.
+Returns : List of ReclaimedMessage. delivery_count is the pending entry's times_delivered,
+          this claim included — system-design.md §12.1's "Retry Count via delivery_count".
+Raises  : redis.ConnectionError / redis.TimeoutError, untranslated (Reconnect behaviour, below).
 ```
 
 #### Method: `create_group_if_not_exists(stream: str, group: str) -> None`
@@ -1405,15 +1409,15 @@ async def ping(self) -> None:
 
 #### Reconnect behaviour
 
-Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`/`autoclaim()` let `redis.ConnectionError` and `redis.TimeoutError` through untranslated. Each layer's consumer loop catches them around its own calls, logs a WARNING (`entity_analysis_redis_stream_unreachable` in §11.2), sleeps `REDIS_RECONNECT_INTERVAL_S` and loops again — indefinitely. `publish()` is the exception and retries in place (above; rationale: system-design.md §12.1). Consumer Group position is preserved server-side across the outage; processing resumes from the last ACKed message once the connection returns.
+Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`/`autoclaim()` let `redis.ConnectionError` and `redis.TimeoutError` through untranslated. Each layer's consumer loop catches them around its own calls, logs a WARNING (`entity_analysis_redis_stream_unreachable` in §11.2), sleeps `REDIS_RECONNECT_INTERVAL_S` and loops again — indefinitely. `_reclaim_loop()` catches them the same way, ahead of its `except Exception`, logging the same WARNING; its own `STREAM_CLAIM_TIMEOUT_MS` sleep is the retry interval. `publish()` is the exception and retries in place (above; rationale: system-design.md §12.1). Consumer Group position is preserved server-side across the outage; processing resumes from the last ACKed message once the connection returns.
 
 #### Reclaim and Dead Letter pattern
 
 `autoclaim()` alone (§6.1 above) is not sufficient — something has to call it periodically, decide when a reclaimed message has exhausted its retries, and route it to that layer's Dead Letter Stream. All four layers (§11–§14) implement the *same* pattern, specified once here rather than four times:
 
 - **`config.consumer_name`** — each layer's own config (`EntityAnalysisConfig`/`AggConfig`/`ScoringConfig`/`CacheConfig`, §4.1) carries a `consumer_name` field, sourced from the `HOSTNAME` env var with a layer-specific fallback string for local/docker-compose runs (§4.1's note), so it's automatically unique per pod under horizontal scaling with no operator action required. Passed as the `consumer` argument to every `read_from()`/`autoclaim()` call that layer makes.
-- **`_reclaim_loop()`** — a coroutine each layer's `start()` runs alongside its main consumer loop via `asyncio.gather()` (**except Cache Layer — see §14.2's note; its reclaim step runs inside the single serial loop, not as a separate coroutine**). Wakes every `STREAM_CLAIM_TIMEOUT_MS` milliseconds and calls `autoclaim(stream, group, config.consumer_name, min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=<layer's batch size>)`. The loop body is wrapped in `except Exception` (not bare `except:`, so `asyncio.CancelledError` still propagates for shutdown) that logs a warning and does not re-raise; `run_supervised()` is the backstop.
-- **Per-message isolation, in both loops.** Each message from a `read_from()` or `autoclaim()` batch is handled — shape check, retry-exhaustion check, routing — inside its own `except Exception` that logs a warning with `exc_info` and leaves that message un-ACKed, so one message's failure never abandons the rest of its batch (on the reclaim path, every message in the batch has already had its `delivery_count` incremented by `autoclaim()`, so an abandoned batch would push healthy messages toward dead-lettering unprocessed).
+- **`_reclaim_loop()`** — a coroutine each layer's `start()` runs alongside its main consumer loop in one `asyncio.TaskGroup` (Layer Supervision, below) (**except Cache Layer — see §14.2's note; its reclaim step runs inside the single serial loop, not as a separate coroutine**). Wakes every `STREAM_CLAIM_TIMEOUT_MS` milliseconds and calls `autoclaim(stream, group, config.consumer_name, min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=<layer's batch size>)`. The loop body is wrapped in `except Exception` (not bare `except:`, so `asyncio.CancelledError` still propagates for shutdown) that logs a warning and does not re-raise; Coroutine Monitoring (§16) is the backstop.
+- **Per-message isolation, in both loops.** Each message from a `read_from()` or `autoclaim()` batch is handled — shape check, retry-exhaustion check, routing — inside its own `except Exception` that logs a WARNING `<layer>_message_handling_failed` with `message_id` and `exc_info` and leaves that message un-ACKed (Redis unreachable is re-raised to the loop instead, Reconnect behaviour above), so one message's failure never abandons the rest of its batch (on the reclaim path, every message in the batch has already had its `delivery_count` incremented by `autoclaim()`, so an abandoned batch would push healthy messages toward dead-lettering unprocessed).
 - **Retry-exhaustion check, per reclaimed message, before anything else:**
   ```python
   if reclaimed.delivery_count >= config.max_retry:   # ENTITY_ANALYSIS_MAX_RETRY / AGG_MAX_RETRY / SCORING_MAX_RETRY / CACHE_MAX_RETRY
@@ -1423,37 +1427,25 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`
           "v": "1",
       })
       await redis_stream.ack(stream, group, reclaimed.id)
+      logger.warning("<layer>_message_dead_lettered", message_id=reclaimed.id,
+                     delivery_count=reclaimed.delivery_count, reason="retries_exhausted")
       continue   # never enters the layer's normal processing path
   ```
+  A message failing the shape check (above) is dead-lettered the same way, with `reason="malformed"`.
   This is system-design.md §12.1's "Retry Count via delivery_count" policy — `delivery_count` comes from `autoclaim()` natively, so no separate Redis state tracks attempt counts.
 - **Below the retry-exhaustion check, a reclaimed message that still has budget left is routed through *the exact same synchronous check-then-insert entry point* as a freshly `read_from()`'d message** — never a second, separately-written processing path. This is not a style preference: the in-memory Set each layer uses to detect an already-in-flight duplicate (§11.2's `processing_cleaned_ids`, §12.2's `_enqueued`, §13.2's `_in_process`) is only a correctness guarantee if there is exactly one code path where a message can be marked "in progress," with no `await` between checking and marking it. A reclaimed message calling into a *different* function — even one that "does the same thing" — reopens exactly the race the guard exists to close. See each layer's own section for its specific entry-point method and why a duplicate delivery is safe.
 
-#### Layer Supervision — `app/common/supervised.py` — `run_supervised()`
+#### Layer Supervision — `asyncio.TaskGroup`
 
-Every layer's `start()` runs its main consumer loop alongside one secondary loop (`_reclaim_loop()` for three layers, `orphan_cleanup_loop()` for Cache, §14.2). A bare `asyncio.gather()` propagates the first exception but doesn't cancel the sibling, so `main.py`'s Coroutine Monitoring (§16) would restart `start()` while the first loop is still running. For Cache Layer, `CacheService`'s build lock (§14.9) keeps the two loops' builds from overlapping, but every build would run twice.
-
-`run_supervised()` replaces `asyncio.gather()` in each `start()` (§11.2, §12.2, §13.2, §14.2) and guarantees no sibling survives a failure:
+Every layer's `start()` runs its main consumer loop alongside one secondary loop (`_reclaim_loop()` for three layers, `orphan_cleanup_loop()` for Cache, §14.2) in one `asyncio.TaskGroup`:
 
 ```python
-# app/common/supervised.py
-import asyncio
-from typing import Coroutine
-
-async def run_supervised(*coros: Coroutine) -> None:
-    """Runs coroutines as one unit. If any raises, cancels and awaits the rest before
-    re-raising, so a layer-Task restart (system-design.md §12.1) starts clean."""
-    tasks = [asyncio.create_task(c) for c in coros]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-    for t in pending:
-        t.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-    for t in done:
-        if (exc := t.exception()) is not None:
-            raise exc
+async with asyncio.TaskGroup() as group:
+    group.create_task(self._consumer_loop())
+    group.create_task(self._reclaim_loop())
 ```
 
-The loops themselves catch anticipated per-iteration failures and log a warning (§14.6 for `orphan_cleanup_loop()`); `run_supervised()` is the backstop for unanticipated bugs.
+If either loop raises, the group cancels the other and waits for it before raising an `ExceptionGroup`; cancelling `start()` cancels both. So when Coroutine Monitoring (§16) restarts a layer, no loop of the old run is still going — system-design.md §12.1's restart guarantee. The loops themselves catch anticipated per-iteration failures and log a warning (§14.6 for `orphan_cleanup_loop()`); the group is the backstop for unanticipated bugs.
 
 ### 6.2 `app/redis/state_client.py`
 
@@ -3330,10 +3322,11 @@ class CleanedNewsConsumer:
     async def start(self) -> None:
         """Entry point — called once from main.py's lifespan (§16). Creates
         the consumer group, then runs _consumer_loop() and _reclaim_loop()
-        concurrently via run_supervised() (§6.1) — a plain asyncio.gather()
-        would leave one loop orphaned if the other raised."""
+        in one asyncio.TaskGroup (§6.1's Layer Supervision)."""
         await self._redis_stream.create_group_if_not_exists(STREAM_RAW_NEWS_CLEANED, CONSUMER_GROUP_ENTITY_ANALYSIS)
-        await run_supervised(self._consumer_loop(), self._reclaim_loop())
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self._consumer_loop())
+            group.create_task(self._reclaim_loop())
 
     async def _consumer_loop(self) -> None:
         """Reads batches from stream:raw_news_cleaned and dispatches each
@@ -3403,11 +3396,14 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           group=CONSUMER_GROUP_ENTITY_ANALYSIS, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=ENTITY_ANALYSIS_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= ENTITY_ANALYSIS_MAX_RETRY,
-          publish to STREAM_ENTITY_ANALYSIS_DEAD_LETTER and ACK (never reaches
-          _process_one()). Otherwise, extract cleaned_id from fields and
+          publish to STREAM_ENTITY_ANALYSIS_DEAD_LETTER, ACK and log WARNING
+          entity_analysis_message_dead_lettered (never reaches _process_one()).
+          Otherwise, run the shape check (§6.1), then extract cleaned_id from fields and
           dispatch via worker_pool.dispatch(lambda: self._process_one(cleaned_id, message_id))
           — the remaining messages gathered as one batch, identical to
           _consumer_loop() (§11.3).
+          except redis.ConnectionError / redis.TimeoutError: log warning
+          entity_analysis_redis_stream_unreachable (§6.1's Reconnect behaviour).
           except Exception: log warning entity_analysis_reclaim_sweep_failed
           with exc_info, do not re-raise — retried next tick.
 ```
@@ -3461,7 +3457,8 @@ The same `WorkerPool` class is used, as independent instances, by Entity Analysi
 | `cleaned_id` missing from SADI | `NewsClient.fetch_cleaned_news()` returns `None`; `EntityAnalysisService.find_entity_events()` logs warning, returns normally (not an error, system-design.md §3.6); `CleanedNewsConsumer` ACKs (retry can't help) |
 | DB write failure | `EntityEventRepository.persist_entities()`'s transaction (§5.1) rolls back and raises `ServiceUnavailableError` (connection unusable / retries exhausted) or `DatabaseError`; `EntityAnalysisService.find_entity_events()` doesn't catch it — `CleanedNewsConsumer._process_one()`'s `except SAPIError` logs it at its own level, no ACK (§11.2) |
 | SADI API failure | `NewsClient` raises `ServiceUnavailableError` (`COMMON-5002`) or, for an unexpected body, `ParseError` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s `except SAPIError`, which logs it at its own `log_level` (WARNING for `COMMON-5002`, ERROR for `ParseError`); no ACK |
-| `RedisStreamClient` unreachable | `redis.ConnectionError`/`redis.TimeoutError` caught by `CleanedNewsConsumer._consumer_loop()` around its `read_from()`/`ack()` calls: WARNING `entity_analysis_redis_stream_unreachable`, sleep `REDIS_RECONNECT_INTERVAL_S`, read again (§6.1's reconnect behaviour) |
+| `RedisStreamClient` unreachable | `redis.ConnectionError`/`redis.TimeoutError` caught by `CleanedNewsConsumer._consumer_loop()` around its `read_from()`/`ack()` calls: WARNING `entity_analysis_redis_stream_unreachable`, sleep `REDIS_RECONNECT_INTERVAL_S`, read again; `_reclaim_loop()` logs the same WARNING and claims again next tick (§6.1's reconnect behaviour) |
+| Malformed message (`v` missing or unrecognised, `cleaned_id` missing or not a UUID), or `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` | Dead-lettered to `stream:entity_analysis_dead_letter`, ACKed and logged WARNING `entity_analysis_message_dead_lettered` with `reason` `malformed` / `retries_exhausted`; never reaches `_process_one()` (§6.1) |
 | HK Stock List not ready (`len(get_hk_stock_list_cache()) == 0`) | `CleanedNewsConsumer._process_one()`'s first check, before the in-flight Set and before `EntityAnalysisService` is called at all (§11.1); log warning `hk_stock_list_not_ready`; no ACK — never reaches `news_client.fetch_cleaned_news()` or `entity_skill.run()` at all, so no entity ever gets a permanently-wrong empty-result outcome from this cause |
 
 ---
@@ -3655,11 +3652,13 @@ class AggregationConsumer:
 
     async def start(self) -> None:
         """Entry point, called from main.py's lifespan (§16); rationale as
-        CleanedNewsConsumer.start() (§11.2). Runs both loops under run_supervised() (§6.1);
+        CleanedNewsConsumer.start() (§11.2). Runs both loops in one asyncio.TaskGroup (§6.1);
         on exit, the final flush (system-design.md §4.5) runs in `finally`."""
         await self._redis_stream.create_group_if_not_exists(STREAM_ENTITY_EVENT_COMPLETED, CONSUMER_GROUP_AGGREGATION)
         try:
-            await run_supervised(self._consumer_loop(), self._reclaim_loop())
+            async with asyncio.TaskGroup() as group:
+                group.create_task(self._consumer_loop())
+                group.create_task(self._reclaim_loop())
         finally:
             await self._service.flush()
 
@@ -4216,9 +4215,11 @@ class ScoringConsumer:
 
     async def start(self) -> None:
         """Entry point, called from main.py's lifespan (§16); rationale as
-        CleanedNewsConsumer.start() (§11.2). Uses run_supervised() (§6.1)."""
+        CleanedNewsConsumer.start() (§11.2). Runs both loops in one asyncio.TaskGroup (§6.1)."""
         await self._redis_stream.create_group_if_not_exists(STREAM_EVENT_AGGREGATED, CONSUMER_GROUP_SCORING)
-        await run_supervised(self._consumer_loop(), self._reclaim_loop())
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self._consumer_loop())
+            group.create_task(self._reclaim_loop())
 
     async def _consumer_loop(self) -> None:
         """Reads batches from stream:event_aggregated and dispatches each
@@ -4671,8 +4672,8 @@ class CacheService:
         the endpoint: 503)."""
 
     async def orphan_cleanup_loop(self) -> None:
-        """Background cache cleanup (§14.6), launched by CacheConsumer.start() via
-        run_supervised() (§14.2). Catches its own per-sweep exceptions."""
+        """Background cache cleanup (§14.6), launched by CacheConsumer.start() in
+        its asyncio.TaskGroup (§14.2). Catches its own per-sweep exceptions."""
 ```
 
 `CacheService` is itself a module-level singleton + getter (§5.1), same shape as `EntityAnalysisService` (§11.1):
@@ -4706,11 +4707,13 @@ class CacheConsumer:
 
     async def start(self) -> None:
         """Entry point, called from main.py's lifespan (§16); rationale as
-        CleanedNewsConsumer.start() (§11.2). run_supervised() (§6.1) keeps a restart from
+        CleanedNewsConsumer.start() (§11.2). The asyncio.TaskGroup (§6.1) keeps a restart from
         leaking a second _consumer_loop(), which would double every build — the build lock
         (§14.9) keeps them from overlapping, not from both running."""
         await self._redis_stream.create_group_if_not_exists(STREAM_EVENT_SCORED, CONSUMER_GROUP_CACHE)
-        await run_supervised(self._consumer_loop(), self._service.orphan_cleanup_loop())
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self._consumer_loop())
+            group.create_task(self._service.orphan_cleanup_loop())
 
     async def _consumer_loop(self) -> None:
         """Reads batches from stream:event_scored, reclaims inline (no
@@ -5342,8 +5345,8 @@ async def lifespan(app: FastAPI):
         layer_tasks: dict[str, asyncio.Task] = {}   # registered below for GET /health (§15.6)
         shutting_down = False
 
-        # Launch each layer as a monitored Task (system-design.md §12.1 Coroutine Monitoring). start() uses
-        # run_supervised() (§6.1), so when _on_done fires both of the layer's coroutines have stopped and
+        # Launch each layer as a monitored Task (system-design.md §12.1 Coroutine Monitoring). start() runs
+        # its loops in one asyncio.TaskGroup (§6.1), so when _on_done fires both of the layer's coroutines have stopped and
         # the restart can't race a live sibling.
         def _make_monitored(name: str, coro_factory):
             task = asyncio.create_task(coro_factory())
@@ -5531,6 +5534,7 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 |---|---|---|---|
 | I-1 | **`lookup_stock`'s (§4.2) real-traffic latency is unmeasured.** Its name search (`_search()`) runs synchronously on the shared event loop (§16). Before traffic it measured p50 0.18 ms, p99 5.0 ms, max 6.6 ms over 737 real name queries (Python 3.12, Apple M5 Pro), with the `StockNameIndex` prepared at refresh (16 ms to build), and it runs for about 1.5% of entities on real news. So `asyncio.to_thread()` is not needed. | §4.2 | After traffic: p50/p95/p99 from `lookup_stock_completed`. Revisit `asyncio.to_thread()` only if calls cross the 20 ms WARNING threshold. |
 | I-3 | **BriefSummarySkill/EventLLMScoringSkill's model and `Max Tokens` (§8 table: `gemini-3.1-flash-lite`, 4096/2048) are unmeasured starting values;** EntityAnalysisSkill's row is measured (§8). | §8, system-design.md §9.1 | Measure on real aggregated Events before implementing either Skill: check for calls hitting the max (truncated JSON → `LLMSchemaViolationError`) and for persistent unused headroom at p95/p99; adjust per Skill. |
+| I-4 | **`STREAM_CLAIM_TIMEOUT_MS=300000` and `ENTITY_ANALYSIS_MAX_RETRY=3` (§4.1) are derived, not measured.** The claim timeout sits above the configured worst case of one message (`HTTP_TIMEOUT_S` 120 s + `LLM_API_TIMEOUT_S` 30 s) and above `RATE_LIMIT_BACKOFF_S`; the retry count matches SADI's. | §4.1, §6.1 | After traffic: per-batch `latency_ms` p99/max from `entity_analysis_batch_completed` (§11.3 — the longest a read message stays un-ACKed), and the `entity_analysis_message_dead_lettered` rate by `reason`; lower the claim timeout toward that p99 plus headroom, and adjust the retry count if transient causes still dead-letter. |
 ---
 
 *— End of Document | SAPI Implementation Guide v0.1 —*

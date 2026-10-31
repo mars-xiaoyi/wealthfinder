@@ -61,7 +61,7 @@ SAPI is the intelligence layer of the HK Stock AI Research Assistant. It consume
 | Runtime | Python 3.12 | Consistent with SADI; best ecosystem for LLM integration |
 | Async framework | asyncio | Optimal for IO-intensive LLM API calls; single-threaded concurrency is safe for shared in-memory state |
 | API framework | FastAPI | Native async support; automatic OpenAPI documentation |
-| Messaging | Redis Streams | Persistent; Consumer Group guarantees at-least-once delivery; `XREADGROUP COUNT+BLOCK` provides native batching with timeout; `XAUTOCLAIM` provides delivery_count for retry management |
+| Messaging | Redis Streams | Persistent; Consumer Group guarantees at-least-once delivery; `XREADGROUP COUNT+BLOCK` provides native batching with timeout; `XAUTOCLAIM` reclaims stalled messages, and the pending entry's delivery counter (read with `XPENDING`) drives retry management |
 | LLM provider | Vertex AI (Gemini) | Enterprise data isolation; no training data usage; `global` endpoint (current Gemini models are not served in `asia-east1`/`asia-east2`); unified SDK with `vertexai=True` |
 | LLM structured output | Gemini native structured output + Pydantic | `response_json_schema` makes Gemini enforce field presence and types at the API level; Pydantic parses the response into the Skill's model; used by all three Skills via `generate_structured` |
 | Database client | asyncpg | Native asyncio driver |
@@ -1016,7 +1016,7 @@ When any Skill's `run()` reports `failure_reason=LLMRateLimitError` (§9.7 — `
 
 - Backoff is applied at the Layer level (Worker Pool), not the individual worker level — prevents concurrent workers from continuing to hit the API during the backoff window
 - Message is not ACKed during backoff; redelivered after backoff period ends
-- **Claim-timeout constraint:** `RATE_LIMIT_BACKOFF_S` must stay below `STREAM_CLAIM_TIMEOUT_MS` (converted to seconds). A message stays pending in the Stream while the pool sleeps, so a longer backoff lets the reclaim loop claim it and raise its `delivery_count` — repeated rate limits could then dead-letter a healthy message
+- **Claim-timeout constraint:** `RATE_LIMIT_BACKOFF_S` must stay below `STREAM_CLAIM_TIMEOUT_MS` (converted to seconds). A message stays pending in the Stream while the pool sleeps, so a longer backoff lets the reclaim loop claim it and raise its `delivery_count` — repeated rate limits could then dead-letter a healthy message. For the same reason the claim timeout must exceed the longest legitimate processing time of one read batch: a still-running message that gets claimed is skipped by the in-flight guard (§3.4), but the claim still counts as a delivery
 - Log WARNING on each rate limit event with `layer`, `backoff_until` fields
 
 **LLM Authentication Failure**
@@ -1088,7 +1088,7 @@ Dead Letter message fields: `message_id`, `fields` (the original message), `deli
 
 **Retry Count via delivery_count**
 
-`XAUTOCLAIM` returns `delivery_count` for each claimed message — no additional Redis state required:
+Each pending entry carries a delivery counter that every claim increments. `XAUTOCLAIM` doesn't return it, so the reclaim step reads it with `XPENDING` right after claiming — the usual Redis Streams dead-letter pattern, and no additional Redis state required:
 
 ```
 delivery_count < MAX_RETRY → retry processing
@@ -1133,7 +1133,7 @@ This lightweight mechanism handles coroutine crash recovery without requiring ha
 
 > **Scope, for the Entity Analysis and Scoring Layers specifically:** each layer's own `_process_one()` wraps its entire per-message body in its own `except Exception`, catching an unanticipated bug at the single-message boundary — CRITICAL log, no ACK, redeliver — rather than letting it propagate up to this Task-level mechanism. Coroutine Monitoring is still what catches a bug anywhere *outside* `_process_one()` (e.g. in `_consumer_loop()`/`_reclaim_loop()` themselves) for those two layers, and it remains the only recovery mechanism, unchanged, for the Cache Layer. The Aggregation Layer handles per-EntityEvent failures inside each Group Coroutine (§4.7), which runs as its own Task — so a failure there never reaches this Task-level mechanism; Coroutine Monitoring covers bugs in Aggregation's consumer and reclaim loops.
 
-> **Restart guarantee.** Each layer's Task runs its main consumer loop concurrently with one secondary loop (`_reclaim_loop()`, or `orphan_cleanup_loop()` for Cache Layer) — a bare `asyncio.gather()` of the two would, on one raising, propagate that exception without cancelling the other, leaving it running orphaned while "recreate Task" above spins up a brand-new pair alongside it. For Cache Layer, a leaked second consumer loop couldn't build concurrently with the new one — every build runs under one lock (§6.9) — but it would double every build. Each layer's Task-launching coroutine is therefore required to guarantee both loops have fully stopped before this mechanism's "recreate Task" step runs — never partially crash-and-restart into a state where an old and new loop coexist.
+> **Restart guarantee.** Each layer's Task runs its main consumer loop concurrently with one secondary loop (`_reclaim_loop()`, or `orphan_cleanup_loop()` for Cache Layer) — a bare `asyncio.gather()` of the two would, on one raising, propagate that exception without cancelling the other, leaving it running orphaned while "recreate Task" above spins up a brand-new pair alongside it. For Cache Layer, a leaked second consumer loop couldn't build concurrently with the new one — every build runs under one lock (§6.9) — but it would double every build. Each layer's Task-launching coroutine (an `asyncio.TaskGroup`, implementation.md §6.1) is therefore required to guarantee both loops have fully stopped before this mechanism's "recreate Task" step runs — never partially crash-and-restart into a state where an old and new loop coexist.
 
 ---
 

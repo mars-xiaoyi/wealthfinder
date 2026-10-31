@@ -100,7 +100,7 @@ This document does not introduce new design — every ticket below implements so
 - `app/config.py`: `RedisConfig.reconnect_interval_s` (needed now — §12.1's Reconnect behavior lives at the consumer loop's own call site) and a minimal `EntityAnalysisConfig` — just the fields a bare read-and-fetch loop needs, not the ones backing `WorkerPool`/reclaim/the LLM skill.
 - `app/redis/stream_client.py`: the stream/group constants, `StreamMessage`, `create_group_if_not_exists()`/`read_from()`/`ack()` (§6.1) — not `publish()`/`autoclaim()`, nothing publishes or reclaims yet.
 - `app/clients/news_client.py`: `NewsClient` (§9.1), its first real consumer.
-- `app/entity_analysis/cleaned_news_consumer.py`: a single consumer loop (no `run_supervised()` — nothing to supervise yet with only one coroutine) that reads, fetches, and ACKs on a terminal outcome (success or 404) but deliberately leaves a client failure un-ACKed, so a transient SADI failure stays recoverable once a future ticket adds the reclaim loop, rather than being silently discarded now.
+- `app/entity_analysis/cleaned_news_consumer.py`: a single consumer loop (no loop supervision — nothing to supervise yet with only one coroutine) that reads, fetches, and ACKs on a terminal outcome (success or 404) but deliberately leaves a client failure un-ACKed, so a transient SADI failure stays recoverable once a future ticket adds the reclaim loop, rather than being silently discarded now.
 - Wire `NewsClient` and the consumer into `app/main.py`'s lifespan.
 **Acceptance criteria** (per impl.md §6.1/§9.1/§11.2):
 - A stream message's `cleaned_id` (a string on the wire) is correctly parsed into the type `fetch_cleaned_news()` expects.
@@ -109,7 +109,7 @@ This document does not introduce new design — every ticket below implements so
 - Unit-tested against mocked Redis/`httpx`.
 - Integration pass against real Redis, with SADI's `GET /v1/cleaned_news/{cleaned_id}` (api.md §2.4) mocked — success, 404, and failure responses.
 **Docs:** impl.md §6.1, §9.1, §11.2 (this ticket implements a subset); api.md §2.4; design.md §3.2, §3.3.
-**Explicitly deferred:** `run_supervised()`/`_reclaim_loop()`/dead-letter routing (also what will eventually recover the un-ACKed messages above); the `processing_cleaned_ids` dedup guard; the `hk_stock_list_not_ready` gate (Entity Analysis: HK Stock List Readiness Gate); `WorkerPool`; the LLM-based entity analysis step itself (Entity Analysis: LLM Entity Extraction; `lookup_stock` itself is Stock Resolution: `lookup_stock`); the `v` schema-version check; `EntityAnalysisConfig`'s remaining fields.
+**Explicitly deferred:** loop supervision/`_reclaim_loop()`/dead-letter routing (also what will eventually recover the un-ACKed messages above); the `processing_cleaned_ids` dedup guard; the `hk_stock_list_not_ready` gate (Entity Analysis: HK Stock List Readiness Gate); `WorkerPool`; the LLM-based entity analysis step itself (Entity Analysis: LLM Entity Extraction; `lookup_stock` itself is Stock Resolution: `lookup_stock`); the `v` schema-version check; `EntityAnalysisConfig`'s remaining fields.
 
 ---
 
@@ -250,11 +250,11 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** Entity Analysis: Persist & Publish Entity Events (for `RedisStreamClient.publish()`, used for dead-lettering).
 **Scope:** Recover messages this layer deliberately leaves un-ACKed (LLM failure, SADI failure, readiness gate, unanticipated crash) — today nothing redelivers them, since `XREADGROUP >` only ever returns new messages — and route the ones that keep failing, or that are malformed (missing or unrecognised `v`, missing or invalid `cleaned_id`), to the dead-letter stream (impl.md §6.1's Reclaim and Dead Letter pattern and Layer Supervision, §11.2).
 - `app/config.py`: `RedisConfig.stream_claim_timeout_ms`, `EntityAnalysisConfig.max_retry`.
-- `app/redis/stream_client.py`: `ReclaimedMessage`, `autoclaim()` (§6.1).
-- `app/common/supervised.py`: `run_supervised()` (§6.1).
+- `app/redis/stream_client.py`: `ReclaimedMessage`, `autoclaim()` (`XAUTOCLAIM`, then `XPENDING` for each claimed message's delivery count, §6.1).
 - `CleanedNewsConsumer`:
-  - `start()` runs `_consumer_loop()` and `_reclaim_loop()` through `run_supervised()` (§11.2).
-  - `_reclaim_loop()`: retry-exhaustion check → dead-letter + ACK; otherwise into the same `_process_one()` as the consumer loop. Each sweep wrapped in `except Exception` → `entity_analysis_reclaim_sweep_failed`.
+  - `start()` runs `_consumer_loop()` and `_reclaim_loop()` in one `asyncio.TaskGroup` (§6.1's Layer Supervision, §11.2).
+  - `_reclaim_loop()`: retry-exhaustion check → dead-letter + ACK; otherwise into the same `_process_one()` as the consumer loop. Each sweep catches an unreachable stream Redis (→ `entity_analysis_redis_stream_unreachable`) and then `except Exception` (→ `entity_analysis_reclaim_sweep_failed`).
+  - Every dead-lettered message logs WARNING `entity_analysis_message_dead_lettered` with `message_id`, `delivery_count` and `reason` (`retries_exhausted` / `malformed`).
   - The `processing_cleaned_ids` dedup guard (§11.2, design.md §3.4 Layer 1) — needed now, since this is the first time two coroutines can dispatch the same message concurrently.
   - The message shape check (§6.1's shape-check callout), immediately after `read_from()`/`autoclaim()` returns: a missing or unrecognised `v`, or a missing or invalid `cleaned_id`, goes straight to dead-letter + ACK, never reaching `_process_one()`; each message is handled in isolation (§6.1).
 **Acceptance criteria** (per impl.md §6.1/§11.2):
@@ -263,7 +263,7 @@ This document does not introduce new design — every ticket below implements so
 - A message whose `v` is missing or unrecognised, or whose `cleaned_id` is missing or not a valid UUID, on either path, is dead-lettered with §6.1's payload (`delivery_count="1"` on the `read_from()` path) and ACKed without being processed; every other message in its batch is still processed normally.
 - A message already in `processing_cleaned_ids` is skipped and left un-ACKed; the check-then-insert has no `await` in between.
 - A failing sweep logs a warning and the loop continues; `asyncio.CancelledError` still propagates.
-- `run_supervised()`: when one coroutine raises, the other is cancelled and awaited before the exception is re-raised.
+- When one loop raises, the other is cancelled and has stopped before `start()` raises; cancelling `start()` stops both.
 - Unit-tested against mocked Redis.
 - Integration pass against real Redis: a message forced to fail reaches the dead-letter stream after `ENTITY_ANALYSIS_MAX_RETRY` deliveries.
 - The integration cases from Entity Analysis: Consume Cleaned News & Fetch Article (failed SADI fetch), Entity Analysis: HK Stock List Readiness Gate (gated message) and Entity Analysis: LLM Entity Extraction (LLM failure classes) re-run with the reclaim loop running: each un-ACKed message is redelivered after `STREAM_CLAIM_TIMEOUT_MS` and ACKed once its cause clears, and dead-lettered if the cause persists.
@@ -298,7 +298,7 @@ This document does not introduce new design — every ticket below implements so
 ### Entity Analysis: Layer Monitoring & Health (S)
 
 **Status:** Created
-**Depends on:** Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `run_supervised()`, so a restart never races a leftover sibling loop)
+**Depends on:** Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for the `asyncio.TaskGroup` in `start()`, so a restart never races a leftover sibling loop)
 **Scope:** Auto-restart the Entity Analysis layer's Task when it crashes, and report its real liveness in `GET /v1/health` (impl.md §16 Coroutine Monitoring, §15.2, §15.6; design.md §12.1).
 - `app/main.py`: `_make_monitored()` with its `done_callback` (CRITICAL `layer_task_crashed`, then restart), `register_layer_tasks(layer_tasks)`, and cancel-and-gather of every layer Task at shutdown (§16). Only `"entity_analysis"` is registered; each later layer adds its own line.
 - `app/layer_tasks.py`: `register_layer_tasks()`/`get_layer_tasks()` (§15.6).
@@ -319,7 +319,7 @@ This document does not introduce new design — every ticket below implements so
 
 **Status:** Created
 **Depends on:** every Entity Analysis ticket above; Deployment: SAPI Container, Compose & Production-like Run (below — the real-traffic run), run for an agreed length.
-**Scope:** Answer the Entity Analysis open questions that need real volume, from the logs the earlier tickets already produce (`entity_analysis_completed`, `llm_calls[]`, `lookup_stock_completed`) — no new instrumentation. Except Q-1, each starts from a value already sanity-checked by a spike.
+**Scope:** Answer the Entity Analysis open questions that need real volume, from the logs the earlier tickets already produce (`entity_analysis_completed`, `llm_calls[]`, `lookup_stock_completed`, `entity_analysis_batch_completed`, `entity_analysis_message_dead_lettered`) — no new instrumentation. Except Q-1 and I-4, each starts from a value already sanity-checked by a spike.
 - **Q-1:** `ENTITY_ANALYSIS_BATCH_SIZE`/`ENTITY_ANALYSIS_BATCH_TIMEOUT_MS`, from throughput and per-batch latency.
 - **Q-7:** `MAX_FC_ROUNDS`/`MAX_FC_RETRIES_PER_ENTITY`, from `fc_summary` — how often `max_rounds_reached` fires, and the retry distribution.
 - **Q-9:** `RATE_LIMIT_BACKOFF_S` (and `ENTITY_ANALYSIS_MAX_CONCURRENT`), from 429 frequency and recovery time.
@@ -327,6 +327,7 @@ This document does not introduce new design — every ticket below implements so
 - **Q-16 at scale:** `lookup_stock` hit/miss rates, plus a hand-checked sample of unverified entities.
 - **I-1 real-traffic part:** `lookup_stock_completed` p50/p95/p99 and fuzzy-path frequency.
 - **I-3:** EntityAnalysisSkill's `max_tokens`, against `output_tokens` p95/p99 and any truncation.
+- **I-4:** `STREAM_CLAIM_TIMEOUT_MS` and `ENTITY_ANALYSIS_MAX_RETRY`, from per-batch `latency_ms` p99/max (`entity_analysis_batch_completed`) and the `entity_analysis_message_dead_lettered` rate by `reason`.
 **Acceptance criteria:**
 - Each item has measured numbers and a decision: keep the default, or change it with the reason.
 - Changed defaults are applied in `app/config.py` and impl.md §4.1/§8.
@@ -428,10 +429,10 @@ This document does not introduce new design — every ticket below implements so
 ### Aggregation: Reclaim, Dead Letter & Schema-Version Check (S)
 
 **Status:** Created
-**Depends on:** Aggregation: Flush Active Events & Publish (for `start()`'s `finally: flush()`); Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`, `run_supervised()`)
+**Depends on:** Aggregation: Flush Active Events & Publish (for `start()`'s `finally: flush()`); Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
 **Scope:** Recover messages Aggregation leaves un-ACKed, and dead-letter the ones that keep failing or are malformed (missing or unrecognised `v`, missing or invalid `entity_event_id`) (impl.md §6.1's Reclaim and Dead Letter pattern, §12.2).
 - `app/config.py`: `AggConfig.max_retry`.
-- `AggregationConsumer`: `start()` runs `_consumer_loop()` and `_reclaim_loop()` through `run_supervised()`; `_reclaim_loop()` dead-letters to `stream:aggregation_dead_letter` at `AGG_MAX_RETRY` and otherwise calls the same `_route_one()`; each sweep wrapped in `except Exception` → `aggregation_reclaim_sweep_failed`.
+- `AggregationConsumer`: `start()` runs `_consumer_loop()` and `_reclaim_loop()` in one `asyncio.TaskGroup`; `_reclaim_loop()` dead-letters to `stream:aggregation_dead_letter` at `AGG_MAX_RETRY` and otherwise calls the same `_route_one()`; each sweep wrapped in `except Exception` → `aggregation_reclaim_sweep_failed`.
 - The message shape check (`v` and `entity_event_id`) immediately after `read_from()`/`autoclaim()`, each message handled in isolation (§6.1's shape-check callout).
 **Acceptance criteria** (per impl.md §6.1, §12.2):
 - A message left un-ACKed by a failure is reclaimed after `STREAM_CLAIM_TIMEOUT_MS` and processed again through `_route_one()`.
@@ -448,7 +449,7 @@ This document does not introduce new design — every ticket below implements so
 ### Aggregation: Layer Monitoring & Health (XS)
 
 **Status:** Created
-**Depends on:** Aggregation: Reclaim, Dead Letter & Schema-Version Check (for `run_supervised()` in `start()`); Entity Analysis: Layer Monitoring & Health (for `_make_monitored()`, `get_layer_tasks`)
+**Depends on:** Aggregation: Reclaim, Dead Letter & Schema-Version Check (for the `asyncio.TaskGroup` in `start()`); Entity Analysis: Layer Monitoring & Health (for `_make_monitored()`, `get_layer_tasks`)
 **Scope:** Register the Aggregation layer's Task for auto-restart and report its real liveness in `GET /v1/health` (impl.md §15.2, §16).
 - `app/main.py`: register `"aggregation"` with `_make_monitored()`.
 - `app/api/routes/health.py`: `layers.aggregation` reflects whether its Task is running.
@@ -621,10 +622,10 @@ This document does not introduce new design — every ticket below implements so
 ### Scoring: Reclaim, Dead Letter & Schema-Version Check (S)
 
 **Status:** Created
-**Depends on:** Scoring: Score & Persist Events; Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`, `run_supervised()`)
+**Depends on:** Scoring: Score & Persist Events; Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
 **Scope:** Recover messages Scoring leaves un-ACKed, and dead-letter the ones that keep failing or are malformed (missing or unrecognised `v`, missing or invalid `event_id`) (impl.md §6.1's Reclaim and Dead Letter pattern, §13.2).
 - `app/config.py`: `ScoringConfig.max_retry`.
-- `ScoringConsumer`: `start()` runs both loops through `run_supervised()`; `_reclaim_loop()` dead-letters to `stream:scoring_dead_letter` at `SCORING_MAX_RETRY` and otherwise calls the same `_process_one()`; each sweep wrapped in `except Exception` → `scoring_reclaim_sweep_failed`.
+- `ScoringConsumer`: `start()` runs both loops in one `asyncio.TaskGroup`; `_reclaim_loop()` dead-letters to `stream:scoring_dead_letter` at `SCORING_MAX_RETRY` and otherwise calls the same `_process_one()`; each sweep wrapped in `except Exception` → `scoring_reclaim_sweep_failed`.
 - The message shape check (`v` and `event_id`) immediately after `read_from()`/`autoclaim()`, each message handled in isolation (§6.1).
 **Acceptance criteria** (per impl.md §6.1, §13.2):
 - An un-ACKed message (LLM failure, skipped in-flight duplicate) is reclaimed after `STREAM_CLAIM_TIMEOUT_MS` and scored.
@@ -660,7 +661,7 @@ This document does not introduce new design — every ticket below implements so
 ### Scoring: Layer Monitoring & Health (XS)
 
 **Status:** Created
-**Depends on:** Scoring: Reclaim, Dead Letter & Schema-Version Check (for `run_supervised()` in `start()`); Entity Analysis: Layer Monitoring & Health (for `_make_monitored()`, `get_layer_tasks`); Aggregation: Layer Monitoring & Health (so `layers.aggregation` is already real)
+**Depends on:** Scoring: Reclaim, Dead Letter & Schema-Version Check (for the `asyncio.TaskGroup` in `start()`); Entity Analysis: Layer Monitoring & Health (for `_make_monitored()`, `get_layer_tasks`); Aggregation: Layer Monitoring & Health (so `layers.aggregation` is already real)
 **Scope:** Register the Scoring layer's Task for auto-restart and report its real liveness in `GET /v1/health` (impl.md §15.2, §16).
 - `app/main.py`: register `"scoring"` with `_make_monitored()`.
 - `app/api/routes/health.py`: `layers.scoring` reflects whether its Task is running.
@@ -805,18 +806,18 @@ This document does not introduce new design — every ticket below implements so
 ### Cache: Orphan Cleanup (S)
 
 **Status:** Created
-**Depends on:** Cache: Build Cache from Scores; Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `run_supervised()`)
+**Depends on:** Cache: Build Cache from Scores
 **Scope:** Periodically delete cache versions left behind by a crash or a failed delete (impl.md §14.6; design.md §12.1 Orphaned Cache Cleanup).
 - `app/config.py`: `CacheConfig.orphan_cleanup_interval_s`.
 - `app/redis/state_client.py`: `delete()` (§6.2) — `scan()` already exists (Aggregation: Flush Active Events & Publish).
 - `CacheStore.scan_orphaned_versions()` (§10.4).
 - `CacheService.orphan_cleanup_loop()` (§14.6).
-- `CacheConsumer.start()`: runs `_consumer_loop()` and `orphan_cleanup_loop()` through `run_supervised()` (§14.2).
+- `CacheConsumer.start()`: runs `_consumer_loop()` and `orphan_cleanup_loop()` in one `asyncio.TaskGroup` (§14.2).
 **Acceptance criteria** (per impl.md §14.6):
 - Every `CACHE_ORPHAN_CLEANUP_INTERVAL_S`, every version key older than the current version is deleted; `morning_brief:version_counter` is never touched.
 - A build committing during a sweep (the pointer moves to a newer version after the sweep read it) never has its new version deleted — versions at or above the one read are left for a later sweep.
 - A failing sweep logs `orphan_cleanup_sweep_failed` and the next tick retries; the consumer loop is never affected.
-- If either loop raises, `run_supervised()` stops the other before `start()` returns — a restart never leaves two consumer loops running.
+- If either loop raises, the `TaskGroup` stops the other before `start()` raises — a restart never leaves two consumer loops running.
 - Unit-tested against mocked Redis.
 - Integration pass against real Redis with planted orphan keys.
 **Docs:** impl.md §4.1, §6.2, §10.4, §14.2, §14.6; design.md §6.8, §12.1.
@@ -826,7 +827,7 @@ This document does not introduce new design — every ticket below implements so
 ### Cache: Layer Monitoring & Health (XS)
 
 **Status:** Created
-**Depends on:** Cache: Orphan Cleanup (for `run_supervised()` in `start()`); Entity Analysis: Layer Monitoring & Health (for `_make_monitored()`, `get_layer_tasks`); Aggregation: Layer Monitoring & Health and Scoring: Layer Monitoring & Health (so `layers.aggregation` and `layers.scoring` are already real)
+**Depends on:** Cache: Orphan Cleanup (for the `asyncio.TaskGroup` in `start()`); Entity Analysis: Layer Monitoring & Health (for `_make_monitored()`, `get_layer_tasks`); Aggregation: Layer Monitoring & Health and Scoring: Layer Monitoring & Health (so `layers.aggregation` and `layers.scoring` are already real)
 **Scope:** Register the Cache layer's Task for auto-restart and report its real liveness in `GET /v1/health` — the last layer, so `healthy` becomes reachable (impl.md §15.2, §16).
 - `app/main.py`: register `"cache"` with `_make_monitored()`.
 - `app/api/routes/health.py`: `layers.cache` reflects whether its Task is running; no `layers.*` field is hardcoded any more.
