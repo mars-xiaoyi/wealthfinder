@@ -11,11 +11,6 @@ from app.logger import get_logger
 
 logger = get_logger(__name__)
 
-STREAM_RAW_NEWS_CLEANED = "stream:raw_news_cleaned"
-STREAM_ENTITY_EVENT_COMPLETED = "stream:entity_event_completed"
-
-CONSUMER_GROUP_ENTITY_ANALYSIS = "sapi-entity-analysis"
-
 _REDIS_UNREACHABLE = (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
 
 
@@ -25,6 +20,14 @@ class StreamMessage:
 
     id: str
     fields: dict[str, str]
+
+
+@dataclass
+class ReclaimedMessage(StreamMessage):
+    """A pending message claimed from an earlier delivery, with how many times it has been
+    delivered, this claim included."""
+
+    delivery_count: int
 
 
 class RedisStreamClient:
@@ -85,6 +88,35 @@ class RedisStreamClient:
         """Acknowledge a message. Call only once every write its processing implies has
         committed."""
         await self._client.xack(stream, group, message_id)
+
+    async def autoclaim(
+        self, stream: str, group: str, consumer: str, min_idle_ms: int, count: int
+    ) -> list[ReclaimedMessage]:
+        """
+        Claim up to count messages that have been pending longer than min_idle_ms, each with its
+        delivery count.
+        Raises redis.ConnectionError / redis.TimeoutError if Redis is unreachable.
+        """
+        _next_start_id, entries, _deleted_ids = await self._client.xautoclaim(
+            stream, group, consumer, min_idle_time=min_idle_ms, count=count
+        )
+        claimed = [StreamMessage(id=message_id, fields=fields) for message_id, fields in entries]
+        if not claimed:
+            return []
+        async with self._client.pipeline(transaction=False) as pipe:
+            for message in claimed:
+                pipe.xpending_range(stream, group, min=message.id, max=message.id, count=1)
+            pending = await pipe.execute()
+        # A message ACKed since the claim has no pending entry left, and is done.
+        return [
+            ReclaimedMessage(
+                id=message.id,
+                fields=message.fields,
+                delivery_count=pending_entries[0]["times_delivered"],
+            )
+            for message, pending_entries in zip(claimed, pending, strict=True)
+            if pending_entries
+        ]
 
     async def ping(self) -> None:
         """

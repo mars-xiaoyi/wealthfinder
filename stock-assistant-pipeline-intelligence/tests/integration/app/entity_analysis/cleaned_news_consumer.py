@@ -31,11 +31,6 @@ from app.llm.errors import (
     LLMSchemaViolationError,
 )
 from app.models.entity_event import EventTypeEnum, SentimentEnum
-from app.redis.stream_client import (
-    CONSUMER_GROUP_ENTITY_ANALYSIS,
-    STREAM_ENTITY_EVENT_COMPLETED,
-    STREAM_RAW_NEWS_CLEANED,
-)
 from app.skills.entity_analysis_skill import ExtractedEntity, LLMOutput
 from tests.integration.conftest import (
     HKEX_URL_CONSTANTS,
@@ -94,14 +89,15 @@ class StreamProbe:
     async def add(self, cleaned_id: uuid.UUID) -> str:
         """XADD a stream:raw_news_cleaned message for cleaned_id; returns its stream id."""
         message_id: str = await self._client.xadd(
-            STREAM_RAW_NEWS_CLEANED, {"cleaned_id": str(cleaned_id), "v": "1"}
+            "stream:raw_news_cleaned",
+            {"cleaned_id": str(cleaned_id), "v": "1"},
         )
         return message_id
 
     async def group_names(self) -> list[str]:
         """Names of the stream's consumer groups; none while the stream does not exist."""
         try:
-            groups = await self._client.xinfo_groups(STREAM_RAW_NEWS_CLEANED)
+            groups = await self._client.xinfo_groups("stream:raw_news_cleaned")
         except redis.exceptions.ResponseError:
             return []
         return [str(group["name"]) for group in groups]
@@ -109,13 +105,13 @@ class StreamProbe:
     async def pending(self) -> dict[str, int]:
         """{stream id: delivery count} of every delivered but un-ACKed message."""
         entries = await self._client.xpending_range(
-            STREAM_RAW_NEWS_CLEANED, CONSUMER_GROUP_ENTITY_ANALYSIS, "-", "+", 100
+            "stream:raw_news_cleaned", "sapi-entity-analysis", "-", "+", 100
         )
         return {entry["message_id"]: entry["times_delivered"] for entry in entries}
 
     async def published(self) -> list[dict[str, str]]:
         """The fields of every stream:entity_event_completed entry, oldest first."""
-        entries = await self._client.xrange(STREAM_ENTITY_EVENT_COMPLETED)
+        entries = await self._client.xrange("stream:entity_event_completed")
         return [fields for _message_id, fields in entries]
 
     async def reconnect(self) -> None:
@@ -241,7 +237,7 @@ async def _wait_group_created(streams: StreamProbe) -> None:
     """Wait until the consumer has created its group, i.e. is up and reading."""
 
     async def group_created() -> bool:
-        return await streams.group_names() == [CONSUMER_GROUP_ENTITY_ANALYSIS]
+        return await streams.group_names() == ["sapi-entity-analysis"]
 
     await _wait_for(group_created, 3)
 
@@ -264,7 +260,7 @@ async def start_existing_group(start_consumer, streams):
 
             await _wait_for(group_noticed, 3)
 
-    assert await streams.group_names() == [CONSUMER_GROUP_ENTITY_ANALYSIS]
+    assert await streams.group_names() == ["sapi-entity-analysis"]
 
 
 @pytest.mark.vertex

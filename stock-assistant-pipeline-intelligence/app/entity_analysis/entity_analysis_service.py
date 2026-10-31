@@ -9,7 +9,8 @@ from app.logger import get_logger
 from app.models.entity_event import EntityEvent
 from app.models.versioned_metadata import VersionedMetadata
 from app.persistent.entity_event_repository import get_entity_event_repository
-from app.redis.stream_client import STREAM_ENTITY_EVENT_COMPLETED, get_redis_stream_client
+from app.redis.stream_client import get_redis_stream_client
+from app.redis.stream_enum import EntityEventCompletedStream
 from app.skills.entity_analysis_skill import EntityAnalysisInput, EntityAnalysisSkill
 
 logger = get_logger(__name__)
@@ -94,7 +95,8 @@ class EntityAnalysisService:
         """Announce each EntityEvent on stream:entity_event_completed."""
         for entity_event_id in entity_event_ids:
             await self._redis_stream.publish(
-                STREAM_ENTITY_EVENT_COMPLETED, {"entity_event_id": entity_event_id, "v": "1"}
+                EntityEventCompletedStream.NAME,
+                {"entity_event_id": entity_event_id, "v": EntityEventCompletedStream.VERSION},
             )
 
 
