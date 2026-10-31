@@ -35,6 +35,7 @@ class RedisConfig:
     stream_url: str  # env: REDIS_STREAM_URL
     state_url: str  # env: REDIS_STATE_URL
     reconnect_interval_s: int  # env: REDIS_RECONNECT_INTERVAL_S (default 5)
+    stream_claim_timeout_ms: int  # env: STREAM_CLAIM_TIMEOUT_MS (default 300000)
 
 
 @dataclass
@@ -48,6 +49,7 @@ class LLMConfig:
 class EntityAnalysisConfig:
     batch_size: int  # env: ENTITY_ANALYSIS_BATCH_SIZE (default 10)
     batch_timeout_ms: int  # env: ENTITY_ANALYSIS_BATCH_TIMEOUT_MS (default 5000)
+    max_retry: int  # env: ENTITY_ANALYSIS_MAX_RETRY (default 3)
     max_input_chars: int  # env: ENTITY_ANALYSIS_MAX_INPUT_CHARS (default 30000), article body cap
     sadi_api_url: str  # env: SADI_API_URL (default http://localhost:8000), without "/v1"
     consumer_name: str  # env: HOSTNAME (default sapi-entity-analysis-1), unique per pod
@@ -100,6 +102,7 @@ def load_config() -> AppConfig:
             stream_url=_require("REDIS_STREAM_URL"),
             state_url=_require("REDIS_STATE_URL"),
             reconnect_interval_s=int(os.environ.get("REDIS_RECONNECT_INTERVAL_S", "5")),
+            stream_claim_timeout_ms=int(os.environ.get("STREAM_CLAIM_TIMEOUT_MS", "300000")),
         ),
         llm=LLMConfig(
             vertex_project=_require("VERTEX_AI_PROJECT"),
@@ -109,6 +112,7 @@ def load_config() -> AppConfig:
         entity_analysis=EntityAnalysisConfig(
             batch_size=int(os.environ.get("ENTITY_ANALYSIS_BATCH_SIZE", "10")),
             batch_timeout_ms=int(os.environ.get("ENTITY_ANALYSIS_BATCH_TIMEOUT_MS", "5000")),
+            max_retry=int(os.environ.get("ENTITY_ANALYSIS_MAX_RETRY", "3")),
             max_input_chars=int(os.environ.get("ENTITY_ANALYSIS_MAX_INPUT_CHARS", "30000")),
             sadi_api_url=os.environ.get("SADI_API_URL", "http://localhost:8000"),
             consumer_name=os.environ.get("HOSTNAME", "sapi-entity-analysis-1"),
