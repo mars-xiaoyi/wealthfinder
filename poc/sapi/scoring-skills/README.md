@@ -33,7 +33,7 @@ Score columns compare against Pro's reference; "unsupported" is the share of sum
 | V1 V0 + no cap, temp 0, numbers rule, new-info rule | 0.819 | 0.742 | 0.402 | 0.22 | 4.38 |
 | V2 V1, Scoring reads the article summaries | 0.807 | 0.727 | 0.409 | 0.20 | 4.39 |
 | V3 V1 as one combined call | 0.866 | 0.795 | 0.652 | 0.38 | 3.80 |
-| **V4 V1 + sourced-only `summary_full`, duplicates rule (documented)** | **0.853** | **0.780** | **0.083** | **0.16** | **4.77** |
+| **V4 V1 + sourced-only `summary_full`, duplicates rule (documented, except Rule 3's wording and §8.4 Example 5's last clause; the final docs were measured in the full-set run below)** | **0.853** | **0.780** | **0.083** | **0.16** | **4.77** |
 | V4b V4 again, unchanged | 0.837 | 0.773 | 0.098 | 0.19 | 4.75 |
 | V5 V4, Scoring zero-shot | 0.846 | 0.795 | 0.063 | 0.19 | 4.75 |
 | V6 V4 + a +3 analyst-upgrade example | 0.841 | 0.773 | 0.068 | 0.17 | 4.77 |
