@@ -268,6 +268,8 @@ async def start_existing_group(start_consumer, streams):
 
 
 @pytest.mark.vertex
+# Six sequential Vertex AI analyses: room for the 3 * VERTEX_WAIT_S wait below, plus startup.
+@pytest.mark.timeout(4 * VERTEX_WAIT_S)
 async def start_fetch_and_ack(start_consumer, streams, stub_sadi):
     """More messages than one batch: each cleaned_id reaches SADI as a canonical UUID, once,
     is analysed once, and every message is ACKed."""
