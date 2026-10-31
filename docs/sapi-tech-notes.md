@@ -2,7 +2,7 @@
 
 Learning notes from designing SAPI, the Redis Streams–based pipeline in this repo (Entity Analysis → Aggregation → Scoring → Cache). SAPI's binding design lives in `stock-assistant-pipeline-intelligence/docs/` (`impl.md` = `implementation.md`, `design.md` = `system-design.md` below); nothing here is a design decision for it.
 
-- **Part 1** lists concrete problems found while designing SAPI: what went wrong, why it was easy to miss, and the fix. It ends with the project's development tooling (§1.11).
+- **Part 1** lists concrete problems found while designing SAPI: what went wrong, why it was easy to miss, and the fix. §1.11–§1.16 come from the two Entity Analysis spikes (`lookup_stock` fuzzy matching, the EntityAnalysisSkill LLM design), whose full write-ups are `poc/sapi/fuzzy-match/README.md` and `poc/sapi/llm-skill/README.md`. Part 1 ends with the project's development tooling (§1.17).
 - **Part 2** covers the general topics behind them, for future investigation. Each ends with questions worth digging into.
 
 ---
@@ -76,7 +76,72 @@ Aggregation runs one `GroupCoroutine` per `(exchange, stock_code, event_type_pri
 - **Status:** open — size `AGG_MAX_CONCURRENT` above the peak number of active groups, and measure it in production.
 - **Topic:** §2.6.
 
-## 1.11 Development tooling
+## 1.11 A fuzzy matcher that was worse than no matcher at all
+
+impl.md §4.2's first `_fuzzy_match` scored stock names by character overlap with the query, above a `NAME_MATCH_MIN_OVERLAP_RATIO` of 0.6. On 475 labeled mentions from real articles it got 263 right, 80 wrong and missed 132. Used as Entity Analysis's name-search fallback, it lowered entity F1 from 0.962 (no name search at all) to 0.954, through 19 wrong matches.
+- **Why it was easy to miss:** the algorithm looks reasonable, and its threshold looks like the knob that would fix any problem. A wrong match is silent: it yields a real, plausible stock code and nothing downstream flags it. Character overlap ignores order, but Chinese abbreviations are *ordered subsequences* of the full name (農行 ⊂ 農業銀行, 國壽 ⊂ 中國人壽). Generic words (地產, 銀行) and single Latin letters overlap with almost everything, and ties were broken by file order. And the fallback runs for only ~1.5% of entities, so the damage is invisible in the aggregate unless you measure it on its own.
+- **Fix:** S8, an ordered-subsequence matcher on normalized names. It has no threshold, ranks by how compact the match is, and treats a tie between companies as a miss: 431 right, 12 wrong, 32 missed, and it holds on two held-out sets (impl.md §4.2, design.md §9.2).
+- **Topic:** §2.7.
+
+## 1.12 Data quirks decided more cases than the algorithm
+
+Several of §4.2's errors came from the HK Stock List and the text itself, not from the scoring:
+- **Duplicate counters.** RMB lines (`80700 騰訊控股－Ｒ`) carry the same name as the HKD line, so they tied with it and won by file order. `－Ｔ` lines are trading-only counters for foreign stocks. Both are now dropped when the list loads.
+- **Variant characters.** 恆/恒 and 滙/匯 are the same character to a reader but not to `==`. The LLM spike's own normalizer lacked 恆→恒, so the model's *correct* `00012|恆地` failed verification until it was added.
+- **The order of normalization steps changes what a rule means.** Traditional→simplified (`t2s`) runs before the generic-tail regex, which is written in traditional characters, so in practice it strips only the tails spelled the same in both scripts (控股, 股份). "Fixing" it measured worse, so the docs specify the measured form.
+- **Some mismatches can't be solved by string matching at all.** A mainland issuer's English legal name ("Shandong Gold Mining Co., Ltd.") is not a translation of HKEX's English short name, and 群核's listed Chinese name is the English "MANYCORE TECH".
+- **Why it was easy to miss:** reading the code shows you the algorithm. The quirks show up only when it runs on the real list and real mentions.
+- **Fix:** one normalizer, applied at load to the list and per call to the query, shared by both name checks in entity verification (impl.md §4.2). Lesson from the third bullet: once a pipeline has been measured, a "bug" in it is part of what was measured. Fixing it is a new experiment, not a cleanup.
+- **Topic:** §2.7.
+
+## 1.13 A tool-calling loop that the task didn't need
+
+impl.md §8.2 originally had the model call a `lookup_stock` tool in a function-calling loop to verify each company, then make a second, structured-output call (via Instructor) for the final answer. The spike replaced it with **one structured-output call**: the model returns each company with its code and name, and code verifies each one against the list (name agrees with the listed name for that code → the article prints the code → name search). On 127 unseen articles: F1 0.962 vs 0.930, $1.14 vs $8.74 per 1k articles, p95 6 s vs 217 s per article. §8.2 as first written cost $23.09 per 1k.
+- **Why it was easy to miss:** "let the model check its own work with a tool" sounds like the robust design. But the check was deterministic, and the inputs already held the answer: articles almost always print the code, and the model knows most HKEX codes (237 of the 252 lookups it made were codes, not names). The tool turned a lookup into a multi-turn conversation, and the loop brought failure modes of its own:
+  - `function_calling_config.mode=ANY` forces a call on every turn, so the loop's normal exit (no tool call) is unreachable.
+  - `AUTO` sometimes re-queried an already-verified code until the round cap.
+  - Dense market wraps took 4–6 rounds at 10–16 lookups per turn.
+- **Fix:** the one-call design (impl.md §8.2, design.md §9.2, §9.4). The accepted cost: articles that name companies without printing any code rely on the model's memory plus the name search (F1 0.913 with every code stripped, against 0.984 for the loop). About 6% of real articles are like that.
+- **Topic:** §2.8.
+
+## 1.14 The bigger model lost
+
+| Model and design | Entity F1 | $ / 1k articles | Reliability |
+|---|---|---|---|
+| 3.1-pro-preview, tool loop | 0.703 | 41.33 | missed 7, 21 and 30 companies on three dense wraps |
+| 3.8-flash (thinking LOW), one call | 0.947 | 2.98 | 7.6% of 1,376 attempts failed; in a ~20-minute capacity episode, 74 of 127 articles failed all 4 attempts |
+| **3.1-flash-lite, one call** | **0.962** | **1.14** | 0.6% of 838 attempts failed, p95 8 s |
+
+Classification was close across all of them. Lite agreed with Pro on 0.890 of event types and 0.908 of sentiments, while Pro agrees with *itself* on only 0.954 and 0.972: that is the ceiling. Routing HKEX announcements to 3.8-flash bought nothing measurable.
+- **Why it was easy to miss:** models are usually compared on quality alone. In a pipeline, once quality is good enough, tail latency, failure rate under a shared quota, and cost per unit of work decide. A gap smaller than the reference model's disagreement with itself is noise.
+- **Fix:** `gemini-3.1-flash-lite` (impl.md §4.1, §8). Accepted trade-offs: it under-calls some negatives in formal HKEX announcements, and some of its summaries exceed 100 characters, which §8.2's validation truncates.
+- **Topic:** §2.8.
+
+## 1.15 SDK and platform behaviour that only shows up live
+
+None of these were in the docs the design was written from. All came from calling Vertex AI (details in impl.md §4.1, §7.1, §7.3):
+- **No default timeout.** google-genai calls hung for ~260 s until `HttpOptions(timeout=ms)` was set; a hang then comes back as `504 DEADLINE_EXCEEDED`. Without `retry_options` the SDK makes exactly one attempt.
+- **A library's retry broke the protocol.** Instructor 1.17's re-ask sends the validation error back as a *model* turn, and Gemini rejects any request ending in a model turn (`400`). Native structured output (`response_json_schema`) already enforces fields and types, so Instructor was dropped.
+- **Thinking tokens.** They are reported separately, billed as output, and counted against `max_output_tokens`. A max sized from visible output alone can truncate the answer.
+- **Where and how much.** Current Gemini models answer only on the `global` endpoint. Quota is a shared on-demand pool: 429s arrived at ≤ 4 concurrent calls, and there is no fixed RPM to size `ENTITY_ANALYSIS_MAX_CONCURRENT` against.
+- **Inputs are not the size you expect.** One cleaned HKEX announcement was 2,069,932 characters, so the body is capped at 30,000 before the call.
+- **Caching wasn't a cost lever.** Explicit context caching needs ≥ 4,096 tokens, and the prompt is ~1,800.
+- **Why it was easy to miss:** documentation describes the happy path. Defaults like "no timeout" and "one attempt" only surface when a call hangs.
+- **Topic:** §2.9.
+
+## 1.16 Benchmark figures that didn't reproduce
+
+The LLM spike's PR review re-ran every figure from the committed runs, and several didn't hold:
+- **Label leakage.** The "every code stripped" test set kept the gold code in a synthetic HKEX title (`HKEX 公告 {code}`) and in a `Stock code (if listed) 00595` line. The models looked those codes up directly.
+- **A moving input.** The scripts read the prompt from implementation.md. Once the doc was updated with the new design, they no longer ran the prompt that produced the results. The prompt is now a frozen copy (`prompt_v1.md`).
+- **Different denominators.** One model's failure rate was per successful call, the other's per attempt.
+- **Stale or misattributed cells.** Some came from an earlier verifier state, one result belonged to a different variant, and re-running the split script would have overwritten a hand-corrected split.
+- **Data hygiene.** Third-party article titles had been committed inside run records, and the raw export wasn't gitignored.
+- **Why it was easy to miss:** each number was right when it was written. The drift came from later changes to the inputs (prompt, verifier, normalizer) without a re-run. And a "codes stripped" set built by regex is only as clean as its patterns.
+- **Fix:** freeze inputs, derive every split and figure from a script, state one denominator, scan constructed sets for leaked labels, and re-score stored outputs after every verifier change.
+- **Topic:** §2.10.
+
+## 1.17 Development tooling
 
 - **uv** — creates the virtualenv and installs pinned dependencies. Chosen because it is much faster than pip and the repo already uses it (SADI's `requirements.lock` is compiled with `uv pip compile`).
 - **pytest + pytest-asyncio** — runs the unit tests; pytest-asyncio lets `async def` tests run without a per-test decorator (`asyncio_mode = "auto"`). Chosen because pytest is the Python standard and SADI already uses both, so tests look the same across services.
@@ -371,8 +436,178 @@ SAPI: §1.10.
 
 ---
 
+## 2.7 Matching names against a reference list
+
+Mapping a free-text mention ("騰訊", "Tencent", "騰訊控股有限公司") to exactly one record in a reference list is called *entity linking* or *record linkage*. It comes up with company names, people, addresses and product catalogues. Three questions decide most of the result: how you normalize, which matcher shape fits how the names actually vary, and what a wrong answer costs compared with no answer.
+
+### Normalize first
+
+Normalization often does more than the matcher. In the fuzzy-matching spike, exact match after normalization alone was right 126 times on the dev half with zero wrong answers. Stripping legal suffixes added 19 more, still with none wrong. Typical steps:
+- **Script and width folding:** traditional→simplified (OpenCC), full-width→ASCII (Unicode NFKC does the width part), casefolding.
+- **Variant characters** that NFKC doesn't fold (恆/恒, 滙/匯).
+- **Legal suffixes** (有限公司, Limited, Co., Ltd.) and **generic tails** (控股, 集團, Holdings, Group).
+- **List-specific markers and duplicate rows** (HKEX's `－Ｒ`/`－Ｔ` counters).
+
+Apply the *same* function to both sides, and prepare the list side once at load, not on every call.
+
+### Pick the matcher that models how names vary
+
+| Family | Handles well | Fails on |
+|---|---|---|
+| Exact after normalization | spelling variants the normalizer folds | anything shortened |
+| Edit distance (Levenshtein, Jaro-Winkler) | typos, one-character differences | abbreviations: 農行 vs 農業銀行 is a large edit |
+| Token measures (`token_set_ratio`, `WRatio`) | reordered words, Latin names | CJK text has no word boundaries |
+| Character n-gram TF-IDF + cosine | fast approximate search over large lists | short queries share n-grams with many names |
+| **Ordered subsequence** | **Chinese abbreviations, which keep characters in order from anywhere in the name** | short real names inside longer ones (瑞銀 ⊂ 華泰瑞銀) |
+
+General rule: **choose the similarity measure from the process that generates the variation** (typing errors, abbreviation, translation, reordering), not from what a library offers by default.
+
+### A wrong answer costs more than no answer
+
+A miss drops one mention. A wrong match invents a false entity that flows on silently. Score matchers with an asymmetric utility (the spike used correct − 2 × wrong), and prefer designs that can say "don't know":
+- **A tie is a miss.** Breaking ties by lowest stock code turned 9 misses into 3 right answers and 6 wrong ones, so it was rejected.
+- **Who else can recover a miss?** In Entity Analysis the article's printed code and the model's own knowledge come first, so the name search only needs to be right when it answers, not to answer often.
+- **Measure the component inside its pipeline.** §4.2's matcher looked mediocre in isolation, but only end-to-end F1 showed it was *worse than nothing* (§1.11).
+
+### What rules can't do
+- Irregular abbreviations (中海油 = 中國海洋石油) need an **alias table**: the standard remedy, but it needs upkeep, and can't be tested fairly on the data it was seeded from.
+- Cross-language names need the code, the other-language name, or a knowledge base.
+
+### Cost
+Precompute the comparison forms at load, pre-filter candidates cheaply (here, names whose characters aren't nested with the query's), and index where you can (English word prefix → stocks). S8 runs at p99 ~5 ms over 2,798 stocks, small enough to stay on the event loop.
+
+SAPI: §1.11, §1.12.
+
+### To investigate
+- Record-linkage theory: the Fellegi–Sunter model, and blocking/indexing for large lists.
+- Unicode normalization forms (NFC vs NFKC), CJK compatibility and variant characters, and OpenCC's configurations (`t2s` vs `hk2s`).
+- Learned entity linking: dense retrieval plus a cross-encoder re-ranker, and when it beats rules on a list this small.
+- Alias tables and knowledge bases (Wikidata company aliases): sourcing, upkeep, and evaluating them without leakage.
+- Romanization and pinyin matching for names that appear only in English.
+- Precision–coverage curves as a way to choose an operating point for a matcher.
+
+---
+
+## 2.8 LLMs in a pipeline: extract with the model, verify in code
+
+An LLM step in a data pipeline is best treated as an unreliable but capable extractor whose output code checks. The design question is **which part only the model can do, and which part code can do deterministically.**
+
+### Split the work
+- **The model:** read prose, decide which companies an article is about, classify events and sentiment, recall facts it knows (an HKEX code).
+- **Code:** check that the code exists, that the name agrees with the listed name, that the article actually prints the code, that enums and lengths are valid, and dedup. These checks are cheap, deterministic and testable, and they catch hallucinated entities.
+- **Ground the output in the source text** wherever possible (the "article prints the code" check). It is the cheapest hallucination detector there is.
+
+### One structured call or a tool loop?
+
+| | One structured-output call, then code checks | Tool-calling loop |
+|---|---|---|
+| Round trips | one | one per round, plus a final answer |
+| Cost and latency | bounded and predictable | grow with how dense the input is |
+| Termination | trivial | must be designed: forced-call modes never stop, free modes can repeat calls, so you need round caps |
+| Needed when | the answer can be checked after the call | the model must fetch information it can't know, and it can't be checked afterwards |
+
+Rule: **if verification can run after the call, run it after the call.** A tool earns its place when it gives the model information it needs to *reason* further, not when it only confirms something code can confirm.
+
+### Choosing a model
+- **Set a ceiling first:** run the strongest model against itself. A gap smaller than its self-disagreement isn't a quality difference.
+- **Then compare what the pipeline pays for:** cost per unit of work (with thinking tokens billed as output), tail latency (p95 and max, not the mean), and failure rate under real load and a shared quota.
+- Choose the **smallest model that clears the bar**, and route to a bigger one only for a slice where routing measurably helps.
+
+### Schema-valid is not correct
+Structured output guarantees the shape: fields, types, enums. It doesn't guarantee the content. Keep business validation (length limits, allowed combinations, cross-field rules) in code after the call, and decide per rule whether to fix (truncate) or reject.
+
+SAPI: §1.13, §1.14.
+
+### To investigate
+- Constrained decoding: how JSON-schema output is enforced at the token level, and what it does to quality.
+- Evaluating LLM output: agreement ceilings, Cohen's kappa, and LLM-as-judge pitfalls (position and self-preference bias).
+- Model cascades and routing (e.g. FrugalGPT): when a cheap-first, escalate-on-doubt design pays off.
+- Prompt and skill versioning in production, and how a prompt change is rolled out and compared (design.md §9.1.1).
+- Thinking or reasoning budgets: when they help extraction tasks, and what they do to cost and tail latency.
+
+---
+
+## 2.9 Calling a hosted LLM API in production
+
+A hosted LLM is a slow, rate-limited, paid, non-deterministic remote dependency. Everything that applies to a remote API applies, and a few things are specific to LLMs.
+
+### Timeouts and retries
+- **Always set a timeout explicitly.** An SDK default can be "none", and one hung call then holds a worker for minutes.
+- **Know who retries.** The SDK (`retry_options`), a wrapper library, and your own code can each retry. Pick one owner, or the attempts multiply. Libraries can also retry in ways the provider rejects (Instructor's model-turn re-ask, §1.15).
+- **A paid call is a side effect you can't undo** (§2.4, pattern 5). Cap attempts, and avoid redoing a call whose result was already stored (§1.2).
+
+### Classify errors by what to do next
+
+| Error | Meaning | Action |
+|---|---|---|
+| 429 | rate limit or quota | pause the whole pool, then retry (§2.1) |
+| 5xx / 504 | provider trouble or a deadline hit | retry with backoff, bounded |
+| other 4xx, schema failures | the request itself is wrong | don't retry; fix the code or prompt |
+| 401 / 403 | credentials or project | alert a human |
+
+SAPI's mapping is in impl.md §7.2.
+
+### Tokens, quotas and inputs
+- **Count all three token kinds:** input, visible output and thinking. Thinking counts against `max_output_tokens`.
+- **Know the quota model.** Fixed RPM gives you a number to size concurrency against. A dynamic shared pool returns 429s at low concurrency and gives no such number. Provisioned throughput buys a guarantee. Also check which regions actually serve the model.
+- **Bound the input before the call.** Real documents can be orders of magnitude larger than test ones.
+- **Check feature thresholds before counting on them.** Context caching has a minimum prompt size.
+
+SAPI: §1.15.
+
+### To investigate
+- Provisioned throughput vs on-demand pricing, and the break-even volume.
+- Hedged requests for tail latency, and why they're risky for paid, non-idempotent calls.
+- Batch prediction APIs: cheaper asynchronous processing for work that isn't latency-sensitive.
+- LLM observability: per-call token, latency and cost logs, and alerting on cost drift.
+- Provider fallback (a second model or region) and how it interacts with evaluated quality.
+
+---
+
+## 2.10 Running a spike as a measured experiment
+
+A spike answers a design question with evidence. Both Entity Analysis spikes worked because they were run like small experiments, and the PR review of one showed how easily such an experiment drifts (§1.16).
+
+### Build the test set from real data
+- **Look for labels the data gives you for free:** news articles print `name(code)`, and HKEX announcements print the issuer's code in the header. Foreign tickers (`name(TICKER.US)`) give negatives, cases where the right answer is "no match".
+- **Add hand-collected hard cases** (abbreviations, ambiguous prefixes, A/H names), and adjudicate by reading wherever the automatic gold has gaps.
+
+### Keep tuning data and judging data apart
+- **Split dev and test by a hash of the query or the company,** so the same company never sits in both halves. Tune on dev; look at test only to confirm.
+- **Score a held-out set exactly once,** on a frozen version, against a pass bar written down *before* scoring. The fuzzy-matching spike's bar was "more right than `WRatio`, and at most 3% wrong".
+- **Reserve untouched data for whoever implements the design** (here, 288 articles neither spike read).
+- **Record rejected rounds with their numbers** (S9, S10), so nobody has to re-run them to know why they were dropped.
+
+### Measure in context, cheaply
+Component accuracy and end-to-end accuracy can disagree (§1.11). **Store raw model outputs, then replay them offline** with one component swapped: the fuzzy-matching spike compared five fallbacks on the LLM spike's stored outputs with no API calls and no LLM randomness between variants.
+
+### Make every figure reproducible
+- Freeze the inputs: prompt copies, list snapshots, commit hashes.
+- Derive every split and number from a committed script, never from a hand edit.
+- State one denominator per metric (per attempt vs per success).
+- Scan constructed test sets for leaked labels.
+- Re-score after any change to a shared component.
+- Commit no third-party text, and gitignore raw exports.
+
+### Small samples
+127 articles is small. 0.954 vs 0.962 is a handful of entities. Read the actual errors behind a difference before believing the score, and treat gaps within the reference model's own disagreement as ties.
+
+SAPI: §1.11–§1.16.
+
+### To investigate
+- Bootstrap confidence intervals and paired tests (McNemar's test) for small evaluation sets.
+- Overfitting to a dev set through repeated tuning: adaptive data analysis, the "garden of forking paths", and reusable holdouts.
+- Pre-registration: why fixing the pass bar in advance matters.
+- A taxonomy of data leakage (Kaufman et al., "Leakage in Data Mining").
+- LLM evaluation tooling (promptfoo, Inspect, OpenAI Evals) vs the hand-rolled scripts used here.
+
+---
+
 ## Further reading
 - Martin Kleppmann, *Designing Data-Intensive Applications*: chapters 8 (distributed system problems), 9 (consistency), 11 (stream processing).
 - Gregor Hohpe & Bobby Woolf, *Enterprise Integration Patterns*: Idempotent Receiver, Dead Letter Channel, Guaranteed Delivery, Competing Consumers.
 - Confluent's posts on Kafka exactly-once semantics.
 - microservices.io (Chris Richardson): Transactional Outbox, Idempotent Consumer, Saga.
+- Chip Huyen, *AI Engineering*: the chapters on evaluation methodology and on building inference pipelines around a model.
+- Peng, Yu & Dredze, "An Empirical Study of Chinese Name Matching and Applications" (ACL 2015), and the study of Chinese abbreviations as ordered subsequences at [arXiv 1712.06289](https://ar5iv.arxiv.org/html/1712.06289): the two papers behind the fuzzy-matching spike's direction.
+- Kaufman, Rosset & Perlich, "Leakage in Data Mining: Formulation, Detection, and Avoidance" (KDD 2011).
