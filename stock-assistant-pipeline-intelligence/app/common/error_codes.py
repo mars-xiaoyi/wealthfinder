@@ -14,3 +14,5 @@ LLM_PROVIDER_ERROR = "COMMON-7002"  # LLM provider error, network error or timeo
 LLM_AUTHENTICATION_FAILED = "COMMON-7003"  # LLM provider rejected the credentials
 LLM_SCHEMA_VIOLATION = "COMMON-7004"  # LLM response did not match the output schema
 LLM_REQUEST_REJECTED = "COMMON-7005"  # LLM provider rejected the request itself
+DATABASE_ERROR = "COMMON-8000"  # Database failure other than an unreachable database
+UNIQUE_CONSTRAINT_VIOLATED = "COMMON-8001"  # Write violated a unique constraint

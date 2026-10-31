@@ -30,6 +30,8 @@ def load_config_defaults():
     assert config.db.url == REQUIRED_ENV["DATABASE_URL"]
     assert config.db.pool_size == 10
     assert config.db.close_timeout_s == 10
+    assert config.db.max_retry == 3
+    assert config.db.retry_base_wait_ms == 100
     assert config.http.timeout_s == 120
     assert config.health.check_timeout_s == 2
     assert config.redis.stream_url == REQUIRED_ENV["REDIS_STREAM_URL"]
@@ -48,6 +50,8 @@ def load_config_defaults():
 def load_config_overrides(monkeypatch):
     monkeypatch.setenv("DB_POOL_SIZE", "25")
     monkeypatch.setenv("DB_CLOSE_TIMEOUT_S", "3")
+    monkeypatch.setenv("DB_WRITE_MAX_RETRY", "5")
+    monkeypatch.setenv("DB_RETRY_BASE_WAIT_MS", "50")
     monkeypatch.setenv("HTTP_TIMEOUT_S", "30")
     monkeypatch.setenv("HEALTH_CHECK_TIMEOUT_S", "5")
     monkeypatch.setenv("REDIS_RECONNECT_INTERVAL_S", "1")
@@ -63,6 +67,8 @@ def load_config_overrides(monkeypatch):
 
     assert config.db.pool_size == 25
     assert config.db.close_timeout_s == 3
+    assert config.db.max_retry == 5
+    assert config.db.retry_base_wait_ms == 50
     assert config.http.timeout_s == 30
     assert config.health.check_timeout_s == 5
     assert config.redis.reconnect_interval_s == 1

@@ -54,7 +54,13 @@ async def _hang_forever(*_args: object) -> None:
 @pytest.fixture
 def config():
     return AppConfig(
-        db=DatabaseConfig(url="postgresql://localhost/sapi", pool_size=10, close_timeout_s=10),
+        db=DatabaseConfig(
+            url="postgresql://localhost/sapi",
+            pool_size=10,
+            close_timeout_s=10,
+            max_retry=3,
+            retry_base_wait_ms=100,
+        ),
         http=HttpConfig(timeout_s=120),
         health=HealthConfig(check_timeout_s=2),
         redis=RedisConfig(

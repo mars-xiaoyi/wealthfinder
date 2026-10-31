@@ -6,15 +6,18 @@ docker CLI. Host ports are fixed per session (not Docker-assigned) so `docker st
 
 import contextlib
 import dataclasses
+import functools
 import http.server
 import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -31,6 +34,8 @@ READY_TIMEOUT_S = 30.0
 OPTIONAL_ENV = (
     "DB_POOL_SIZE",
     "DB_CLOSE_TIMEOUT_S",
+    "DB_WRITE_MAX_RETRY",
+    "DB_RETRY_BASE_WAIT_MS",
     "HTTP_TIMEOUT_S",
     "HEALTH_CHECK_TIMEOUT_S",
     "REDIS_RECONNECT_INTERVAL_S",
@@ -47,6 +52,7 @@ PLACEHOLDER_VERTEX_PROJECT = "sapi-integration-test"
 HKEX_URL_CONSTANTS = ("_ACTIVESTOCK_EN_URL", "_ACTIVESTOCK_ZH_URL", "_LIST_OF_SECURITIES_URL")
 # Nothing listens on port 1, so a connection is refused at once.
 REFUSED_URL = "http://127.0.0.1:1"
+SERVICE_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _docker(*args: str) -> subprocess.CompletedProcess[str]:
@@ -202,10 +208,29 @@ def infra() -> Iterator[Infra]:
         infra = Infra(*started)
         for container in infra.all():
             container.wait_ready()
+        _alembic(infra, "upgrade", "head")
         yield infra
     finally:
         for container in started:
             subprocess.run(["docker", "rm", "-f", container.name], capture_output=True)
+
+
+def _alembic(infra: Infra, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the alembic CLI against the session's Postgres, as an operator would."""
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", *args],
+        cwd=SERVICE_ROOT,
+        env={**os.environ, "DATABASE_URL": infra.env()["DATABASE_URL"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+@pytest.fixture
+def alembic(infra: Infra) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """alembic("upgrade", "head") runs the alembic CLI against the session's Postgres."""
+    return functools.partial(_alembic, infra)
 
 
 @pytest.fixture(autouse=True)

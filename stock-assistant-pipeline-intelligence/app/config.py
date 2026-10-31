@@ -10,6 +10,8 @@ class DatabaseConfig:
     url: str  # env: DATABASE_URL
     pool_size: int  # env: DB_POOL_SIZE (default 10)
     close_timeout_s: int  # env: DB_CLOSE_TIMEOUT_S (default 10)
+    max_retry: int  # env: DB_WRITE_MAX_RETRY (default 3)
+    retry_base_wait_ms: int  # env: DB_RETRY_BASE_WAIT_MS (default 100)
 
 
 @dataclass
@@ -85,6 +87,8 @@ def load_config() -> AppConfig:
             url=_require("DATABASE_URL"),
             pool_size=int(os.environ.get("DB_POOL_SIZE", "10")),
             close_timeout_s=int(os.environ.get("DB_CLOSE_TIMEOUT_S", "10")),
+            max_retry=int(os.environ.get("DB_WRITE_MAX_RETRY", "3")),
+            retry_base_wait_ms=int(os.environ.get("DB_RETRY_BASE_WAIT_MS", "100")),
         ),
         http=HttpConfig(
             timeout_s=int(os.environ.get("HTTP_TIMEOUT_S", "120")),

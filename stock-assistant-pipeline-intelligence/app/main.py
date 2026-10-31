@@ -14,6 +14,7 @@ from app.entity_analysis.cleaned_news_consumer import CleanedNewsConsumer
 from app.entity_analysis.entity_analysis_service import create_entity_analysis_service
 from app.llm.vertex_adapter import create_llm_adapter
 from app.logger import configure_logging, get_logger
+from app.persistent.entity_event_repository import create_entity_event_repository
 from app.redis.state_client import create_state_client
 from app.redis.stream_client import create_stream_client
 
@@ -36,7 +37,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         db = await create_db_client(config.db)
         resources.push_async_callback(db.close, config.db.close_timeout_s)
-        redis_stream = await create_stream_client(config.redis.stream_url)
+        redis_stream = await create_stream_client(
+            config.redis.stream_url, config.redis.reconnect_interval_s
+        )
         resources.push_async_callback(redis_stream.close)
         redis_state = await create_state_client(config.redis.state_url)
         resources.push_async_callback(redis_state.close)
@@ -45,6 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         llm_adapter = create_llm_adapter(config.llm)
         resources.push_async_callback(llm_adapter.close)
         create_news_client(http_client, config.entity_analysis.sadi_api_url)
+        create_entity_event_repository()
 
         # Eager, blocking HK Stock List load. Unlike the infra above, a failure must not abort
         # startup: refresh_hk_stock_list() leaves an empty fallback cache, and GET /v1/health

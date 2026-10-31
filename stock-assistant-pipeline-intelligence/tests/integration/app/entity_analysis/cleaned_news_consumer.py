@@ -1,22 +1,42 @@
 import asyncio
+import dataclasses
 import functools
 import io
 import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from datetime import UTC, datetime
 from typing import Any
 
+import asyncpg
 import openpyxl
 import pytest
 import redis.asyncio
 import redis.exceptions
 import structlog.testing
 
-from app import logger
+from app import logger, main
 from app.common import error_codes, hk_stock_list
 from app.common.error_categories import ErrorCategory
-from app.redis.stream_client import CONSUMER_GROUP_ENTITY_ANALYSIS, STREAM_RAW_NEWS_CLEANED
+from app.common.errors import ServiceUnavailableError
+from app.llm import vertex_adapter
+from app.llm.adapter import LLMAdapter, StructuredLLMResponse
+from app.llm.errors import (
+    LLMAuthenticationError,
+    LLMError,
+    LLMProviderError,
+    LLMRateLimitError,
+    LLMRequestError,
+    LLMSchemaViolationError,
+)
+from app.models.entity_event import EventTypeEnum, SentimentEnum
+from app.redis.stream_client import (
+    CONSUMER_GROUP_ENTITY_ANALYSIS,
+    STREAM_ENTITY_EVENT_COMPLETED,
+    STREAM_RAW_NEWS_CLEANED,
+)
+from app.skills.entity_analysis_skill import ExtractedEntity, LLMOutput
 from tests.integration.conftest import (
     HKEX_URL_CONSTANTS,
     REFUSED_URL,
@@ -33,6 +53,8 @@ CONSUMER_ENV = {
     "ENTITY_ANALYSIS_BATCH_SIZE": "5",
     "ENTITY_ANALYSIS_BATCH_TIMEOUT_MS": "200",
     "REDIS_RECONNECT_INTERVAL_S": "1",
+    "DB_WRITE_MAX_RETRY": "3",
+    "DB_RETRY_BASE_WAIT_MS": "100",
 }
 POLL_INTERVAL_S = 0.05
 SETTLE_S = 0.5
@@ -90,6 +112,15 @@ class StreamProbe:
             STREAM_RAW_NEWS_CLEANED, CONSUMER_GROUP_ENTITY_ANALYSIS, "-", "+", 100
         )
         return {entry["message_id"]: entry["times_delivered"] for entry in entries}
+
+    async def published(self) -> list[dict[str, str]]:
+        """The fields of every stream:entity_event_completed entry, oldest first."""
+        entries = await self._client.xrange(STREAM_ENTITY_EVENT_COMPLETED)
+        return [fields for _message_id, fields in entries]
+
+    async def reconnect(self) -> None:
+        """Drop the probe's connections, e.g. after the stream Redis restarted."""
+        await self._client.connection_pool.disconnect()
 
 
 @pytest.fixture
@@ -376,22 +407,6 @@ async def start_stream_redis_outage(start_consumer, streams, stub_sadi, infra, o
         )
 
 
-@pytest.mark.vertex
-async def start_postgres_and_state_redis_down(start_consumer, streams, stub_sadi, infra):
-    """Analysing an article needs only the stream Redis, SADI and Vertex AI."""
-    cleaned_id = uuid.uuid4()
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            infra.postgres.stop()
-            infra.redis_state.stop()
-            message_id = await streams.add(cleaned_id)
-            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, VERTEX_WAIT_S)
-            await asyncio.sleep(SETTLE_S)
-
-    assert len(_completed(logs, cleaned_id)) == 1
-
-
 async def start_resumes_after_restart(start_consumer, streams, stub_sadi):
     """The group's position is kept across an app restart: a message added while the app is
     down is handled, and nothing already ACKed is requested again."""
@@ -553,9 +568,11 @@ async def _wait_completed(
 
 
 @pytest.mark.vertex
-async def start_listed_companies_verified(start_consumer, hkex_feed, streams, stub_sadi):
+async def start_listed_companies_verified(
+    start_consumer, hkex_feed, streams, stub_sadi, entity_events
+):
     """An article naming two listed companies is analysed in one call and both are verified
-    against the real HK Stock List; the message is ACKed."""
+    against the real HK Stock List, stored and announced; the message is ACKed."""
     cleaned_id = uuid.uuid4()
     stub_sadi.serve(cleaned_id, LISTED_TITLE, LISTED_BODY)
     hkex_feed("real")
@@ -577,7 +594,9 @@ async def start_listed_companies_verified(start_consumer, hkex_feed, streams, st
     assert record["input_truncated"] is False
     # The Skill records the constraint fixes it applies as BusinessValidationError entries.
     assert [e for e in record["llm_errors"] if e["error_type"] in LLM_ERROR_TYPES] == []
-    assert "entity_event_ids" not in record
+    rows = await entity_events.rows(f"https://finance.mingpao.com/{cleaned_id}")
+    assert [row["stock_code"] for row in rows] == ["00005", "01299"]
+    assert sorted(record["entity_event_ids"]) == sorted(str(row["entity_event_id"]) for row in rows)
     [call] = record["llm_calls"]
     assert (call["call_index"], call["purpose"]) == (1, "structured_output")
     assert call["input_tokens"] > 1000  # the system prompt alone is about 1,800 tokens
@@ -665,3 +684,415 @@ async def start_llm_failure_left_pending(
     assert [e["error_type"] for e in record["llm_errors"]] == [error_type]
     assert record["verified_entities"] == []
     assert await streams.pending() == {failing_message_id: 1}
+
+
+# Persisting and publishing EntityEvents. These cases replace Vertex AI with FakeLLMAdapter, so
+# the outcome stored for each article is known in advance.
+
+ARTICLE_TITLE = "騰訊及阿里巴巴公佈季度業績"
+ARTICLE_BODY = "騰訊控股（00700）及阿里巴巴（09988）公佈季度業績。"  # noqa: RUF001
+ARTICLE_PUBLISHED_AT = datetime(2025, 1, 15, tzinfo=UTC)  # what the SADI stub serves
+TENCENT_ITEM = ExtractedEntity(
+    stock_code="00700",
+    company_name="騰訊控股",
+    event_type_primary=EventTypeEnum.EARNINGS,
+    event_type_secondary=EventTypeEnum.DIVIDEND,
+    sentiment_label=SentimentEnum.POSITIVE,
+    sentiment_score=0.8,
+    headline="騰訊業績超預期",
+    entity_summary="騰訊季度收入按年增長，並增加派息。",  # noqa: RUF001
+)
+ALIBABA_ITEM = ExtractedEntity(
+    stock_code="09988",
+    company_name="阿里巴巴",
+    event_type_primary=EventTypeEnum.EARNINGS,
+    event_type_secondary=None,
+    sentiment_label=SentimentEnum.NEGATIVE,
+    sentiment_score=0.3,
+    headline="阿里巴巴盈利下跌",
+    entity_summary="阿里巴巴季度盈利按年下跌。",
+)
+# (stock_code, exchange, company_name_zh, company_name_en) of each item's stock in the trimmed
+# HK Stock List feed.
+ITEM_STOCKS = {
+    "00700": ("00700", "HKEX", "騰訊控股", "TENCENT"),
+    "09988": ("09988", "HKEX", "阿里巴巴", "BABA-W"),
+}
+REPUBLISHED_EVENT = "entity_analysis_republished"
+
+
+class FakeLLMAdapter(LLMAdapter):
+    """Stands in for Vertex AI: answers every call with items, or raises error. While hold is
+    set, a call waits for it before answering; entered is set once a call has started."""
+
+    def __init__(self) -> None:
+        self.items: list[ExtractedEntity] = []
+        self.error: LLMError | None = None
+        self.hold: asyncio.Event | None = None
+        self.entered = asyncio.Event()
+        self.calls = 0
+
+    async def generate_structured(self, messages, output_schema, generation_config):
+        self.calls += 1
+        self.entered.set()
+        if self.hold is not None:
+            await self.hold.wait()
+        if self.error is not None:
+            raise self.error
+        return StructuredLLMResponse(
+            output=LLMOutput(output_items=self.items),
+            input_tokens=1000,
+            output_tokens=100,
+            latency_ms=10,
+        )
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeLLMAdapter:
+    """Make the app's lifespan register a FakeLLMAdapter instead of the Vertex AI adapter."""
+    fake = FakeLLMAdapter()
+
+    def create_llm_adapter(config: object) -> FakeLLMAdapter:
+        monkeypatch.setattr(vertex_adapter, "_llm_adapter", fake)
+        return fake
+
+    monkeypatch.setattr(main, "create_llm_adapter", create_llm_adapter)
+    return fake
+
+
+class EntityEventsProbe:
+    """The test's own view of the entity_events table, on a fresh connection per query so it
+    survives a Postgres restart."""
+
+    def __init__(self, database_url: str) -> None:
+        self._database_url = database_url
+
+    async def rows(self, source_url: str) -> list[asyncpg.Record]:
+        """The rows stored for source_url, ordered by stock_code."""
+        conn = await asyncpg.connect(self._database_url)
+        try:
+            return await conn.fetch(
+                "SELECT * FROM entity_events WHERE source_url = $1 ORDER BY stock_code",
+                source_url,
+            )
+        finally:
+            await conn.close()
+
+    async def truncate(self) -> None:
+        conn = await asyncpg.connect(self._database_url)
+        try:
+            await conn.execute("TRUNCATE entity_events")
+        finally:
+            await conn.close()
+
+
+@pytest.fixture
+async def entity_events(infra: Infra) -> EntityEventsProbe:
+    probe = EntityEventsProbe(infra.env()["DATABASE_URL"])
+    await probe.truncate()
+    return probe
+
+
+def _source_url(cleaned_id: uuid.UUID) -> str:
+    """The source_url the SADI stub serves for cleaned_id."""
+    return f"https://finance.mingpao.com/{cleaned_id}"
+
+
+def _assert_row(row: asyncpg.Record, cleaned_id: uuid.UUID, item: ExtractedEntity) -> None:
+    """row is item's EntityEvent for cleaned_id's article, exactly as stored."""
+    stock_code, exchange, company_name_zh, company_name_en = ITEM_STOCKS[item.stock_code or ""]
+    assert isinstance(row["entity_event_id"], uuid.UUID)
+    assert (row["exchange"], row["stock_code"]) == (exchange, stock_code)
+    assert (row["source_url"], row["source_name"]) == (_source_url(cleaned_id), "MINGPAO")
+    assert row["published_at"] == ARTICLE_PUBLISHED_AT
+    assert (
+        row["event_type_primary"],
+        row["sentiment_label"],
+        row["sentiment_score"],
+        row["headline"],
+        row["entity_summary"],
+    ) == (
+        item.event_type_primary,
+        item.sentiment_label,
+        item.sentiment_score,
+        item.headline,
+        item.entity_summary,
+    )
+    assert json.loads(row["additional_outcome"]) == {
+        "version": "v1.0.0",
+        "output": {
+            "company_name_zh": company_name_zh,
+            "company_name_en": company_name_en,
+            "event_type_secondary": item.event_type_secondary,
+            "headline": item.headline,
+            "entity_summary": item.entity_summary,
+        },
+    }
+    assert json.loads(row["metadata"]) == {"cleaned_id": str(cleaned_id)}
+    assert row["created_at"] == row["updated_at"]
+
+
+def _announcements(rows: list[asyncpg.Record]) -> list[dict[str, str]]:
+    """The stream:entity_event_completed fields announcing each row, in row order."""
+    return [{"entity_event_id": str(row["entity_event_id"]), "v": "1"} for row in rows]
+
+
+def _by_id(fields: list[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(fields, key=lambda entry: entry["entity_event_id"])
+
+
+def _sapi_errors(logs: list[MutableMapping[str, Any]], error_code: str) -> list[tuple]:
+    """(log_level, category, cleaned_id) of each record logged for a SAPIError with
+    error_code."""
+    return [
+        (log["log_level"], log["category"], log["cleaned_id"])
+        for log in logs
+        if log.get("error_code") == error_code
+    ]
+
+
+async def start_persist_and_publish(start_consumer, streams, stub_sadi, fake_llm, entity_events):
+    """An article naming two listed companies is stored as one row per company, and each row
+    is announced once, before the message is ACKed."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM, ALIBABA_ITEM]
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            message_id = await streams.add(cleaned_id)
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 10)
+            published_when_acked = await streams.published()
+            await asyncio.sleep(SETTLE_S)
+
+    rows = await entity_events.rows(_source_url(cleaned_id))
+    assert len(rows) == 2
+    _assert_row(rows[0], cleaned_id, TENCENT_ITEM)
+    _assert_row(rows[1], cleaned_id, ALIBABA_ITEM)
+    assert _by_id(published_when_acked) == _by_id(_announcements(rows))
+    assert await streams.published() == published_when_acked
+    [record] = _completed(logs, cleaned_id)
+    assert sorted(record["entity_event_ids"]) == sorted(str(row["entity_event_id"]) for row in rows)
+    assert await streams.pending() == {}
+
+
+async def start_failed_write_stores_nothing(
+    start_consumer, streams, stub_sadi, fake_llm, entity_events
+):
+    """When one company's row can't be written, none of the article's rows is kept or
+    announced and its message stays pending; the next article is handled normally."""
+    failing, next_article = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.serve(failing, ARTICLE_TITLE, ARTICLE_BODY)
+    stub_sadi.serve(next_article, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM, ALIBABA_ITEM]
+
+    async with start_consumer():
+        cache = hk_stock_list.get_hk_stock_list_cache()
+        alibaba = cache.entries["09988"]
+        # Longer than the exchange column's VARCHAR(10): the second insert fails.
+        cache.entries["09988"] = dataclasses.replace(alibaba, exchange="HKEX-TOO-LONG")
+        with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
+            failing_message_id = await streams.add(failing)
+
+            async def failed() -> bool:
+                return bool(_sapi_errors(logs, error_codes.DATABASE_ERROR))
+
+            await _wait_for(failed, 10)
+            cache.entries["09988"] = alibaba
+            next_message_id = await streams.add(next_article)
+            await _wait_acked(streams, stub_sadi, {next_article: next_message_id}, 10)
+
+    assert await entity_events.rows(_source_url(failing)) == []
+    next_rows = await entity_events.rows(_source_url(next_article))
+    assert len(next_rows) == 2
+    assert _by_id(await streams.published()) == _by_id(_announcements(next_rows))
+    assert await streams.pending() == {failing_message_id: 1}
+    assert _sapi_errors(logs, error_codes.DATABASE_ERROR) == [
+        ("error", ErrorCategory.DB, str(failing))
+    ]
+    assert _completed(logs, failing) == []
+
+
+async def start_redelivery_republished(start_consumer, streams, stub_sadi, fake_llm, entity_events):
+    """A message for an article already stored announces the stored rows again without
+    analysing the article again, and is ACKed."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM, ALIBABA_ITEM]
+
+    async with start_consumer():
+        first_message_id = await streams.add(cleaned_id)
+        await _wait_acked(streams, stub_sadi, {cleaned_id: first_message_id}, 10)
+        rows = await entity_events.rows(_source_url(cleaned_id))
+
+        with structlog.testing.capture_logs() as logs:
+            second_message_id = await streams.add(cleaned_id)
+
+            async def republished() -> bool:
+                return any(log["event"] == REPUBLISHED_EVENT for log in logs)
+
+            await _wait_for(republished, 10)
+            await _wait_acked(streams, stub_sadi, {cleaned_id: second_message_id}, 5)
+            await asyncio.sleep(SETTLE_S)
+
+    assert len(rows) == 2
+    assert fake_llm.calls == 1
+    assert await entity_events.rows(_source_url(cleaned_id)) == rows
+    published = await streams.published()
+    assert len(published) == 4
+    assert _by_id(published[:2]) == _by_id(_announcements(rows))
+    assert _by_id(published[2:]) == _by_id(_announcements(rows))
+    [record] = [log for log in logs if log["event"] == REPUBLISHED_EVENT]
+    assert record["log_level"] == "info"
+    assert record["cleaned_id"] == str(cleaned_id)
+    assert record["source_url"] == _source_url(cleaned_id)
+    assert sorted(record["entity_event_ids"]) == sorted(str(row["entity_event_id"]) for row in rows)
+    assert _completed(logs, cleaned_id) == []
+    assert await streams.pending() == {}
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "no_entities",
+        "not_found",
+        LLMRateLimitError,
+        LLMProviderError,
+        LLMRequestError,
+        LLMAuthenticationError,
+        LLMSchemaViolationError,
+    ],
+    ids=lambda outcome: outcome if isinstance(outcome, str) else outcome.__name__,
+)
+async def start_nothing_stored(
+    start_consumer, streams, stub_sadi, fake_llm, entity_events, outcome
+):
+    """An article with no listed company, one SADI doesn't have, or one whose analysis failed
+    writes and announces nothing; only the first two are ACKed."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    acked = outcome in ("no_entities", "not_found")
+    if outcome == "not_found":
+        stub_sadi.respond(cleaned_id, 404)
+    elif isinstance(outcome, type):
+        fake_llm.error = outcome("scripted failure", category=ErrorCategory.LLM)
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer():
+            message_id = await streams.add(cleaned_id)
+            if acked:
+                await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 5)
+            else:
+                await _wait_completed(logs, cleaned_id, 5)
+            await asyncio.sleep(SETTLE_S)
+
+    assert await entity_events.rows(_source_url(cleaned_id)) == []
+    assert await streams.published() == []
+    assert await streams.pending() == ({} if acked else {message_id: 1})
+    records = _completed(logs, cleaned_id)
+    if outcome == "not_found":
+        assert records == []
+    else:
+        [record] = records
+        assert record["entity_event_ids"] == []
+        expected_errors = [] if acked else [outcome.__name__]
+        assert [e["error_type"] for e in record["llm_errors"]] == expected_errors
+
+
+async def start_postgres_down_at_write(
+    start_consumer, streams, stub_sadi, fake_llm, entity_events, infra
+):
+    """With Postgres stopped by the time an article is written, the write fails once its
+    retries run out, nothing is announced and the message stays pending; once Postgres is
+    back, the same app instance stores the next article."""
+    stopped, recovered = uuid.uuid4(), uuid.uuid4()
+    stub_sadi.serve(stopped, ARTICLE_TITLE, ARTICLE_BODY)
+    stub_sadi.serve(recovered, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM]
+    fake_llm.hold = asyncio.Event()
+
+    with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
+        async with start_consumer():
+            stopped_message_id = await streams.add(stopped)
+            await asyncio.wait_for(fake_llm.entered.wait(), 5)
+            infra.postgres.stop()
+            fake_llm.hold.set()
+
+            async def failed() -> bool:
+                return bool(_sapi_errors(logs, error_codes.SERVICE_UNAVAILABLE))
+
+            await _wait_for(failed, 10)
+            infra.postgres.restore()
+            fake_llm.hold = None
+            recovered_message_id = await streams.add(recovered)
+            await _wait_acked(streams, stub_sadi, {recovered: recovered_message_id}, 15)
+
+    assert await entity_events.rows(_source_url(stopped)) == []
+    recovered_rows = await entity_events.rows(_source_url(recovered))
+    assert len(recovered_rows) == 1
+    assert await streams.published() == _announcements(recovered_rows)
+    assert await streams.pending() == {stopped_message_id: 1}
+    assert _sapi_errors(logs, error_codes.SERVICE_UNAVAILABLE) == [
+        ("error", ErrorCategory.DB, str(stopped))
+    ]
+    [failure] = [log for log in logs if log.get("error_code") == error_codes.SERVICE_UNAVAILABLE]
+    assert isinstance(failure["exc_info"], ServiceUnavailableError)
+
+
+async def start_stream_redis_down_at_publish(
+    start_consumer, streams, stub_sadi, fake_llm, entity_events, infra
+):
+    """With the stream Redis stopped once an article's rows are stored, publishing warns and
+    retries; once Redis is back, every row is announced exactly once and the message is ACKed
+    by the same app instance."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM, ALIBABA_ITEM]
+    fake_llm.hold = asyncio.Event()
+
+    async with start_consumer():
+        message_id = await streams.add(cleaned_id)
+        await asyncio.wait_for(fake_llm.entered.wait(), 5)
+        await asyncio.sleep(1.5)  # the delivery reaches the append-only file within a second
+        infra.redis_stream.stop()
+        with structlog.testing.capture_logs() as logs:
+            fake_llm.hold.set()
+            await asyncio.sleep(3)
+        rows_during_outage = await entity_events.rows(_source_url(cleaned_id))
+
+        infra.redis_stream.restore()
+        await streams.reconnect()
+
+        async def acked() -> bool:
+            return message_id not in await streams.pending()
+
+        await _wait_for(acked, 10)
+
+    assert len(rows_during_outage) == 2
+    retries = [log for log in logs if log["event"] == "redis_stream_publish_retrying"]
+    assert len(retries) >= 2
+    assert {log["log_level"] for log in retries} == {"warning"}
+    assert not [log for log in logs if log["log_level"] in ("error", "critical")]
+    assert _by_id(await streams.published()) == _by_id(_announcements(rows_during_outage))
+    assert await streams.pending() == {}
+
+
+async def start_state_redis_down(
+    start_consumer, streams, stub_sadi, fake_llm, entity_events, infra
+):
+    """Analysing, storing and announcing an article doesn't need the state Redis."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
+    fake_llm.items = [TENCENT_ITEM]
+
+    async with start_consumer():
+        infra.redis_state.stop()
+        message_id = await streams.add(cleaned_id)
+        await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 10)
+
+    rows = await entity_events.rows(_source_url(cleaned_id))
+    assert len(rows) == 1
+    assert await streams.published() == _announcements(rows)

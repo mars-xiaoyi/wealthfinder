@@ -1,7 +1,9 @@
+import asyncio
 from dataclasses import dataclass
 
 import redis.asyncio
 import redis.exceptions
+from redis.typing import EncodableT, FieldT
 
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
@@ -10,8 +12,11 @@ from app.logger import get_logger
 logger = get_logger(__name__)
 
 STREAM_RAW_NEWS_CLEANED = "stream:raw_news_cleaned"
+STREAM_ENTITY_EVENT_COMPLETED = "stream:entity_event_completed"
 
 CONSUMER_GROUP_ENTITY_ANALYSIS = "sapi-entity-analysis"
+
+_REDIS_UNREACHABLE = (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
 
 
 @dataclass
@@ -25,8 +30,28 @@ class StreamMessage:
 class RedisStreamClient:
     """Wrapper around the Redis connection dedicated to stream:* keys."""
 
-    def __init__(self, client: redis.asyncio.Redis) -> None:
+    def __init__(self, client: redis.asyncio.Redis, reconnect_interval_s: int) -> None:
         self._client = client
+        self._reconnect_interval_s = reconnect_interval_s
+
+    async def publish(self, stream: str, fields: dict[str, str]) -> str:
+        """
+        Append a message to a stream and return its id. While the stream Redis is unreachable,
+        retries every reconnect_interval_s until the message is written.
+        """
+        entry: dict[FieldT, EncodableT] = {key: value for key, value in fields.items()}
+        while True:
+            try:
+                message_id: str = await self._client.xadd(stream, entry)
+                return message_id
+            except _REDIS_UNREACHABLE as exc:
+                logger.warning(
+                    "redis_stream_publish_retrying",
+                    stream=stream,
+                    retry_in_s=self._reconnect_interval_s,
+                    error=repr(exc),
+                )
+                await asyncio.sleep(self._reconnect_interval_s)
 
     async def create_group_if_not_exists(self, stream: str, group: str) -> None:
         """Create the consumer group at the stream's start, creating the stream too if it is
@@ -88,7 +113,7 @@ def get_redis_stream_client() -> RedisStreamClient:
     return _redis_stream_client
 
 
-async def create_stream_client(redis_url: str) -> RedisStreamClient:
+async def create_stream_client(redis_url: str, reconnect_interval_s: int) -> RedisStreamClient:
     """
     Create a Redis connection pool, verify connectivity with PING, wrap it in a
     RedisStreamClient and register it as this module's singleton.
@@ -101,5 +126,5 @@ async def create_stream_client(redis_url: str) -> RedisStreamClient:
     except BaseException:
         await client.aclose()
         raise
-    _redis_stream_client = RedisStreamClient(client)
+    _redis_stream_client = RedisStreamClient(client, reconnect_interval_s)
     return _redis_stream_client
