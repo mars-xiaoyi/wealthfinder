@@ -8,7 +8,8 @@
 - Variants: see VARIANTS. Every response goes to data/rounds/<variant>.jsonl.
 - Prompts are the ones the rounds ran: Parts 1/2/4 from implementation.md as of FROZEN_REV (before the spike's
   writeback), few-shots from the current implementation.md with the commentary tails the earlier variants used put
-  back (SHOT_TAIL_CUTS). V4 is what implementation.md now specifies, except Edge Case Rule 3's wording.
+  back (SHOT_TAIL_CUTS, SCORING_SHOT_TAIL). V4 is what implementation.md now specifies, except Edge Case Rule 3's
+  wording and §8.4 Example 5's last clause.
 
     .venv/bin/python rounds.py ref dev          # reference scores
     .venv/bin/python rounds.py run V0 dev       # a variant (both Skills), then its judge
@@ -79,13 +80,19 @@ def brief_parts() -> dict[str, str]:
     return _frozen_parts("### 8.3 ", "### 8.4 ")
 
 
+# §8.4 Example 5's summary_full as the rounds ran it, before the writeback cut its own commentary tail
+SCORING_SHOT_TAIL = ("調查範圍及時間表未有披露，潛在處罰存在不確定性。\n", "調查範圍及時間表未有披露。\n")
+
+
 def draft_shots(heading: str) -> list[str]:
-    """The few-shots as the rounds' variants read them: §8.3's with the commentary tails put back."""
-    shots = rs.few_shots(rs._section("### 8.3 ", "### 8.4 ") if heading == "## 8.3" else rs._section("### 8.4 ", "### 8.5 "))
+    """The few-shots as the rounds' variants read them: the commentary tails put back."""
     if heading == "## 8.3":
+        shots = rs.few_shots(rs._section("### 8.3 ", "### 8.4 "))
         for old, new in SHOT_TAIL_CUTS.items():
             shots = [s.replace(new, old) for s in shots]
-    return shots
+        return shots
+    old, new = SCORING_SHOT_TAIL
+    return [s.replace(new, old) for s in rs.few_shots(rs._section("### 8.4 ", "### 8.5 "))]
 
 
 def select_capped(constituents: list[dict], char_cap: int | None) -> list[dict]:
@@ -115,10 +122,10 @@ SUMMARY_FULL_SPEC_NEW = ("【summary_full】≤150繁體中文字；涵蓋事件
 BRIEF_RULE_DUPLICATES = "5. 同一指標有多個不同數值（如盤中及全日股價變動）→ 採用標明「全日」或最新的數值，不得混用"
 BRIEF_RULE_TIMING = ("5. 時段照錄原文：只有輸入標明「全日」「半日」「盤中」的數值才可寫上該時段；未標明時段的數值照錄原文措辭"
                      "（如「升11.09%」），不得自行加上時段；同一指標有多個數值時，優先採用標明「全日」者")
-SHOT_TAIL_CUTS = {
-    "管理層指中場業務需求強勁，業績及股東回報均屬正面。": "管理層指中場業務需求強勁。",
-    "涉及車型數目及調查時間表均未披露，結果及潛在處罰存在不確定性。": "涉及車型數目及調查時間表均未披露。",
-    "將全年銷量指引由低單位數增長下調至持平，高端化增長與前景轉弱信號並存。": "將全年銷量指引由低單位數增長下調至持平。",
+SHOT_TAIL_CUTS = {   # each ends with the closing quote, so only the summary_full line matches, never an INPUT line
+    "管理層指中場業務需求強勁，業績及股東回報均屬正面。\"": "管理層指中場業務需求強勁。\"",
+    "涉及車型數目及調查時間表均未披露，結果及潛在處罰存在不確定性。\"": "涉及車型數目及調查時間表均未披露。\"",
+    "將全年銷量指引由低單位數增長下調至持平，高端化增長與前景轉弱信號並存。\"": "將全年銷量指引由低單位數增長下調至持平。\"",
 }
 
 
