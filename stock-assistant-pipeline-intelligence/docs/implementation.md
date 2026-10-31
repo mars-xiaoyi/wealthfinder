@@ -147,7 +147,8 @@ sapi/
 │   │   ├── connection.py                # asyncpg connection pool + DatabaseClient + TransactionConnection; _db_write_with_retry() unified write retry (system-design.md §12.1)
 │   │   └── errors.py                    # UniqueConstraintError / DatabaseError (driver-agnostic)
 │   ├── redis/
-│   │   ├── stream_client.py             # RedisStreamClient — messaging + reconnect logic; stream name constants
+│   │   ├── stream_client.py             # RedisStreamClient — messaging + reconnect logic
+│   │   ├── stream_enum.py               # one class per stream: its name, message-format version, consumer group (§6.1)
 │   │   └── state_client.py              # RedisStateClient — thin generic Redis primitives (get/set/hash/scan/multi_exec); no business logic
 │   ├── persistent/
 │   │   ├── entity_event_repository.py   # EntityEventRepository: persist_entities(), fetch_entity_event() — entity_events reads/writes
@@ -1251,39 +1252,59 @@ Per system-design.md §1.4 / §11.1, SAPI opens **two independent Redis connecti
 
 ### 6.1 `app/redis/stream_client.py`
 
-#### Stream Name Constants
+#### Stream Constants — `app/redis/stream_enum.py`
+
+Each stream's constants live together in their own class: its `NAME`, the `VERSION` of its message format (carried in every message's `v` field, so each format can change on its own), and, for a stream SAPI consumes, the `CONSUMER_GROUP` that reads it.
 
 ```python
-# app/redis/stream_client.py
+# app/redis/stream_enum.py
+from typing import Final
 
-STREAM_RAW_NEWS_CLEANED         = "stream:raw_news_cleaned"          # produced by SADI; consumed by Entity Analysis Layer
-STREAM_ENTITY_EVENT_COMPLETED   = "stream:entity_event_completed"    # produced by Entity Analysis Layer; consumed by Aggregation Layer
-STREAM_EVENT_AGGREGATED         = "stream:event_aggregated"          # produced by Aggregation Layer; consumed by Scoring Layer
-STREAM_EVENT_SCORED             = "stream:event_scored"              # produced by Scoring Layer; consumed by Cache Layer
+class RawNewsCleanedStream:
+    NAME: Final = "stream:raw_news_cleaned"
+    VERSION: Final = "1"
+    CONSUMER_GROUP: Final = "sapi-entity-analysis"
 
-STREAM_ENTITY_ANALYSIS_DEAD_LETTER          = "stream:entity_analysis_dead_letter"
-STREAM_AGGREGATION_DEAD_LETTER  = "stream:aggregation_dead_letter"
-STREAM_SCORING_DEAD_LETTER      = "stream:scoring_dead_letter"
-STREAM_CACHE_DEAD_LETTER        = "stream:cache_dead_letter"
+class EntityEventCompletedStream:
+    NAME: Final = "stream:entity_event_completed"
+    VERSION: Final = "1"
+    CONSUMER_GROUP: Final = "sapi-aggregation"
 
-# Each stream's message-format version, carried in every message's "v" field: one constant per
-# stream, next to its name constant (e.g. STREAM_RAW_NEWS_CLEANED_VERSION = "1",
-# STREAM_ENTITY_ANALYSIS_DEAD_LETTER_VERSION = "1"), so each format can change on its own.
+class EventAggregatedStream:
+    NAME: Final = "stream:event_aggregated"
+    VERSION: Final = "1"
+    CONSUMER_GROUP: Final = "sapi-scoring"
 
-CONSUMER_GROUP_ENTITY_ANALYSIS          = "sapi-entity-analysis"
-CONSUMER_GROUP_AGGREGATION  = "sapi-aggregation"
-CONSUMER_GROUP_SCORING      = "sapi-scoring"
-CONSUMER_GROUP_CACHE        = "sapi-cache"
+class EventScoredStream:
+    NAME: Final = "stream:event_scored"
+    VERSION: Final = "1"
+    CONSUMER_GROUP: Final = "sapi-cache"
+
+class EntityAnalysisDeadLetterStream:
+    NAME: Final = "stream:entity_analysis_dead_letter"
+    VERSION: Final = "1"
+
+class AggregationDeadLetterStream:
+    NAME: Final = "stream:aggregation_dead_letter"
+    VERSION: Final = "1"
+
+class ScoringDeadLetterStream:
+    NAME: Final = "stream:scoring_dead_letter"
+    VERSION: Final = "1"
+
+class CacheDeadLetterStream:
+    NAME: Final = "stream:cache_dead_letter"
+    VERSION: Final = "1"
 ```
 
-| Constant | Producer | Consumer Group |
+| Class | Producer | Consumer Group |
 |---|---|---|
-| `STREAM_RAW_NEWS_CLEANED` | SADI | `sapi-entity-analysis` |
-| `STREAM_ENTITY_EVENT_COMPLETED` | Entity Analysis Layer | `sapi-aggregation` |
-| `STREAM_EVENT_AGGREGATED` | Aggregation Layer | `sapi-scoring` |
-| `STREAM_EVENT_SCORED` | Scoring Layer | `sapi-cache` |
+| `RawNewsCleanedStream` | SADI | `sapi-entity-analysis` |
+| `EntityEventCompletedStream` | Entity Analysis Layer | `sapi-aggregation` |
+| `EventAggregatedStream` | Aggregation Layer | `sapi-scoring` |
+| `EventScoredStream` | Scoring Layer | `sapi-cache` |
 
-> **Message shape check — `v` and the id field (system-design.md §2.3).** Every published message carries `v` (its stream's `STREAM_<NAME>_VERSION`, currently `"1"` for every stream) and the layer's id field (`cleaned_id`, `entity_event_id` or `event_id`, each a UUID). Each layer's consumer checks both immediately after `read_from()`/`autoclaim()` returns and before any processing: a message whose `v` is missing or unrecognised, or whose id field is missing or not a valid UUID, is routed straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) and ACKed without a processing attempt — it can never succeed, so retrying it would only spend delivery attempts. It uses the same dead-letter payload as the Reclaim and Dead Letter pattern below; on the `read_from()` path, `delivery_count` is `"1"` — a first delivery.
+> **Message shape check — `v` and the id field (system-design.md §2.3).** Every published message carries `v` (its stream class's `VERSION`, currently `"1"` for every stream) and the layer's id field (`cleaned_id`, `entity_event_id` or `event_id`, each a UUID). Each layer's consumer checks both immediately after `read_from()`/`autoclaim()` returns and before any processing: a message whose `v` is missing or unrecognised, or whose id field is missing or not a valid UUID, is routed straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) and ACKed without a processing attempt — it can never succeed, so retrying it would only spend delivery attempts. It uses the same dead-letter payload as the Reclaim and Dead Letter pattern below; on the `read_from()` path, `delivery_count` is `"1"` — a first delivery.
 
 **Module-level singleton, same pattern as `DatabaseClient`** (§5.1). `create_stream_client()` constructs and registers it; every consumer calls `get_redis_stream_client()` directly rather than taking `redis_stream` as a constructor parameter.
 
@@ -1332,7 +1353,7 @@ Implementation is identical to SADI's `create_stream_client()` (`decode_response
 ```
 Purpose : Write a message to a Redis Stream (XADD). All fields must be strings
           — convert UUIDs, floats, etc. before calling. Callers always include
-          "v": STREAM_<NAME>_VERSION alongside the business fields. While the stream Redis is
+          "v": <Stream>.VERSION alongside the business fields. While the stream Redis is
           unreachable (redis.ConnectionError / redis.TimeoutError), logs WARNING
           redis_stream_publish_retrying, sleeps reconnect_interval_s and retries
           the same XADD — indefinitely, until it is written (cancellable).
@@ -1425,10 +1446,10 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`
 - **Retry-exhaustion check, per reclaimed message, before anything else:**
   ```python
   if reclaimed.delivery_count >= config.max_retry:   # ENTITY_ANALYSIS_MAX_RETRY / AGG_MAX_RETRY / SCORING_MAX_RETRY / CACHE_MAX_RETRY
-      await redis_stream.publish(STREAM_<LAYER>_DEAD_LETTER, {
+      await redis_stream.publish(<Layer>DeadLetterStream.NAME, {
           "message_id": reclaimed.id, "fields": json.dumps(reclaimed.fields),
           "delivery_count": str(reclaimed.delivery_count), "failed_at": datetime.now(timezone.utc).isoformat(),
-          "v": STREAM_<LAYER>_DEAD_LETTER_VERSION,
+          "v": <Layer>DeadLetterStream.VERSION,
       })
       await redis_stream.ack(stream, group, reclaimed.id)
       logger.warning("<layer>_message_dead_lettered", message_id=reclaimed.id,
@@ -3327,7 +3348,7 @@ class CleanedNewsConsumer:
         """Entry point — called once from main.py's lifespan (§16). Creates
         the consumer group, then runs _consumer_loop() and _reclaim_loop()
         in one asyncio.TaskGroup (§6.1's Layer Supervision)."""
-        await self._redis_stream.create_group_if_not_exists(STREAM_RAW_NEWS_CLEANED, CONSUMER_GROUP_ENTITY_ANALYSIS)
+        await self._redis_stream.create_group_if_not_exists(RawNewsCleanedStream.NAME, RawNewsCleanedStream.CONSUMER_GROUP)
         async with asyncio.TaskGroup() as group:
             group.create_task(self._consumer_loop())
             group.create_task(self._reclaim_loop())
@@ -3396,11 +3417,11 @@ Purpose : The single entry point for dispatching one message, from either _consu
 
 ```
 Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
-          try: autoclaim(stream=STREAM_RAW_NEWS_CLEANED,
-          group=CONSUMER_GROUP_ENTITY_ANALYSIS, consumer=config.consumer_name,
+          try: autoclaim(stream=RawNewsCleanedStream.NAME,
+          group=RawNewsCleanedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=ENTITY_ANALYSIS_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= ENTITY_ANALYSIS_MAX_RETRY,
-          publish to STREAM_ENTITY_ANALYSIS_DEAD_LETTER, ACK and log WARNING
+          publish to EntityAnalysisDeadLetterStream.NAME, ACK and log WARNING
           entity_analysis_message_dead_lettered (never reaches _process_one()).
           Otherwise, run the shape check (§6.1), then extract cleaned_id from fields and
           dispatch via worker_pool.dispatch(lambda: self._process_one(cleaned_id, message_id))
@@ -3658,7 +3679,7 @@ class AggregationConsumer:
         """Entry point, called from main.py's lifespan (§16); rationale as
         CleanedNewsConsumer.start() (§11.2). Runs both loops in one asyncio.TaskGroup (§6.1);
         on exit, the final flush (system-design.md §4.5) runs in `finally`."""
-        await self._redis_stream.create_group_if_not_exists(STREAM_ENTITY_EVENT_COMPLETED, CONSUMER_GROUP_AGGREGATION)
+        await self._redis_stream.create_group_if_not_exists(EntityEventCompletedStream.NAME, EntityEventCompletedStream.CONSUMER_GROUP)
         try:
             async with asyncio.TaskGroup() as group:
                 group.create_task(self._consumer_loop())
@@ -3706,7 +3727,7 @@ flowchart TD
 ```python
 async def _on_processed(self, entity_event_id: UUID, message_id: str) -> None:
     self._enqueued.discard(entity_event_id)
-    await self._redis_stream.ack(STREAM_ENTITY_EVENT_COMPLETED, CONSUMER_GROUP_AGGREGATION, message_id)
+    await self._redis_stream.ack(EntityEventCompletedStream.NAME, EntityEventCompletedStream.CONSUMER_GROUP, message_id)
 ```
 
 An explicit-argument method, testable in isolation. `process_entity_event()` never sees it directly: `_route_one()` (below) wraps it in a per-call zero-arg lambda closing over `entity_event_id`/`message_id` (§12.1).
@@ -3745,11 +3766,11 @@ Why the _enqueued guard exists : merge_or_create() (§12.4) appends entity_event
 
 ```
 Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
-          try: autoclaim(stream=STREAM_ENTITY_EVENT_COMPLETED,
-          group=CONSUMER_GROUP_AGGREGATION, consumer=config.consumer_name,
+          try: autoclaim(stream=EntityEventCompletedStream.NAME,
+          group=EntityEventCompletedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=AGG_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= AGG_MAX_RETRY,
-          publish to STREAM_AGGREGATION_DEAD_LETTER and ACK (never reaches
+          publish to AggregationDeadLetterStream.NAME and ACK (never reaches
           _route_one()). Otherwise, extract entity_event_id from fields and
           call _route_one(entity_event_id, message_id) — identical call as
           _consumer_loop() uses.
@@ -4220,7 +4241,7 @@ class ScoringConsumer:
     async def start(self) -> None:
         """Entry point, called from main.py's lifespan (§16); rationale as
         CleanedNewsConsumer.start() (§11.2). Runs both loops in one asyncio.TaskGroup (§6.1)."""
-        await self._redis_stream.create_group_if_not_exists(STREAM_EVENT_AGGREGATED, CONSUMER_GROUP_SCORING)
+        await self._redis_stream.create_group_if_not_exists(EventAggregatedStream.NAME, EventAggregatedStream.CONSUMER_GROUP)
         async with asyncio.TaskGroup() as group:
             group.create_task(self._consumer_loop())
             group.create_task(self._reclaim_loop())
@@ -4270,11 +4291,11 @@ flowchart TD
 
 ```
 Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
-          try: autoclaim(stream=STREAM_EVENT_AGGREGATED,
-          group=CONSUMER_GROUP_SCORING, consumer=config.consumer_name,
+          try: autoclaim(stream=EventAggregatedStream.NAME,
+          group=EventAggregatedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=SCORING_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= SCORING_MAX_RETRY,
-          publish to STREAM_SCORING_DEAD_LETTER and ACK (never reaches
+          publish to ScoringDeadLetterStream.NAME and ACK (never reaches
           _process_one()). Otherwise, extract event_id from fields and call
           _process_one(event_id, message_id) — identical call as
           _consumer_loop() uses.
@@ -4714,7 +4735,7 @@ class CacheConsumer:
         CleanedNewsConsumer.start() (§11.2). The asyncio.TaskGroup (§6.1) keeps a restart from
         leaking a second _consumer_loop(), which would double every build — the build lock
         (§14.9) keeps them from overlapping, not from both running."""
-        await self._redis_stream.create_group_if_not_exists(STREAM_EVENT_SCORED, CONSUMER_GROUP_CACHE)
+        await self._redis_stream.create_group_if_not_exists(EventScoredStream.NAME, EventScoredStream.CONSUMER_GROUP)
         async with asyncio.TaskGroup() as group:
             group.create_task(self._consumer_loop())
             group.create_task(self._service.orphan_cleanup_loop())
@@ -4740,7 +4761,7 @@ flowchart TD
     RC -->|Yes| AC[autoclaim consumer=config.consumer_name\nmin_idle_ms=STREAM_CLAIM_TIMEOUT_MS\ncount=_RECLAIM_COUNT]
     RC -->|No| RG
     AC --> DL{Any reclaimed message with\ndelivery_count >= CACHE_MAX_RETRY?}
-    DL -->|Yes| DLW[publish to STREAM_CACHE_DEAD_LETTER\nACK those; drop from this batch]
+    DL -->|Yes| DLW[publish to CacheDeadLetterStream.NAME\nACK those; drop from this batch]
     DL -->|No| RG[read_from COUNT=None - everything pending\nBLOCK=CACHE_BATCH_TIMEOUT_MS\nconsumer=config.consumer_name\nthen coalesce: keep reading until\nCACHE_BATCH_TIMEOUT_MS since the first message]
     DLW --> RG
     RG -->|Empty and no reclaimed messages| A
