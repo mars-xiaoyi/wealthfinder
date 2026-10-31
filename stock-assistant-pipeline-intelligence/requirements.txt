@@ -22,5 +22,5 @@ structlog==26.1.0
 
 # Web framework
 fastapi==0.115.12
-pydantic==2.11.1
+pydantic==2.14.1
 uvicorn==0.34.2
