@@ -1266,6 +1266,10 @@ STREAM_AGGREGATION_DEAD_LETTER  = "stream:aggregation_dead_letter"
 STREAM_SCORING_DEAD_LETTER      = "stream:scoring_dead_letter"
 STREAM_CACHE_DEAD_LETTER        = "stream:cache_dead_letter"
 
+# Each stream's message-format version, carried in every message's "v" field: one constant per
+# stream, next to its name constant (e.g. STREAM_RAW_NEWS_CLEANED_VERSION = "1",
+# STREAM_ENTITY_ANALYSIS_DEAD_LETTER_VERSION = "1"), so each format can change on its own.
+
 CONSUMER_GROUP_ENTITY_ANALYSIS          = "sapi-entity-analysis"
 CONSUMER_GROUP_AGGREGATION  = "sapi-aggregation"
 CONSUMER_GROUP_SCORING      = "sapi-scoring"
@@ -1279,7 +1283,7 @@ CONSUMER_GROUP_CACHE        = "sapi-cache"
 | `STREAM_EVENT_AGGREGATED` | Aggregation Layer | `sapi-scoring` |
 | `STREAM_EVENT_SCORED` | Scoring Layer | `sapi-cache` |
 
-> **Message shape check — `v` and the id field (system-design.md §2.3).** Every published message carries `v` (current value: `"1"`) and the layer's id field (`cleaned_id`, `entity_event_id` or `event_id`, each a UUID). Each layer's consumer checks both immediately after `read_from()`/`autoclaim()` returns and before any processing: a message whose `v` is missing or unrecognised, or whose id field is missing or not a valid UUID, is routed straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) and ACKed without a processing attempt — it can never succeed, so retrying it would only spend delivery attempts. It uses the same dead-letter payload as the Reclaim and Dead Letter pattern below; on the `read_from()` path, `delivery_count` is `"1"` — a first delivery.
+> **Message shape check — `v` and the id field (system-design.md §2.3).** Every published message carries `v` (its stream's `STREAM_<NAME>_VERSION`, currently `"1"` for every stream) and the layer's id field (`cleaned_id`, `entity_event_id` or `event_id`, each a UUID). Each layer's consumer checks both immediately after `read_from()`/`autoclaim()` returns and before any processing: a message whose `v` is missing or unrecognised, or whose id field is missing or not a valid UUID, is routed straight to that layer's Dead Letter Stream (§11–§14's per-layer error handling) and ACKed without a processing attempt — it can never succeed, so retrying it would only spend delivery attempts. It uses the same dead-letter payload as the Reclaim and Dead Letter pattern below; on the `read_from()` path, `delivery_count` is `"1"` — a first delivery.
 
 **Module-level singleton, same pattern as `DatabaseClient`** (§5.1). `create_stream_client()` constructs and registers it; every consumer calls `get_redis_stream_client()` directly rather than taking `redis_stream` as a constructor parameter.
 
@@ -1328,7 +1332,7 @@ Implementation is identical to SADI's `create_stream_client()` (`decode_response
 ```
 Purpose : Write a message to a Redis Stream (XADD). All fields must be strings
           — convert UUIDs, floats, etc. before calling. Callers always include
-          "v": "1" alongside the business fields. While the stream Redis is
+          "v": STREAM_<NAME>_VERSION alongside the business fields. While the stream Redis is
           unreachable (redis.ConnectionError / redis.TimeoutError), logs WARNING
           redis_stream_publish_retrying, sleeps reconnect_interval_s and retries
           the same XADD — indefinitely, until it is written (cancellable).
@@ -1424,7 +1428,7 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`
       await redis_stream.publish(STREAM_<LAYER>_DEAD_LETTER, {
           "message_id": reclaimed.id, "fields": json.dumps(reclaimed.fields),
           "delivery_count": str(reclaimed.delivery_count), "failed_at": datetime.now(timezone.utc).isoformat(),
-          "v": "1",
+          "v": STREAM_<LAYER>_DEAD_LETTER_VERSION,
       })
       await redis_stream.ack(stream, group, reclaimed.id)
       logger.warning("<layer>_message_dead_lettered", message_id=reclaimed.id,
