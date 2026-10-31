@@ -326,7 +326,7 @@ This document does not introduce new design — every ticket below implements so
 - **Q-11:** `LLM_API_TIMEOUT_S`/`HTTP_TIMEOUT_S`, from p95/p99 call latency.
 - **Q-16 at scale:** `lookup_stock` hit/miss rates, plus a hand-checked sample of unverified entities.
 - **I-1 real-traffic part:** `lookup_stock_completed` p50/p95/p99 and fuzzy-path frequency.
-- **I-3:** EntityAnalysisSkill's `max_tokens`, against `output_tokens` p95/p99 and any truncation.
+- **Max tokens:** EntityAnalysisSkill's `max_tokens` (§8's table), against `output_tokens` p95/p99 and any truncation.
 - **I-4:** `STREAM_CLAIM_TIMEOUT_MS` and `ENTITY_ANALYSIS_MAX_RETRY`, from per-batch `latency_ms` p99/max (`entity_analysis_batch_completed`) and the `entity_analysis_message_dead_lettered` rate by `reason`.
 **Acceptance criteria:**
 - Each item has measured numbers and a decision: keep the default, or change it with the reason.
@@ -495,7 +495,7 @@ This document does not introduce new design — every ticket below implements so
 - The few-shot examples are written into impl.md §8.3/§8.4, ready to copy verbatim, and approved.
 - Any design-changing answer is written back into impl.md (§8.3/§8.4, §8's table) as a fix and approved before the Skill tickets start.
 **Docs:** impl.md §7.1, §8, §8.3, §8.4, §18 (I-3); design.md §9.5, §9.6, §14 (Q-8).
-**Explicitly deferred:** calibrating Q-8 and I-3 at volume (Scoring: Post-Release Tuning Validation).
+**Explicitly deferred:** both Skills' max tokens at real volume (Scoring: Post-Release Tuning Validation).
 **PM note:** time-box length to be set.
 
 ---
