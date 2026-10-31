@@ -731,8 +731,8 @@ Three Skills encapsulate all LLM interactions. Each Skill is a versioned, reusab
 | Skill | Adapter Method | Temperature | Max Tokens | Depends On |
 |---|---|---|---|---|
 | EntityAnalysisSkill | `generate_structured` | 0 | 16384 | — |
-| BriefSummarySkill | `generate_structured` | 0.1 | 4096 | EntityAnalysisSkill output |
-| EventScoringSkill | `generate_structured` | 0 | 2048 | BriefSummarySkill output |
+| BriefSummarySkill | `generate_structured` | 0 | 1024 | EntityAnalysisSkill output |
+| EventScoringSkill | `generate_structured` | 0 | 512 | BriefSummarySkill output |
 
 ### 9.1.1 Skill Version Management
 
@@ -860,17 +860,17 @@ stock_code, company_name, event_type_primary, event_type_secondary
 Selection rules (applied in order):
 1. Per-source cap: retain at most 3 articles per source_name;
    when exceeded, keep the 3 with latest published_at, discard the rest
-2. Total character cap: sort retained articles by source authority (P1→P2→P3),
-   same source by latest published_at first;
-   accumulate entity_summary strings; discard entire entry when adding it
-   would exceed 200 characters total
+2. Order: sort retained articles by source authority (P1→P2→P3),
+   same source by latest published_at first
 Format:
 - [SOURCE_NAME] entity_summary text
 - [SOURCE_NAME] entity_summary text
 ...
 ```
 
-Input selection metadata is recorded in the `brief_summary_completed` log event for quality monitoring purposes. Output: `summary_short` (≤30 chars), `summary_full` (≤150 chars), and up to 3 `key_numbers` — all Traditional Chinese regardless of source article language, and never inferring numbers the input doesn't contain. Full prompt text, few-shot examples, output schema, and business constraint validation table: implementation.md §8.3.
+Input selection metadata is recorded in the `brief_summary_completed` log event for quality monitoring purposes. Output: `summary_short` (≤30 chars), `summary_full` (≤150 chars), and up to 3 `key_numbers` — all Traditional Chinese regardless of source article language. Numbers are copied as the input states them, and `summary_full` carries only the impact or outlook the sources themselves state, never the model's own reading: EventScoringSkill scores from `summary_full` (§9.6), so a model-added assessment would steer the score with an opinion no source holds. Full prompt text, few-shot examples, output schema, and business constraint validation table: implementation.md §8.3.
+
+**Measured** on aggregated Events built from real SADI articles: graded by `gemini-3.1-pro-preview` against every constituent summary, about 6% of 223 summaries carry a claim no source supports. The per-source cap alone bounds the input (≤3 entries per source, each ≤100 characters, a few hundred input tokens), so every retained summary reaches the model. Temperature 0 keeps `summary_full` stable from run to run, which matters because the score is derived from it.
 
 Source authority weights for the ordering above and for the fallback come from the Scoring Layer's source configuration (§1.5), read before the Skill starts and passed in (§5.3).
 
@@ -895,7 +895,7 @@ key_numbers: <brief_summary.output.key_numbers>
 
 **Rationale for using BriefSummarySkill output:** `summary_full` and `key_numbers` are structured, distilled representations of the Event content already produced by BriefSummarySkill. Using these as input avoids requiring EventScoringSkill to re-interpret raw article content, reduces token consumption, and provides consistent, noise-reduced scoring inputs. `sentiment_label` and `sentiment_score` from EntityAnalysisSkill are intentionally excluded to prevent anchoring bias on the directional impact evaluation.
 
-Output: `stock_impact_score` on a `[-5, +5]` scale (a 7-point reference table anchors the scale, from "existential threat" at -5 to "major positive" at +5), prioritizing forward-looking signals and explicit financial data over qualitative description, plus a ≤80-character `adjustment_reason` explaining the dominant signal. Full prompt text, few-shot examples, output schema, and business constraint validation table: implementation.md §8.4.
+Output: `stock_impact_score` on a `[-5, +5]` scale (a 7-point reference table anchors the scale, from "existential threat" at -5 to "major positive" at +5), prioritizing forward-looking signals and explicit financial data over qualitative description, and scoring only what the event itself adds (a company's existing state, such as a long suspension, is not new information), plus a ≤80-character `adjustment_reason` explaining the dominant signal. Full prompt text, few-shot examples, output schema, and business constraint validation table: implementation.md §8.4.
 
 **Fallback (LLMSchemaViolationError or empty adjustment_reason):** Apply §5.9 EventScoringSkill fallback policy.
 
@@ -1176,7 +1176,7 @@ SAPI is designed and deployed as **exactly one replica** for now — multiple re
 | Q-5 | ~~DB Write Failure unified retry implementation details~~ | Implementation specification | **Resolved** — stale; same issue as Q-4. §12.1 already fully specifies this (failure classification, retry parameters, exponential backoff formula) — nothing deferred to a separate document |
 | Q-6 | Post-MVP: entity_event_processing_status table for state machine tracking and quality monitoring | Observability | Post-MVP |
 | Q-7 | ~~Validate `MAX_FC_ROUNDS=3` and `MAX_FC_RETRIES_PER_ENTITY=2` against real HK news data~~ | EntityAnalysisSkill accuracy | **Resolved** — EntityAnalysisSkill makes one structured-output call and verifies entities in code (§9.2, §9.4), so neither limit exists. |
-| Q-8 | Validate BriefSummarySkill input character cap (200 chars total entity_summary) against real aggregated Events; adjust if key_numbers extraction quality is insufficient | BriefSummarySkill output quality | Week 2 |
+| Q-8 | ~~Validate BriefSummarySkill input character cap (200 chars total entity_summary) against real aggregated Events~~ | BriefSummarySkill output quality | **Resolved** — over 574 aggregated Events from real SADI articles, the 200-character cap dropped summaries holding price-relevant figures in about 1% of Events and saved no measurable cost; the per-source cap alone bounds the input (§9.5) |
 | Q-9 | Validate `RATE_LIMIT_BACKOFF_S=60` against actual Vertex AI rate limit reset window; adjust if provider reset is faster or slower | LLM throughput | Week 1 |
 | Q-10 | Post-MVP: Design quality monitoring Service — log ingestion pipeline, LLM-as-Judge evaluation for EntityAnalysisSkill and BriefSummarySkill, post-event price correlation analysis for EventScoringSkill (Option C) | LLM quality improvement | Post-MVP |
 | Q-11 | Validate the common `HTTP_TIMEOUT_S=120` (SADI, Admin, HKEXnews calls) against real latency measurements in Week 1 (`LLM_API_TIMEOUT_S` is measured: implementation.md §4.1) | Latency tuning | Week 1 |

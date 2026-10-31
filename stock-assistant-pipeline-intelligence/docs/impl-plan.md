@@ -553,9 +553,9 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** Spike: Scoring LLM Skills (for the few-shot examples and any §8.3 fixes); Entity Analysis: LLM Entity Extraction (for `SkillBase`, the LLM Adapter with `GenerationConfig`); Aggregation: Sliding-Window Merge Algorithm (for `Event`)
 **Scope:** Generate an Event's Traditional Chinese summary from its constituent EntityEvents, with an extractive fallback on a schema violation (impl.md §8.3; design rationale: design.md §9.5, §5.9).
 - `app/models/event.py`: `BriefSummary` (§3.3) — not yet `Event.brief_summary` (added by its writer, Scoring: Score & Persist Events).
-- `app/skills/brief_summary_skill.py`: `BriefSummaryInput` (including `source_weights`), `BriefSummaryResult`, `BriefSummarySkillLog`, `InputSummary`, `BRIEF_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0.1, 4096), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
+- `app/skills/brief_summary_skill.py`: `BriefSummaryInput` (including `source_weights`), `BriefSummaryResult`, `BriefSummarySkillLog`, `InputSummary`, `BRIEF_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0, 1024), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
 **Acceptance criteria** (per impl.md §8.3):
-- Input construction: at most 3 articles per source (latest kept); ordered by `source_weights` descending, then latest `published_at`; entries that would exceed 200 characters dropped whole; `input_summary` records counts and both truncation flags.
+- Input construction: at most 3 articles per source (latest kept); ordered by `source_weights` descending, then latest `published_at`; the user message follows §8.3's template; `input_summary` records counts and the source-cap flag.
 - Business constraints: `summary_short` ≤30, `summary_full` ≤150, `key_numbers` ≤3 — truncated and logged, not failed.
 - `LLMSchemaViolationError` → fallback (highest-weight constituent's `headline`, ties by latest `published_at`; `summary_full = summary_short`; `key_numbers = []`), `skill_log.fallback=True`, `brief_summary_fallback` logged, `failure_reason=None`.
 - Rate-limit/provider/auth failures → `failure_reason` is the caught error, `output=None`.
@@ -573,7 +573,7 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** Scoring: Brief Summary Skill (for `BriefSummary`); Spike: Scoring LLM Skills (for the few-shot examples)
 **Scope:** Score an Event's directional stock impact from BriefSummarySkill's output, with a neutral fallback (impl.md §8.4; design rationale: design.md §9.6, §5.9).
 - `app/models/event_score.py`: `LLMScore` (§13.1).
-- `app/skills/event_scoring_skill.py`: `EventLLMScoringInput`, `EventLLMScoringResult`, `EventLLMScoringSkillLog`, `SCORING_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0, 2048), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
+- `app/skills/event_scoring_skill.py`: `EventLLMScoringInput`, `EventLLMScoringResult`, `EventLLMScoringSkillLog`, `SCORING_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0, 512), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
 **Acceptance criteria** (per impl.md §8.4):
 - `stock_impact_score` clipped to `[-5, +5]` and `adjustment_reason` truncated to 80, both logged.
 - An empty `adjustment_reason`, or `LLMSchemaViolationError`, → fallback (`stock_impact_score=0`, `adjustment_reason=""`), `skill_log.fallback=True` with the right `fallback_reason`, `event_scoring_fallback` logged, `failure_reason=None`.
@@ -681,10 +681,9 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** every Scoring ticket above; Deployment: SAPI Container, Compose & Production-like Run (below — the real-traffic run), run for an agreed length.
 **Scope:** Answer the Scoring tuning questions that need real volume, from the logs the earlier tickets produce (`brief_summary_completed`, `event_scoring_completed`, `llm_calls[]`) and `event_scores` — no new instrumentation.
 - **Q-2:** `SCORING_MAX_CONCURRENT`, from 429 frequency and throughput.
-- **Q-8:** BriefSummarySkill's 200-character input cap, from `input_summary` truncation rates and summary quality on a hand-checked sample.
 - **Q-15:** `source_heat_score`'s `source_count / TOTAL_ACTIVE_SOURCES` formula, from real cross-source corroboration rates.
 - **Q-1, Q-9, Q-11 (Scoring's shares):** `SCORING_BATCH_SIZE`/`SCORING_BATCH_TIMEOUT_MS`, `RATE_LIMIT_BACKOFF_S`, and `LLM_API_TIMEOUT_S` for the two Scoring Skills.
-- **I-3 (Scoring's share):** both Skills' max tokens against `output_tokens` p95/p99 and any truncation.
+- **Max tokens:** both Skills' `output_tokens` p95/p99 against 1024/512 (§8's table) and any truncation at real volume.
 - **Fallback rates:** `brief_summary_fallback`/`event_scoring_fallback` frequency — a high rate points at a prompt or schema problem.
 **Acceptance criteria:**
 - Each item has measured numbers and a decision: keep the default, or change it with the reason.

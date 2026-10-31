@@ -1697,12 +1697,12 @@ Three Skills (rationale: system-design.md §9.1), each owning its prompt, output
 | Skill | Module | Model | Temperature | Max Tokens |
 |---|---|---|---|---|
 | EntityAnalysisSkill | `app/skills/entity_analysis_skill.py` | `gemini-3.1-flash-lite` | 0 | 16384 |
-| BriefSummarySkill | `app/skills/brief_summary_skill.py` | `gemini-3.1-flash-lite` | 0.1 | 4096 |
-| EventLLMScoringSkill | `app/skills/event_scoring_skill.py` | `gemini-3.1-flash-lite` | 0 | 2048 |
+| BriefSummarySkill | `app/skills/brief_summary_skill.py` | `gemini-3.1-flash-lite` | 0 | 1024 |
+| EventLLMScoringSkill | `app/skills/event_scoring_skill.py` | `gemini-3.1-flash-lite` | 0 | 512 |
 
 Every Skill makes `generate_structured` calls only. Each module holds its row as a constant, `_GENERATION_CONFIG = GenerationConfig(model=..., temperature=..., max_output_tokens=...)` (§7.1), and passes it on every Adapter call it makes; a model change is a Skill version bump (system-design.md §9.1.1).
 
-EntityAnalysisSkill's row is measured on real SADI articles: its largest output was 13,917 tokens (a 121-company weekly calendar), every other article stayed under 4,400, and `gemini-3.1-flash-lite` does not think by default. The other two rows are starting values (I-3, §18).
+All three rows are measured on real SADI articles, and `gemini-3.1-flash-lite` does not think by default. EntityAnalysisSkill's largest output was 13,917 tokens (a 121-company weekly calendar); every other article stayed under 4,400. Over 574 aggregated Events, BriefSummarySkill's largest output was 240 tokens (p95 177) and EventLLMScoringSkill's 89 (p95 78); every call finished within 14 s, inside `LLM_API_TIMEOUT_S`.
 
 Each module defines a version constant (`ENTITY_SKILL_VERSION`, `BRIEF_SKILL_VERSION`, `SCORING_SKILL_VERSION`, all `"v1.0.0"`) per system-design.md §9.1.1 and sets it as `skill_log.skill_version` (§8.6). Callers read the version from `result.skill_log.skill_version` (§11.1, §13.4) and never re-import the constant.
 
@@ -2094,7 +2094,7 @@ Error handling (which exceptions get caught where, and what `EntityAnalysisServi
 
 ### 8.3 `app/skills/brief_summary_skill.py` — BriefSummarySkill
 
-Generates the Traditional-Chinese Morning Brief summary for one `Event`: from the event's constituent `EntityEvent` records, it selects and caps a subset of their `entity_summary` text (per-source and total-character caps, "Input construction" below) and makes a single LLM call producing `summary_short` (≤30 chars), `summary_full` (≤150 chars), and up to 3 `key_numbers`. Always returns a fully-populated result — schema violations fall back to an extractive, non-LLM summary rather than failing outright. `ScoringService` (§13) is its only caller.
+Generates the Traditional-Chinese Morning Brief summary for one `Event`: from the event's constituent `EntityEvent` records, it selects a subset of their `entity_summary` text (at most 3 per source, "Input construction" below) and makes a single LLM call producing `summary_short` (≤30 chars), `summary_full` (≤150 chars), and up to 3 `key_numbers`. Always returns a fully-populated result — schema violations fall back to an extractive, non-LLM summary rather than failing outright. `ScoringService` (§13) is its only caller.
 
 #### Input Schema
 
@@ -2123,18 +2123,81 @@ Design rationale for the input-selection rules below ("Input construction") and 
 *Part 2 — Output Specification:*
 ```
 【summary_short】≤30繁體中文字；包含核心事件+最重要數據（如有）；不得為純描述性語句
-【summary_full】≤150繁體中文字；涵蓋事件背景、核心數據、潛在影響；整合多來源主要觀點
+【summary_full】≤150繁體中文字；涵蓋事件背景、核心數據，以及來源所述的影響或展望；整合多來源主要觀點；不得加入來源未有的推論或評價（如「反映…」「顯示…」）
 【key_numbers】最多3個；格式：數字+單位+方向（如適用）；例："廣告收入+32% YoY"
               只提取與 event_type_primary 直接相關的數據；無明確數字時輸出 []
 ```
 
-*Part 3 — Few-shot Examples:* 3 examples covering financial data events, regulatory events without numbers, and conflicting signals (not reproduced here — same style as §8.2's four EntityAnalysisSkill examples).
+*Part 3 — Few-shot Examples:* the three examples below, assembled into `_SYSTEM_PROMPT` with Parts 1, 2 and 4 as in §8.2.
 
 *Part 4 — Edge Case Rules:*
 ```
 1. 輸入內容無明確數字 → key_numbers 輸出 []，不得估算或捏造
 2. 多來源報導角度存在明顯差異 → 在 summary_full 中整合主要觀點，不偏向單一來源
-3. 來源文章為英文 → 所有輸出仍使用繁體中文，數字和專有名詞保持原格式
+3. 實體摘要含英文內容（如英文公司名、產品名）→ 所有輸出仍使用繁體中文，數字和專有名詞保持原格式
+4. 數字照錄輸入原文：不得自行加總、平均或換算；不同幣種的金額不得相加
+5. 同一指標有多個不同數值（如盤中及全日股價變動）→ 採用標明「全日」或最新的數值，不得混用
+```
+
+The user message is built by `build_prompt()` ("Input construction", below).
+
+**Few-shot Example 1 — Financial data, several sources:**
+```
+INPUT:
+【實體信息】
+股票代碼：00027
+公司名稱：銀河娛樂
+主要事件類型：EARNINGS
+次要事件類型：DIVIDEND
+
+【各文章實體摘要】
+- [HKEX] 銀河娛樂公佈中期業績，淨收益按年增長9%至221億港元，經調整EBITDA升18%至68.4億港元，宣派中期股息每股0.5港元。
+- [AASTOCKS] 銀娛中期經調整EBITDA增長18%，勝市場預期，管理層指中場業務需求強勁。
+- [MINGPAO] 銀娛宣佈20億港元股份回購計劃，並維持全年資本開支預算。
+
+OUTPUT:
+summary_short: "銀娛中期EBITDA增18%勝預期"
+summary_full: "銀河娛樂中期淨收益按年增長9%至221億港元，經調整EBITDA升18%至68.4億港元，勝市場預期，宣派中期股息每股0.5港元，另宣佈20億港元股份回購。管理層指中場業務需求強勁。"
+key_numbers: ["經調整EBITDA 68.4億港元 +18% YoY", "淨收益221億港元 +9% YoY", "中期股息每股0.5港元"]
+```
+
+**Few-shot Example 2 — Regulatory, no numbers:**
+```
+INPUT:
+【實體信息】
+股票代碼：02333
+公司名稱：長城汽車
+主要事件類型：REGULATORY
+次要事件類型：無
+
+【各文章實體摘要】
+- [HKEX] 長城汽車公告接獲國家市場監管總局通知，就其部分車型的排放數據申報展開調查，公司表示將全面配合。
+- [YAHOO_HK] 監管機構調查長城汽車排放數據申報，公司未披露涉及車型數目及調查時間表。
+
+OUTPUT:
+summary_short: "長城汽車排放數據申報遭監管調查"
+summary_full: "長城汽車接獲國家市場監管總局通知，就部分車型的排放數據申報展開調查，公司表示將全面配合。涉及車型數目及調查時間表均未披露。"
+key_numbers: []
+```
+
+**Few-shot Example 3 — Conflicting signals:**
+```
+INPUT:
+【實體信息】
+股票代碼：00291
+公司名稱：華潤啤酒
+主要事件類型：EARNINGS
+次要事件類型：無
+
+【各文章實體摘要】
+- [HKEX] 華潤啤酒公佈中期業績，收入按年增長4%至245億元人民幣，惟毛利率由43.4%收窄至41.2%。
+- [AASTOCKS] 華潤啤酒管理層將全年銷量指引由低單位數增長下調至持平，指內地餐飲消費轉弱。
+- [MINGPAO] 華潤啤酒次高端及以上產品銷量按年升9%，喜力品牌銷量增長逾30%。
+
+OUTPUT:
+summary_short: "華潤啤酒收入增4%惟下調銷量指引"
+summary_full: "華潤啤酒中期收入按年增長4%至245億元人民幣，次高端及以上產品銷量升9%，喜力品牌增長逾30%；惟毛利率由43.4%收窄至41.2%，管理層以內地餐飲消費轉弱為由，將全年銷量指引由低單位數增長下調至持平。"
+key_numbers: ["收入245億元人民幣 +4% YoY", "毛利率43.4%→41.2%", "次高端及以上銷量 +9% YoY"]
 ```
 
 #### Output Schemas
@@ -2215,7 +2278,6 @@ class InputSummary:
     entity_summary_count: int
     entity_summary_total_chars: int
     truncated_by_source_cap: bool
-    truncated_by_char_cap: bool
 
 @dataclass
 class BriefSummarySkillLog:
@@ -2237,14 +2299,25 @@ class BriefSummarySkillLog:
 ```
 1. Per-source cap: retain at most 3 articles per source_name;
    when exceeded, keep the 3 with latest published_at, discard the rest.
-2. Total character cap: sort retained articles by input.source_weights
-   descending (P1 -> P2 -> P3; a source missing from it weighs 0.0;
-   same weight by latest published_at first);
-   accumulate entity_summary strings; discard an entry entirely once
-   including it would push the total over 200 characters.
+2. Order: sort retained articles by input.source_weights descending
+   (P1 -> P2 -> P3; a source missing from it weighs 0.0;
+   same weight by latest published_at first).
 ```
 
-`input_summary` fields (`entity_summary_count`, `entity_summary_total_chars`, `truncated_by_source_cap`, `truncated_by_char_cap`) are recorded during this construction and included in the `brief_summary_completed` log event (system-design.md §9.8).
+The user message, one `- [SOURCE_NAME]` line per retained article in that order; `event_type_secondary` is joined with `、`, or `無` when it is `None`:
+
+```
+【實體信息】
+股票代碼：{stock_code}
+公司名稱：{company_name}
+主要事件類型：{event_type_primary}
+次要事件類型：{event_type_secondary}
+
+【各文章實體摘要】
+- [{source_name}] {entity_summary}
+```
+
+`input_summary` fields (`entity_summary_count`, `entity_summary_total_chars`, `truncated_by_source_cap`) are recorded during this construction and included in the `brief_summary_completed` log event (system-design.md §9.8).
 
 #### Business Constraint Validation (post-call)
 
@@ -2313,9 +2386,10 @@ Rationale (why direction is derived here rather than from `sentiment_label`, why
 1. Forward-looking 信號（管理層指引、展望）優先於 backward-looking 數據
 2. 明確財務數據優先於定性描述
 3. key_numbers 中多個數據點方向一致時，信號強度相應提升
+4. 只評估本事件帶來的新信息：公司既有狀態（如長期停牌、已進入清盤程序）本身不構成評分依據；停牌公司的例行公告仍按公告內容評分
 ```
 
-*Part 3 — Few-shot Examples:* 5 examples covering earnings beat, implicit negative guidance, conflicting signals, neutral boilerplate, and regulatory investigation (not reproduced here — same style as §8.2's four EntityAnalysisSkill examples).
+*Part 3 — Few-shot Examples:* the five examples below, assembled into `_SYSTEM_PROMPT` with Parts 1, 2 and 4 as in §8.2.
 
 *Part 4 — Output Constraints:*
 ```
@@ -2324,6 +2398,98 @@ adjustment_reason 要求：
 - 必須說明評分方向的主要依據
 - 若存在衝突信號，必須說明哪個信號主導及理由
 - 不得重複輸入內容，需提供判斷性陳述
+```
+
+The user message is built by `build_prompt()` ("Input construction", below).
+
+**Few-shot Example 1 — Earnings beat:**
+```
+INPUT:
+【實體信息】
+股票代碼：00941
+公司名稱：中國移動
+主要事件類型：EARNINGS
+次要事件類型：DIVIDEND
+
+【事件摘要（來自BriefSummarySkill）】
+summary_full：中國移動中期股東應佔利潤按年增長12%至802億元人民幣，高於市場預期約5%；中期派息率提升至73%，管理層上調全年派息率目標至75%以上。
+key_numbers：股東應佔利潤802億元人民幣 +12% YoY、派息率73%、全年派息率目標75%以上
+
+OUTPUT:
+stock_impact_score: 4
+adjustment_reason: "盈利增長12%並超出市場預期，管理層同時上調全年派息率目標，前瞻信號與財務數據方向一致，屬明確正面，接近重大正面水平。"
+```
+
+**Few-shot Example 2 — Implicit negative guidance:**
+```
+INPUT:
+【實體信息】
+股票代碼：06862
+公司名稱：海底撈
+主要事件類型：GENERAL_ANNOUNCEMENT
+次要事件類型：無
+
+【事件摘要（來自BriefSummarySkill）】
+summary_full：海底撈管理層表示下半年將「審慎推進」開店計劃，並會根據各門店經營情況調整網絡布局，未有提供具體開店目標。
+key_numbers：無
+
+OUTPUT:
+stock_impact_score: -2
+adjustment_reason: "未見負面財務數據，但「審慎推進」及調整網絡布局屬放緩擴張的隱性負面指引，且撤回具體開店目標，前瞻信號偏弱，屬輕至中度負面。"
+```
+
+**Few-shot Example 3 — Conflicting signals:**
+```
+INPUT:
+【實體信息】
+股票代碼：06690
+公司名稱：海爾智家
+主要事件類型：EARNINGS
+次要事件類型：無
+
+【事件摘要（來自BriefSummarySkill）】
+summary_full：海爾智家中期收入按年增長8%至1,356億元人民幣，惟受原材料成本上升影響，毛利率由31.0%收窄至28.5%；管理層表示下半年成本壓力將持續。
+key_numbers：收入1,356億元人民幣 +8% YoY、毛利率31.0%→28.5%
+
+OUTPUT:
+stock_impact_score: -1
+adjustment_reason: "收入增長8%屬正面，但毛利率收窄2.5個百分點，管理層預期成本壓力持續，前瞻信號主導，盈利能力受壓抵銷收入增長，整體輕微負面。"
+```
+
+**Few-shot Example 4 — Neutral boilerplate:**
+```
+INPUT:
+【實體信息】
+股票代碼：00762
+公司名稱：中國聯通
+主要事件類型：GENERAL_ANNOUNCEMENT
+次要事件類型：無
+
+【事件摘要（來自BriefSummarySkill）】
+summary_full：中國聯通按上市規則公佈截至8月底的每月證券變動報表，已發行股份數目與上月相同，未涉及新的業務或財務信息。
+key_numbers：無
+
+OUTPUT:
+stock_impact_score: 0
+adjustment_reason: "屬上市規則要求的例行月度披露，股本並無變動，未提供任何新信息，對股價無實質影響。"
+```
+
+**Few-shot Example 5 — Regulatory investigation:**
+```
+INPUT:
+【實體信息】
+股票代碼：09868
+公司名稱：小鵬汽車
+主要事件類型：REGULATORY
+次要事件類型：無
+
+【事件摘要（來自BriefSummarySkill）】
+summary_full：小鵬汽車公告接獲監管機構通知，就其智能駕駛功能的宣傳內容展開調查，公司已暫停相關推廣。調查範圍及時間表未有披露，潛在處罰存在不確定性。
+key_numbers：無
+
+OUTPUT:
+stock_impact_score: -3
+adjustment_reason: "正式監管調查屬明確負面事件，且涉及核心智能駕駛賣點，公司已暫停推廣；處罰範圍未明，但未見存亡風險，評為明確負面。"
 ```
 
 #### Output Schemas
@@ -2421,7 +2587,21 @@ class EventLLMScoringSkillLog:
     timestamp: datetime
 ```
 
-**Input construction** — `build_prompt()`, called from `__init__()` above (system-design.md §9.6): `stock_code`, `event_type_primary`, `event_type_secondary` from `input.event`; `company_name` from `input.stock.company_name`; `summary_full` and `key_numbers` from `input.brief_output.output`. `input.input_from_fallback` is recorded (not used in the prompt) purely for the `event_scoring_completed` log event, flagging a potentially-degraded input for monitoring.
+**Input construction** — `build_prompt()`, called from `__init__()` above (system-design.md §9.6): `stock_code`, `event_type_primary`, `event_type_secondary` from `input.event`; `company_name` from `input.stock.company_name`; `summary_full` and `key_numbers` from `input.brief_output.output`. `event_type_secondary` and `key_numbers` are joined with `、`, or `無` when empty:
+
+```
+【實體信息】
+股票代碼：{stock_code}
+公司名稱：{company_name}
+主要事件類型：{event_type_primary}
+次要事件類型：{event_type_secondary}
+
+【事件摘要（來自BriefSummarySkill）】
+summary_full：{summary_full}
+key_numbers：{key_numbers}
+```
+
+`input.input_from_fallback` is recorded (not used in the prompt) purely for the `event_scoring_completed` log event, flagging a potentially-degraded input for monitoring.
 
 #### Business Constraint Validation
 
@@ -5543,7 +5723,6 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 | Q-2 | Validate `SCORING_MAX_CONCURRENT` against LLM API rate limits | Scoring Layer throughput | Week 1 |
 | Q-3 | Post-MVP: Dead Letter Stream consumption and reprocessing pipeline | Service reliability | Post-MVP |
 | Q-6 | Post-MVP: `entity_event_processing_status` table for state machine tracking and quality monitoring | Observability | Post-MVP |
-| Q-8 | Validate BriefSummarySkill's 200-char input cap against real aggregated Events | BriefSummarySkill output quality | Week 2 |
 | Q-9 | Validate `RATE_LIMIT_BACKOFF_S=60` against actual Vertex AI rate limit reset window | LLM throughput | Week 1 |
 | Q-10 | Post-MVP: quality monitoring Service design (log ingestion, LLM-as-Judge, post-event price correlation) | LLM quality improvement | Post-MVP |
 | Q-11 | Validate the common `HTTP_TIMEOUT_S=120` (§4.1 — covers SADI, Admin, and HKEXnews calls) against real latency measurements (`LLM_API_TIMEOUT_S` is measured, §4.1) | Latency tuning | Week 1 |
@@ -5551,14 +5730,13 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 | Q-16 | Validate the name checks of entity verification (§4.2 `name_matches_stock`/`lookup_stock`) at real volume: how often `lookup_stock` decides an entity, and a hand-checked sample of its matches and of unverified entities | EntityAnalysisSkill accuracy | Week 2 |
 | Q-17 | Morning Brief cache retention: Events never age out of the cache (§14.4), so it grows without bound and old high-impact Events keep surfacing in the backfill | Morning Brief content; build cost (§14.1, §14.9); Redis memory | Pre-go-live (product decision) |
 
-(Q-4, Q-5, Q-7, Q-12, Q-13, Q-14 are marked Resolved in system-design.md §14 and are not repeated here.)
+(Q-4, Q-5, Q-7, Q-8, Q-12, Q-13, Q-14 are marked Resolved in system-design.md §14 and are not repeated here.)
 
 ### New — implementation-doc-level gaps found while writing this document
 
 | # | Gap | Where | Recommended resolution |
 |---|---|---|---|
 | I-1 | **`lookup_stock`'s (§4.2) real-traffic latency is unmeasured.** Its name search (`_search()`) runs synchronously on the shared event loop (§16). Before traffic it measured p50 0.18 ms, p99 5.0 ms, max 6.6 ms over 737 real name queries (Python 3.12, Apple M5 Pro), with the `StockNameIndex` prepared at refresh (16 ms to build), and it runs for about 1.5% of entities on real news. So `asyncio.to_thread()` is not needed. | §4.2 | After traffic: p50/p95/p99 from `lookup_stock_completed`. Revisit `asyncio.to_thread()` only if calls cross the 20 ms WARNING threshold. |
-| I-3 | **BriefSummarySkill/EventLLMScoringSkill's model and `Max Tokens` (§8 table: `gemini-3.1-flash-lite`, 4096/2048) are unmeasured starting values;** EntityAnalysisSkill's row is measured (§8). | §8, system-design.md §9.1 | Measure on real aggregated Events before implementing either Skill: check for calls hitting the max (truncated JSON → `LLMSchemaViolationError`) and for persistent unused headroom at p95/p99; adjust per Skill. |
 | I-4 | **`STREAM_CLAIM_TIMEOUT_MS=300000` and `ENTITY_ANALYSIS_MAX_RETRY=3` (§4.1) are derived, not measured.** The claim timeout sits above the configured worst case of one message (`HTTP_TIMEOUT_S` 120 s + `LLM_API_TIMEOUT_S` 30 s) and above `RATE_LIMIT_BACKOFF_S`; the retry count matches SADI's. | §4.1, §6.1 | After traffic: per-batch `latency_ms` p99/max from `entity_analysis_batch_completed` (§11.3 — the longest a read message stays un-ACKed), and the `entity_analysis_message_dead_lettered` rate by `reason`; lower the claim timeout toward that p99 plus headroom, and adjust the retry count if transient causes still dead-letter. |
 ---
 
