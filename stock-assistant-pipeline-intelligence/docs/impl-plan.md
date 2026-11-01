@@ -343,29 +343,29 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Entity Analysis: LLM Entity Extraction (for `EntityEvent`/`AnalysisOutcome` and `app/models/`)
 **Scope:** The pure merge decision — whether an incoming EntityEvent extends its group's active Event or starts a new one (impl.md §12.4; design rationale: design.md §4.4).
-- `app/config.py`: `AggregationConfig.sliding_window_hours`/`event_max_timespan_hours`/`db_flush_interval_s` (the last one for `ttl_for()`'s grace period).
+- `app/config.py`: `AggregationConfig.sliding_window_hours`/`event_max_timespan_hours`.
 - `app/models/event.py`: `Event` without its `brief_summary` field, and `EntitySource` (§3.3).
 - `app/models/entity_event.py`: `EntityEvent.is_persistent_event()`/`get_published_at()` (§11.1).
-- `app/aggregation/sliding_window.py`: `merge_or_create()`, `is_late()`, `ttl_for()`.
+- `app/aggregation/sliding_window.py`: `merge_or_create()`, validating its inputs first.
 **Acceptance criteria** (per impl.md §12.4):
 - Merge vs. new Event decided correctly at the sliding-window and hard-cap boundaries (just inside, exactly at, just outside).
 - `first_seen_at`/`last_seen_at` take min/max on out-of-order arrival, never a blind overwrite.
 - `published_at=None` falls back to `created_at` for the computation only.
 - `aggregation_updated_at` is set on both branches; a merge keeps `event_id` and appends the `entity_event_id`, a new Event gets a fresh `event_id`.
-- `is_late()` is true only for an EntityEvent dated before the active Event's `last_seen_at` by more than `SLIDING_WINDOW_HOURS`, with the same `published_at` fallback.
-- `ttl_for()` returns `min(SLIDING_WINDOW_HOURS, remaining lifespan)` in seconds plus `2 × AGG_DB_FLUSH_INTERVAL_S` — never `0`, even at the hard cap.
+- A non-active `active_event` or an unpersisted `entity_event` raises `SAPIError` before any merge.
 - Unit-tested with fixed timestamps. No integration pass — a pure function with no I/O; its real-world behaviour is exercised by Aggregation: Consume & Merge into Active Events.
-**Docs:** impl.md §3.3, §4.1, §12.4; design.md §4.4, §11.2 (TTL grace period).
-**Explicitly deferred:** `Event.brief_summary` and `BriefSummary` (added by the first Scoring ticket that writes it); `Event.source_count` (added with its first reader); everything with I/O — Redis, DB, streams.
+**Docs:** impl.md §3.3, §4.1, §11.1, §12.4; design.md §4.4.
+**Explicitly deferred:** `is_late()`, `ttl_for()` and `AggregationConfig.db_flush_interval_s` (built with their caller, `AggregationService`); `Event.brief_summary` and `BriefSummary` (added by the first Scoring ticket that writes it); `Event.source_count` (added with its first reader); everything with I/O — Redis, DB, streams.
 
 ---
 
 ### Aggregation: Consume & Merge into Active Events (L)
 
 **Status:** Created
-**Depends on:** Aggregation: Sliding-Window Merge Algorithm (for `merge_or_create()`/`ttl_for()`, `Event`); Entity Analysis: Persist & Publish Entity Events (for the `stream:entity_event_completed` payload, `EntityEventRepository`, migration `001`)
+**Depends on:** Aggregation: Sliding-Window Merge Algorithm (for `merge_or_create()`, `Event`); Entity Analysis: Persist & Publish Entity Events (for the `stream:entity_event_completed` payload, `EntityEventRepository`, migration `001`)
 **Scope:** Consume `stream:entity_event_completed`, merge each EntityEvent into its group's active Event in Redis, and ACK once the Redis write lands (impl.md §12.1–§12.3, §12.5; design.md §4.2–§4.4).
-- `app/config.py`: `AggregationConfig.batch_size`/`batch_timeout_ms`/`max_concurrent`/`group_idle_timeout_s`/`consumer_name`.
+- `app/config.py`: `AggregationConfig.batch_size`/`batch_timeout_ms`/`max_concurrent`/`group_idle_timeout_s`/`consumer_name`, and `db_flush_interval_s` (default 300) for `ttl_for()`'s grace period.
+- `app/aggregation/sliding_window.py`: `is_late()` and `ttl_for()` (§12.4), tested through `AggregationService`.
 - `app/redis/state_client.py`: `hgetall()`/`hset()`/`expire()` only (§6.2).
 - `app/aggregation/event_aggregation_store.py`: `EventAggregationStore` + singleton — `get_active_event()`/`upsert_active_event()` only, not `scan_all()` (§12.5).
 - `app/persistent/entity_event_repository.py`: `fetch_entity_event()` and `_row_to_entity_event()` (§10.1).
@@ -376,10 +376,10 @@ This document does not introduce new design — every ticket below implements so
 **Acceptance criteria** (per impl.md §12.1–§12.3, §12.6):
 - EntityEvents of one group are merged strictly in order; different groups run concurrently, bounded by `AGG_MAX_CONCURRENT`.
 - A group idle for `AGG_GROUP_IDLE_TIMEOUT_S` tears itself down; a later message for it recreates it.
-- A message is ACKed only after its Redis write; the key's TTL is `ttl_for()`'s value.
+- A message is ACKed only after its Redis write; the key's TTL is `min(SLIDING_WINDOW_HOURS, remaining lifespan)` in seconds plus `2 × AGG_DB_FLUSH_INTERVAL_S` — never `0`, even at the hard cap.
 - A missing `entity_events` row logs `aggregation_entity_event_missing` and ACKs without merging.
 - An `entity_event_id` already in the active Event logs `aggregation_duplicate_skipped` and ACKs without merging again.
-- A late EntityEvent (`is_late()`) logs `aggregation_late_entity_event_skipped` and ACKs; the active Event and its Redis key are untouched.
+- A late EntityEvent — dated before the active Event's `last_seen_at` by more than `SLIDING_WINDOW_HOURS`, with `published_at` falling back to `created_at` — logs `aggregation_late_entity_event_skipped` and ACKs; the active Event and its Redis key are untouched.
 - A failure before or inside the unit of work logs `aggregation_route_failed`/`aggregation_process_failed`, leaves the message un-ACKed, and releases its `_enqueued` entry; the group and the consumer loop keep running.
 - A Redis `ConnectionError` in the consumer loop triggers the documented warn/sleep/retry (§6.1), without crashing.
 - Shutdown cancels and awaits the layer Task, then `AggregationService.close()` cancels any running groups, all before clients close.
@@ -388,7 +388,7 @@ This document does not introduce new design — every ticket below implements so
 - Integration pass against real Redis and Postgres: seed `entity_events` rows and `XADD` messages to the stream directly (SAPI's own internal stream — no mocking needed); control merge-vs-new through the seeded `published_at` values; verify results in the `agg:event:*` keys and `XPENDING`.
 **Meanwhile:** active Events live only in Redis — never flushed, and a replaced Event's merges are overwritten. Acceptable until Aggregation: Flush Active Events & Publish, since nothing reads aggregation output before then.
 **Config note:** `AGG_MAX_CONCURRENT` must exceed the peak number of distinct groups live within any `AGG_GROUP_IDLE_TIMEOUT_S` window — a live group holds its permit until it idles out, so running out of permits stalls the consumer loop and, once flushing exists, the flush triggers too (design.md §4.3, known limitation).
-**Docs:** impl.md §4.1, §6.2, §10.1 (`fetch_entity_event`), §12.1, §12.2, §12.3, §12.5, §12.6, §16; design.md §4.2–§4.4, §4.7, §11.2.
+**Docs:** impl.md §4.1, §6.2, §10.1 (`fetch_entity_event`), §12.1, §12.2, §12.3, §12.4 (`is_late`, `ttl_for`), §12.5, §12.6, §16; design.md §4.2–§4.4, §4.7, §11.2 (TTL grace period).
 **Explicitly deferred:** flush and every DB write; `fetch_mapped_event_id()` (the DB half of the duplicate check); flush-before-replace; reclaim/dead-letter and the `v` check; layer monitoring.
 
 ---
