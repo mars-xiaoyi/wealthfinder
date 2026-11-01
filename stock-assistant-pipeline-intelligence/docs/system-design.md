@@ -225,7 +225,7 @@ Two-layer protection prevents duplicate processing:
 
 **Layer 1 — In-memory Set (concurrent deduplication):**
 
-An in-memory Set `processing_cleaned_ids` prevents the same article from being processed concurrently within the same service instance. Before invoking EntityAnalysisSkill, the worker checks the Set:
+An in-memory Set `processing_cleaned_ids` prevents the same article from being processed concurrently within the same service instance. Before the article takes a worker slot (§3.3), the consumer checks the Set — so an article still waiting for a slot already counts as in flight:
 
 ```
 if cleaned_id in processing_cleaned_ids → skip

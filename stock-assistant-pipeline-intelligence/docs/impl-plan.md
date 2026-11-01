@@ -285,7 +285,7 @@ This document does not introduce new design — every ticket below implements so
 - After `trigger_backoff()`, no new work starts until `RATE_LIMIT_BACKOFF_S` has elapsed — including a dispatch already waiting on the semaphore when the backoff fires; work already running is not interrupted.
 - Each loop gathers its batch's dispatches and reads again only once all have returned (§11.3).
 - An `LLMRateLimitError` from any one article triggers the layer-wide backoff and leaves that message un-ACKed.
-- Unit-tested with fake coroutines and a controllable clock.
+- Unit-tested with fake coroutines and a real 1 s backoff.
 - Integration pass against live Vertex AI at the configured concurrency.
 - The integration cases from Entity Analysis: Reclaim, Dead Letter & Schema-Version Check re-run with both loops dispatching through `WorkerPool`, and the `HTTP 429` case from Entity Analysis: LLM Entity Extraction re-run with the backoff in force: the same results, except that a rate-limited article now delays the next article's start by `RATE_LIMIT_BACKOFF_S`.
 - Each backoff logs WARNING `rate_limit_backoff_started` with `layer` and `backoff_until`, and each gathered batch logs INFO `entity_analysis_batch_completed` with `batch_size` and `latency_ms` (impl.md §11.3).

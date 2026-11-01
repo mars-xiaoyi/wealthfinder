@@ -485,7 +485,7 @@ class LLMConfig:
     vertex_project: str            # env: VERTEX_AI_PROJECT
     vertex_location: str           # env: VERTEX_AI_LOCATION (default "global" — current Gemini models are not served in asia-east1/asia-east2)
     api_timeout_s: int             # env: LLM_API_TIMEOUT_S (default 30 — gemini-3.1-flash-lite on EntityAnalysis calls: p95 8.4 s, max 18 s)
-    rate_limit_backoff_s: int      # env: RATE_LIMIT_BACKOFF_S
+    rate_limit_backoff_s: int      # env: RATE_LIMIT_BACKOFF_S (default 60 — tuned under Q-9)
 ```
 
 #### Class: `EntityAnalysisConfig`
@@ -495,7 +495,8 @@ class LLMConfig:
 class EntityAnalysisConfig:
     batch_size: int                       # env: ENTITY_ANALYSIS_BATCH_SIZE (default 10)
     batch_timeout_ms: int                 # env: ENTITY_ANALYSIS_BATCH_TIMEOUT_MS (default 5000)
-    max_concurrent: int                   # env: ENTITY_ANALYSIS_MAX_CONCURRENT
+    max_concurrent: int                   # env: ENTITY_ANALYSIS_MAX_CONCURRENT (default 3 — the LLM spike saw 429s at
+                                           # ≤ 4 concurrent calls on a shared quota with no fixed RPM; tuned under Q-9)
     max_retry: int                        # env: ENTITY_ANALYSIS_MAX_RETRY (default 3)
     max_input_chars: int                  # env: ENTITY_ANALYSIS_MAX_INPUT_CHARS (default 30000) — article body cut before
                                            # the LLM call (§8.2); HKEX announcements reach 2,000,000+ chars
@@ -3543,10 +3544,14 @@ class CleanedNewsConsumer:
         see below."""
 
     async def _process_one(self, cleaned_id: UUID, message_id: str) -> None:
-        """The shared per-message entry point both loops dispatch into —
-        gates on HK Stock List readiness and the dedup guard, calls
-        EntityAnalysisService.find_entity_events(), and decides
-        ACK/backoff — see Flowchart and Purpose block below."""
+        """The shared per-message entry point both loops route into —
+        gates on HK Stock List readiness and the dedup guard, then
+        dispatches _analyse() to worker_pool — see Flowchart and Purpose
+        block below."""
+
+    async def _analyse(self, cleaned_id: UUID, message_id: str) -> None:
+        """The work run inside a worker_pool slot — calls
+        EntityAnalysisService.find_entity_events() and decides ACK/backoff."""
 ```
 
 `_consumer_loop()` and `_reclaim_loop()` are described in their own subsections below; `start()` only launches them concurrently (§6.1).
@@ -3555,24 +3560,25 @@ class CleanedNewsConsumer:
 
 #### `_consumer_loop()` (see Flowchart, below)
 
-Reads batches (`read_from()`) and dispatches each message to `worker_pool` (`WorkerPool.dispatch()`, §11.3); nodes `A`–`D` of the flowchart below are its entire body.
+Reads batches (`read_from()`) and routes each message of a batch concurrently (`_route_batch()`, §11.3); nodes `A`–`D` of the flowchart below are its entire body.
 
 #### Method: `CleanedNewsConsumer._process_one(cleaned_id: UUID, message_id: str) -> None`
 
-Both `_consumer_loop()` (above) and `_reclaim_loop()` (below) dispatch into this **same** method — the diagram below is system-design.md §3.2's flowchart, with implementation-level detail added; only how a message arrives at `worker_pool.dispatch(...)` differs between the two loops. Node `H` is the single call into `EntityAnalysisService.find_entity_events(cleaned_id)`, described above — its own internal steps aren't redrawn here.
+Both `_consumer_loop()` (above) and `_reclaim_loop()` (below) route into this **same** method — the diagram below is system-design.md §3.2's flowchart, with implementation-level detail added; only how a message arrives at `_process_one()` differs between the two loops. Node `H` is the single call into `EntityAnalysisService.find_entity_events(cleaned_id)`, described above — its own internal steps aren't redrawn here.
 
 ```mermaid
 flowchart TD
     A([_consumer_loop]) --> B[create_group_if_not_exists\nstream:raw_news_cleaned / sapi-entity-analysis]
     B --> C[read_from COUNT=ENTITY_ANALYSIS_BATCH_SIZE BLOCK=ENTITY_ANALYSIS_BATCH_TIMEOUT_MS\nconsumer=config.consumer_name]
     C -->|Empty| C
-    C -->|Messages| D[gather worker_pool.dispatch over the batch\nSemaphore ENTITY_ANALYSIS_MAX_CONCURRENT\nnext read_from once all return]
+    C -->|Messages| D[gather over the batch: §6.1 dead-letter checks,\nthen _process_one\nnext read_from once all return]
     D --> R{len get_hk_stock_list_cache\n> 0?}
     R -->|No - not ready| S[Log warning hk_stock_list_not_ready\nDo not ACK - redeliver later]
     R -->|Yes| E{cleaned_id in\nprocessing_cleaned_ids Set?}
     E -->|Yes| F[Skip - already in flight\nleave unACKed for this delivery]
     E -->|No| G[Add to Set — no await between\nthis check and this insert]
-    G --> H[service.find_entity_events cleaned_id\nEntityAnalysisService — see above]
+    G --> W[worker_pool.dispatch _analyse\nSemaphore ENTITY_ANALYSIS_MAX_CONCURRENT\nwaits out any backoff]
+    W --> H[service.find_entity_events cleaned_id\nEntityAnalysisService — see above]
     H -->|Returns normally\nsuccess or SADI 404| Q[Remove from Set\nACK]
     H -->|Raises LLMRateLimitError| L[worker_pool.trigger_backoff\nRemove from Set\nDo not ACK]
     H -->|Raises LLMProviderError, LLMAuthenticationError,\nor LLMSchemaViolationError| M[Remove from Set\nDo not ACK]
@@ -3581,16 +3587,19 @@ flowchart TD
 
 > **`hk_stock_list_not_ready` gate:** checked before the in-flight Set and before `EntityAnalysisService`, as a synchronous side-effect-free read. Messages are **not ACKed**: an empty list would make every entity `found=false` and produce a permanently-wrong empty result. The reclaim loop (§6.1) redelivers after `STREAM_CLAIM_TIMEOUT_MS`.
 
-> **`_process_one()` wraps everything from the Set-insert onward in `try`/`except LLMRateLimitError`/`except SAPIError`/`except Exception`** (in that order, since `LLMRateLimitError` subclasses `LLMError`, which subclasses `SAPIError`). `except LLMRateLimitError` calls `trigger_backoff()`, then logs the error like the next clause. `except SAPIError` covers every other SAPI error — any other `LLMError` re-raised by `find_entity_events()`, a SADI outage, a DB write failure: log it at its own `log_level` with its `dev_message`, `cleaned_id` and `message_id`, and leave the message unACKed. Only the last is unanticipated: log ERROR `f"Unhandled exception: {exc!r}"` with `exc_info`, remove `cleaned_id` from `processing_cleaned_ids` in a `finally`, leave the message unACKed, and don't re-raise. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
+> **`_analyse()` wraps the `find_entity_events()` call and the ACK in `try`/`except SAPIError`/`except Exception`.** `except SAPIError` calls `trigger_backoff()` first when the error is an `LLMRateLimitError` (which subclasses `LLMError`, which subclasses `SAPIError`), then handles it like every other SAPI error — any other `LLMError` re-raised by `find_entity_events()`, a SADI outage, a DB write failure: log it at its own `log_level` with its `dev_message`, `cleaned_id` and `message_id`, and leave the message unACKed. Only the last is unanticipated: log ERROR `f"Unhandled exception: {exc!r}"` with `exc_info`, leave the message unACKed, and don't re-raise. `_process_one()` removes `cleaned_id` from `processing_cleaned_ids` in a `finally` around `dispatch()`. This limits an unanticipated bug to one message (Coroutine Monitoring, system-design.md §12.1, remains the fallback outside the wrapper); a repeating failure dead-letters at `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` (§6.1).
 
 ```
-Purpose : The single entry point for dispatching one message, from either _consumer_loop()
+Purpose : The single entry point for processing one message, from either _consumer_loop()
           or _reclaim_loop() (§6.1). Implements the flowchart from the
           hk_stock_list_not_ready gate onward. The check-then-insert into
           processing_cleaned_ids has no `await` in between, which makes concurrent calls from
           both loops race-free and distinguishes a still-in-flight duplicate (entry present)
-          from an orphaned one (entry absent, e.g. after a crash). Everything from the
-          Set-insert onward runs inside the try/except above.
+          from an orphaned one (entry absent, e.g. after a crash). The insert happens before
+          worker_pool.dispatch(), so an article still waiting for a slot counts as in flight:
+          a batch with more messages than ENTITY_ANALYSIS_MAX_CONCURRENT can sit pending past
+          STREAM_CLAIM_TIMEOUT_MS, and its reclaimed copy is then skipped, not queued for a
+          second analysis.
 ```
 
 #### `_reclaim_loop()` (§6.1's Reclaim and Dead Letter pattern, applied here)
@@ -3604,9 +3613,8 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           publish to EntityAnalysisDeadLetterStream.NAME, ACK and log WARNING
           entity_analysis_message_dead_lettered (never reaches _process_one()).
           Otherwise, run the shape check (§6.1), then extract cleaned_id from fields and
-          dispatch via worker_pool.dispatch(lambda: self._process_one(cleaned_id, message_id))
-          — the remaining messages gathered as one batch, identical to
-          _consumer_loop() (§11.3).
+          call _process_one(cleaned_id, message_id) — the claimed messages gathered as one
+          batch, identical to _consumer_loop() (§11.3).
           except redis.ConnectionError / redis.TimeoutError: log warning
           entity_analysis_redis_stream_unreachable (§6.1's Reconnect behaviour).
           except Exception: log warning entity_analysis_reclaim_sweep_failed
@@ -3645,9 +3653,9 @@ class WorkerPool:
 
 Backoff is pool-level (system-design.md §12.1). `dispatch()` checks `self._rate_limit_until` *after* acquiring the semaphore, in a loop, so a caller already waiting on the semaphore still waits out the backoff, and a `trigger_backoff()` that extends the deadline mid-sleep is honoured. Work already running is not interrupted.
 
-**`dispatch()` awaits the work**, so both loops (`_consumer_loop()`/`_reclaim_loop()`, §11.2) `asyncio.gather()` a whole batch of dispatches and read again only once all return (system-design.md §3.3). Both share the pool, so `max_concurrent` caps the layer. `WorkerPool` owns no Tasks; cancelling the layer Task cancels in-flight work. After each gathered batch, the loop logs INFO `entity_analysis_batch_completed` (Scoring: `scoring_batch_completed`, §13.2) with `batch_size` and `latency_ms` — the per-batch measure Q-1 tunes `*_BATCH_SIZE`/`*_BATCH_TIMEOUT_MS` against (§18).
+**`dispatch()` awaits the work**, so both loops (`_consumer_loop()`/`_reclaim_loop()`, §11.2) route a whole batch through `CleanedNewsConsumer._route_batch()`, which `asyncio.gather(..., return_exceptions=True)`s it, so a loop reads again only once every message has returned (system-design.md §3.3). A stream-Redis error from one message's ACK is re-raised only after the rest of the batch is done, into the loop's reconnect handling (§6.1). Dead-lettering (§6.1) happens before `_process_one()`, so it takes no slot and isn't held back by a backoff. Both loops share the pool, so `max_concurrent` caps the layer. `WorkerPool` owns no Tasks; cancelling the layer Task cancels in-flight work. After each non-empty gathered batch, `_route_batch()` logs INFO `entity_analysis_batch_completed` (Scoring: `scoring_batch_completed`, §13.2) with `batch_size` (messages in the batch) and `latency_ms` — the per-batch measure Q-1 tunes `*_BATCH_SIZE`/`*_BATCH_TIMEOUT_MS` against (§18).
 
-> `RATE_LIMIT_BACKOFF_S * 1000` must stay below `STREAM_CLAIM_TIMEOUT_MS` — system-design.md §12.1 (claim-timeout constraint).
+> `RATE_LIMIT_BACKOFF_S * 1000` must stay below `STREAM_CLAIM_TIMEOUT_MS` — system-design.md §12.1 (claim-timeout constraint). Since a batch larger than `max_concurrent` runs in several rounds, "one read batch's processing time" there includes the rounds its messages spend waiting for a slot; I-4 (§18) measures it.
 
 The same `WorkerPool` class is used, as independent instances, by Entity Analysis and Scoring (§13).
 
@@ -5737,7 +5745,7 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 | # | Gap | Where | Recommended resolution |
 |---|---|---|---|
 | I-1 | **`lookup_stock`'s (§4.2) real-traffic latency is unmeasured.** Its name search (`_search()`) runs synchronously on the shared event loop (§16). Before traffic it measured p50 0.18 ms, p99 5.0 ms, max 6.6 ms over 737 real name queries (Python 3.12, Apple M5 Pro), with the `StockNameIndex` prepared at refresh (16 ms to build), and it runs for about 1.5% of entities on real news. So `asyncio.to_thread()` is not needed. | §4.2 | After traffic: p50/p95/p99 from `lookup_stock_completed`. Revisit `asyncio.to_thread()` only if calls cross the 20 ms WARNING threshold. |
-| I-4 | **`STREAM_CLAIM_TIMEOUT_MS=300000` and `ENTITY_ANALYSIS_MAX_RETRY=3` (§4.1) are derived, not measured.** The claim timeout sits above the configured worst case of one message (`HTTP_TIMEOUT_S` 120 s + `LLM_API_TIMEOUT_S` 30 s) and above `RATE_LIMIT_BACKOFF_S`; the retry count matches SADI's. | §4.1, §6.1 | After traffic: per-batch `latency_ms` p99/max from `entity_analysis_batch_completed` (§11.3 — the longest a read message stays un-ACKed), and the `entity_analysis_message_dead_lettered` rate by `reason`; lower the claim timeout toward that p99 plus headroom, and adjust the retry count if transient causes still dead-letter. |
+| I-4 | **`STREAM_CLAIM_TIMEOUT_MS=300000` and `ENTITY_ANALYSIS_MAX_RETRY=3` (§4.1) are derived, not measured.** The claim timeout sits above the configured worst case of one message (`HTTP_TIMEOUT_S` 120 s + `LLM_API_TIMEOUT_S` 30 s) and above `RATE_LIMIT_BACKOFF_S`, but not above the worst case of one batch: `ENTITY_ANALYSIS_BATCH_SIZE` 10 at `ENTITY_ANALYSIS_MAX_CONCURRENT` 3 runs in up to 4 rounds (§11.3); a message reclaimed while it waits for a slot is skipped (§11.2), but the claim still counts as a delivery. The retry count matches SADI's. | §4.1, §6.1 | After traffic: per-batch `latency_ms` p99/max from `entity_analysis_batch_completed` (§11.3 — the longest a read message stays un-ACKed), and the `entity_analysis_message_dead_lettered` rate by `reason`; lower the claim timeout toward that p99 plus headroom, and adjust the retry count if transient causes still dead-letter. |
 ---
 
 *— End of Document | SAPI Implementation Guide v0.1 —*
