@@ -1,5 +1,7 @@
 import asyncio
 import json
+import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -9,6 +11,8 @@ from app.common.errors import SAPIError
 from app.common.hk_stock_list import get_hk_stock_list_cache
 from app.config import EntityAnalysisConfig, RedisConfig
 from app.entity_analysis.entity_analysis_service import get_entity_analysis_service
+from app.entity_analysis.worker_pool import WorkerPool
+from app.llm.errors import LLMRateLimitError
 from app.logger import get_logger
 from app.redis.stream_client import ReclaimedMessage, StreamMessage, get_redis_stream_client
 from app.redis.stream_enum import EntityAnalysisDeadLetterStream, RawNewsCleanedStream
@@ -35,9 +39,12 @@ def _get_delivery_count(message: StreamMessage) -> int:
 class CleanedNewsConsumer:
     """Consumes stream:raw_news_cleaned and analyses each article."""
 
-    def __init__(self, config: EntityAnalysisConfig, redis_config: RedisConfig) -> None:
+    def __init__(
+        self, worker_pool: WorkerPool, config: EntityAnalysisConfig, redis_config: RedisConfig
+    ) -> None:
         self._service = get_entity_analysis_service()
         self._redis_stream = get_redis_stream_client()
+        self._worker_pool = worker_pool
         self._config = config
         self._reconnect_interval_s = redis_config.reconnect_interval_s
         self._claim_timeout_ms = redis_config.stream_claim_timeout_ms
@@ -65,10 +72,10 @@ class CleanedNewsConsumer:
                     count=self._config.batch_size,
                     block_ms=self._config.batch_timeout_ms,
                 )
-                for message in messages:
-                    await self._route(message)
+                if messages:
+                    await self._route_batch(messages)
             except _REDIS_UNREACHABLE:
-                # Any unprocessed rest of the batch stays pending, un-ACKed.
+                # A message whose ACK failed stays pending, un-ACKed.
                 logger.warning(
                     "entity_analysis_redis_stream_unreachable",
                     retry_in_s=self._reconnect_interval_s,
@@ -88,8 +95,8 @@ class CleanedNewsConsumer:
                     min_idle_ms=self._claim_timeout_ms,
                     count=self._config.batch_size,
                 )
-                for message in messages:
-                    await self._route(message)
+                if messages:
+                    await self._route_batch(messages)
             except _REDIS_UNREACHABLE:
                 logger.warning(
                     "entity_analysis_redis_stream_unreachable",
@@ -98,6 +105,24 @@ class CleanedNewsConsumer:
                 )
             except Exception:
                 logger.warning("entity_analysis_reclaim_sweep_failed", exc_info=True)
+
+    async def _route_batch(self, messages: Sequence[StreamMessage]) -> None:
+        """Route every message of a batch concurrently, returning once all are done. Raises
+        the stream Redis error if one stopped a message's handling."""
+        start = time.perf_counter()
+        results = await asyncio.gather(
+            *(self._route(message) for message in messages), return_exceptions=True
+        )
+        logger.info(
+            "entity_analysis_batch_completed",
+            batch_size=len(messages),
+            latency_ms=int((time.perf_counter() - start) * 1000),
+        )
+        # Every other failure was already handled per message, so only a stream Redis error
+        # comes back here, once the whole batch is done.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def _route(self, message: StreamMessage) -> None:
         """Dead-letter a message that is out of retries or malformed, and process any other."""
@@ -146,16 +171,29 @@ class CleanedNewsConsumer:
     async def _process_one(self, cleaned_id: UUID, message_id: str) -> None:
         """Analyse one message's article and ACK the message once its outcome is final:
         analysed, or not found in SADI. Any other outcome, including an HK Stock List not loaded
-        yet or the same article already in flight, leaves it un-ACKed."""
+        yet or the same article already in flight, leaves it un-ACKed. Raises the stream Redis
+        error if the ACK fails."""
         if len(get_hk_stock_list_cache()) == 0:
             logger.warning("hk_stock_list_not_ready", message_id=message_id)
             return
 
-        # No await between this check and the insert, so two loops can't both pass it.
+        # No await between this check and the insert, so two loops can't both pass it. An
+        # article waiting for a worker slot counts as in flight.
         if cleaned_id in self._processing_cleaned_ids:
             return
         self._processing_cleaned_ids.add(cleaned_id)
 
+        # Released even on a failed ACK or a cancellation; a leftover entry would make every
+        # redelivery of the article skip as in flight.
+        try:
+            await self._worker_pool.dispatch(lambda: self._analyse(cleaned_id, message_id))
+        finally:
+            self._processing_cleaned_ids.discard(cleaned_id)
+
+    async def _analyse(self, cleaned_id: UUID, message_id: str) -> None:
+        """Analyse the article and ACK its message. A failed analysis leaves the message
+        un-ACKed; a rate-limited one also pauses the layer's new work. Raises the stream Redis
+        error if the ACK fails."""
         try:
             await self._service.find_entity_events(cleaned_id)
             await self._redis_stream.ack(
@@ -164,6 +202,8 @@ class CleanedNewsConsumer:
         except _REDIS_UNREACHABLE:
             raise
         except SAPIError as exc:
+            if isinstance(exc, LLMRateLimitError):
+                self._worker_pool.trigger_backoff()
             logger.log(
                 exc.log_level,
                 exc.dev_message,
@@ -178,5 +218,3 @@ class CleanedNewsConsumer:
                 message_id=message_id,
                 exc_info=exc,
             )
-        finally:
-            self._processing_cleaned_ids.discard(cleaned_id)

@@ -12,6 +12,7 @@ from app.config import load_config
 from app.db.connection import create_db_client
 from app.entity_analysis.cleaned_news_consumer import CleanedNewsConsumer
 from app.entity_analysis.entity_analysis_service import create_entity_analysis_service
+from app.entity_analysis.worker_pool import WorkerPool
 from app.llm.vertex_adapter import create_llm_adapter
 from app.logger import configure_logging, get_logger
 from app.persistent.entity_event_repository import create_entity_event_repository
@@ -58,8 +59,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             logger.critical("hk_stock_list_startup_load_failed", exc_info=True)
 
+        entity_analysis_worker_pool = WorkerPool(
+            "entity_analysis",
+            config.entity_analysis.max_concurrent,
+            config.llm.rate_limit_backoff_s,
+        )
         create_entity_analysis_service(config.entity_analysis)
-        cleaned_news_consumer = CleanedNewsConsumer(config.entity_analysis, config.redis)
+        cleaned_news_consumer = CleanedNewsConsumer(
+            entity_analysis_worker_pool, config.entity_analysis, config.redis
+        )
         consumer_task = asyncio.create_task(cleaned_news_consumer.start())
         # Registered last, so on shutdown the consumer stops before the clients it uses close.
         resources.push_async_callback(_cancel_and_wait, consumer_task)

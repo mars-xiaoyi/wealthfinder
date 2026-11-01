@@ -21,7 +21,12 @@ from app.llm.errors import (
 )
 from app.llm.vertex_adapter import VertexAIAdapter
 
-CONFIG = LLMConfig(vertex_project="wealthfinder", vertex_location="global", api_timeout_s=30)
+CONFIG = LLMConfig(
+    vertex_project="wealthfinder",
+    vertex_location="global",
+    api_timeout_s=30,
+    rate_limit_backoff_s=60,
+)
 GENERATION_CONFIG = GenerationConfig(
     model="gemini-3.1-flash-lite", temperature=0, max_output_tokens=16384
 )

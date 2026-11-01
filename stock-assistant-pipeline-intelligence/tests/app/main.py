@@ -35,10 +35,16 @@ CONFIG = AppConfig(
         reconnect_interval_s=5,
         stream_claim_timeout_ms=300000,
     ),
-    llm=LLMConfig(vertex_project="wealthfinder", vertex_location="global", api_timeout_s=30),
+    llm=LLMConfig(
+        vertex_project="wealthfinder",
+        vertex_location="global",
+        api_timeout_s=30,
+        rate_limit_backoff_s=60,
+    ),
     entity_analysis=EntityAnalysisConfig(
         batch_size=10,
         batch_timeout_ms=5000,
+        max_concurrent=3,
         max_retry=3,
         max_input_chars=30000,
         sadi_api_url="http://sadi:8000",
@@ -80,6 +86,7 @@ def infra():
             raise
 
     consumer_cls = MagicMock(return_value=MagicMock(start=_consume_until_cancelled))
+    worker_pool_cls = MagicMock()
     calls.attach_mock(create_db, "create_db_client")
     calls.attach_mock(create_stream, "create_stream_client")
     calls.attach_mock(create_state, "create_state_client")
@@ -89,6 +96,7 @@ def infra():
     calls.attach_mock(create_news, "create_news_client")
     calls.attach_mock(create_repository, "create_entity_event_repository")
     calls.attach_mock(create_service, "create_entity_analysis_service")
+    calls.attach_mock(worker_pool_cls, "WorkerPool")
     calls.attach_mock(consumer_cls, "CleanedNewsConsumer")
     with (
         mock.patch.object(main_module, "load_config", return_value=CONFIG),
@@ -101,6 +109,7 @@ def infra():
         mock.patch.object(main_module, "create_news_client", create_news),
         mock.patch.object(main_module, "create_entity_event_repository", create_repository),
         mock.patch.object(main_module, "create_entity_analysis_service", create_service),
+        mock.patch.object(main_module, "WorkerPool", worker_pool_cls),
         mock.patch.object(main_module, "CleanedNewsConsumer", consumer_cls),
     ):
         yield calls
@@ -119,6 +128,7 @@ STARTUP_CALLS = [
     "create_news_client",
     "create_entity_event_repository",
     "refresh_hk_stock_list",
+    "WorkerPool",
     "create_entity_analysis_service",
     "CleanedNewsConsumer",
     "consumer_started",
@@ -150,7 +160,10 @@ async def lifespan(infra):
         infra.create_entity_event_repository.assert_called_once_with()
         infra.refresh_hk_stock_list.assert_awaited_once_with()
         infra.create_entity_analysis_service.assert_called_once_with(CONFIG.entity_analysis)
-        infra.CleanedNewsConsumer.assert_called_once_with(CONFIG.entity_analysis, CONFIG.redis)
+        infra.WorkerPool.assert_called_once_with("entity_analysis", 3, 60)
+        infra.CleanedNewsConsumer.assert_called_once_with(
+            infra.WorkerPool.return_value, CONFIG.entity_analysis, CONFIG.redis
+        )
 
     assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS
     infra.db_close.assert_awaited_once_with(CONFIG.db.close_timeout_s)

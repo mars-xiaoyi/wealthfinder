@@ -35,6 +35,7 @@ from app.skills.entity_analysis_skill import ExtractedEntity, LLMOutput
 CONFIG = EntityAnalysisConfig(
     batch_size=10,
     batch_timeout_ms=5000,
+    max_concurrent=3,
     max_retry=3,
     max_input_chars=30000,
     sadi_api_url="http://sadi:8000",
