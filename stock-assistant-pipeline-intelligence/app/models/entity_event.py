@@ -50,3 +50,12 @@ class EntityEvent:
     stock: Stock
     entity_event_id: UUID | None = None  # set once the row is persisted
     created_at: datetime | None = None  # set once the row is persisted
+
+    def is_persistent_event(self) -> bool:
+        """Return whether this EntityEvent has been stored."""
+        return self.entity_event_id is not None and self.created_at is not None
+
+    def get_published_at(self) -> datetime | None:
+        """Return the article's publication time, or the time this EntityEvent was stored when
+        the article has none."""
+        return self.published_at or self.created_at

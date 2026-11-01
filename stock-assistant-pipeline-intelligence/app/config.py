@@ -58,6 +58,12 @@ class EntityAnalysisConfig:
 
 
 @dataclass
+class AggregationConfig:
+    sliding_window_hours: int  # env: SLIDING_WINDOW_HOURS (default 4)
+    event_max_timespan_hours: int  # env: EVENT_MAX_TIMESPAN_HOURS (default 24)
+
+
+@dataclass
 class AppConfig:
     db: DatabaseConfig
     http: HttpConfig
@@ -65,6 +71,7 @@ class AppConfig:
     redis: RedisConfig
     llm: LLMConfig
     entity_analysis: EntityAnalysisConfig
+    aggregation: AggregationConfig
 
 
 _config: AppConfig | None = None
@@ -120,6 +127,10 @@ def load_config() -> AppConfig:
             max_input_chars=int(os.environ.get("ENTITY_ANALYSIS_MAX_INPUT_CHARS", "30000")),
             sadi_api_url=os.environ.get("SADI_API_URL", "http://localhost:8000"),
             consumer_name=os.environ.get("HOSTNAME", "sapi-entity-analysis-1"),
+        ),
+        aggregation=AggregationConfig(
+            sliding_window_hours=int(os.environ.get("SLIDING_WINDOW_HOURS", "4")),
+            event_max_timespan_hours=int(os.environ.get("EVENT_MAX_TIMESPAN_HOURS", "24")),
         ),
     )
     return _config

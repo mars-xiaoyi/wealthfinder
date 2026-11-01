@@ -49,6 +49,8 @@ def load_config_defaults():
     assert config.entity_analysis.max_input_chars == 30000
     assert config.entity_analysis.sadi_api_url == "http://localhost:8000"
     assert config.entity_analysis.consumer_name == "sapi-entity-analysis-1"
+    assert config.aggregation.sliding_window_hours == 4
+    assert config.aggregation.event_max_timespan_hours == 24
 
 
 def load_config_overrides(monkeypatch):
@@ -70,6 +72,8 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("ENTITY_ANALYSIS_MAX_RETRY", "10")
     monkeypatch.setenv("SADI_API_URL", "http://sadi:8000")
     monkeypatch.setenv("HOSTNAME", "sapi-pod-7")
+    monkeypatch.setenv("SLIDING_WINDOW_HOURS", "6")
+    monkeypatch.setenv("EVENT_MAX_TIMESPAN_HOURS", "48")
 
     config = config_module.load_config()
 
@@ -91,6 +95,8 @@ def load_config_overrides(monkeypatch):
     assert config.entity_analysis.max_retry == 10
     assert config.entity_analysis.sadi_api_url == "http://sadi:8000"
     assert config.entity_analysis.consumer_name == "sapi-pod-7"
+    assert config.aggregation.sliding_window_hours == 6
+    assert config.aggregation.event_max_timespan_hours == 48
 
 
 @pytest.mark.parametrize("missing", list(REQUIRED_ENV))

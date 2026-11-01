@@ -4,6 +4,7 @@ from enum import StrEnum
 class ErrorCategory(StrEnum):
     """The part of SAPI an error was raised from. Every raise site sets one."""
 
+    AGGREGATION = "AGGREGATION"
     COMMON = "COMMON"
     CONFIG = "CONFIG"
     DB = "DB"
