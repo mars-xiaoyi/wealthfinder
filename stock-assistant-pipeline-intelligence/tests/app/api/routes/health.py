@@ -222,6 +222,26 @@ async def get_health_dependency_timeout(config, db, redis_stream, redis_state, c
             assert getattr(body, other) is ComponentStatus.OK
 
 
+async def get_health_all_dependencies_timeout(config, db, redis_stream, redis_state):
+    """The three checks run concurrently, so three hanging dependencies cost one timeout, not
+    three."""
+    config.health.check_timeout_s = 0.2
+    for component in COMPONENTS:
+        _probe(component, db, redis_stream, redis_state).side_effect = _hang_forever
+    response = Response()
+    loop = asyncio.get_running_loop()
+
+    started = loop.time()
+    body = await health.get_health(response)
+    elapsed_s = loop.time() - started
+
+    assert response.status_code == 503
+    assert body.status is HealthStatus.UNHEALTHY
+    for component in COMPONENTS:
+        assert getattr(body, component) is ComponentStatus.ERROR
+    assert 0.2 <= elapsed_s < 0.4
+
+
 async def get_health_database_timeout_cleanup_blocks(config, db):
     """A paused Postgres: the timed-out query's cancellation cleanup never finishes.
 

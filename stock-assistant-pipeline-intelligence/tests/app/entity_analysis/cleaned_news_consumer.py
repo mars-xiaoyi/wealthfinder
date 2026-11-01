@@ -532,3 +532,48 @@ async def start_article_waiting_for_slot_in_flight(redis_stream, service):
         _ack_call(MESSAGE_B),
         _ack_call(MESSAGE_C),
     ]
+
+
+async def start_loops_share_worker_pool(redis_stream, service):
+    """The consumer loop and the reclaim loop share one cap: a reclaimed message waits for a
+    slot while the read batch holds every slot."""
+    running = 0
+    peak = 0
+    batch_running = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _analyse(cleaned_id: UUID) -> list[EntityEvent]:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        if running == 2:
+            batch_running.set()
+        if cleaned_id != ID_C:
+            await release.wait()
+        running -= 1
+        return []
+
+    async def _claim(*args: object, **kwargs: object) -> list[ReclaimedMessage]:
+        if redis_stream.autoclaim.await_count == 1:
+            await batch_running.wait()
+            asyncio.get_running_loop().call_soon(release.set)
+            return [RECLAIMED_C]
+        raise asyncio.CancelledError
+
+    service.find_entity_events.side_effect = _analyse
+    redis_stream.read_from.side_effect = [[MESSAGE_A, MESSAGE_B], asyncio.CancelledError()]
+    redis_stream.autoclaim.side_effect = _claim
+    with mock.patch("asyncio.sleep", new=AsyncMock()):
+        await _new_consumer().start()
+
+    assert peak == 2
+    assert sorted(call.args[0] for call in service.find_entity_events.await_args_list) == [
+        ID_A,
+        ID_B,
+        ID_C,
+    ]
+    assert sorted(call.args[2] for call in redis_stream.ack.await_args_list) == [
+        MESSAGE_A.id,
+        MESSAGE_B.id,
+        MESSAGE_C.id,
+    ]
