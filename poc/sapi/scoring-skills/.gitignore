@@ -1,0 +1,4 @@
+.venv
+__pycache__/
+# article-derived spike output (entity summaries, raw responses)
+data/
