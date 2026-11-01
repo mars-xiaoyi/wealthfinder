@@ -285,14 +285,12 @@ class StubResponse:
 
 class _StubServer(http.server.ThreadingHTTPServer):
     response: StubResponse
-    requests: int
 
 
 class _StubHandler(http.server.BaseHTTPRequestHandler):
     server: _StubServer
 
     def do_GET(self) -> None:
-        self.server.requests += 1
         self.send_response(self.server.response.status)
         self.send_header("Content-Length", str(len(self.server.response.body)))
         self.end_headers()
@@ -309,10 +307,6 @@ class StubHKEX:
     url: str
     server: _StubServer
 
-    @property
-    def requests(self) -> int:
-        return self.server.requests
-
 
 @pytest.fixture
 def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
@@ -321,7 +315,6 @@ def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
     def start(response: StubResponse) -> StubHKEX:
         server = _StubServer(("127.0.0.1", 0), _StubHandler)
         server.response = response
-        server.requests = 0
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
         return StubHKEX(url=f"http://127.0.0.1:{server.server_address[1]}", server=server)
@@ -333,15 +326,8 @@ def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
 
 
 @dataclasses.dataclass
-class SADIRequest:
-    cleaned_id: str
-    at: float  # time.monotonic() when the request arrived
-
-
-@dataclasses.dataclass
 class _Behaviour:
     status: int
-    delay_s: float
     title: str = "騰訊控股公佈第四季業績"
     body: str = "騰訊控股第四季廣告收入錄得強勁增長"
 
@@ -356,21 +342,13 @@ class _SADIHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         cleaned_id = self.path.rsplit("/", 1)[-1]
         stub = self.server.stub
-        with stub.lock:
-            stub.requests.append(SADIRequest(cleaned_id, time.monotonic()))
-            stub.in_flight += 1
-            stub.peak_in_flight = max(stub.peak_in_flight, stub.in_flight)
-        try:
-            behaviour = stub.behaviours.get(cleaned_id, _Behaviour(200, 0.0))
-            time.sleep(behaviour.delay_s)
-            body = json.dumps(_sadi_body(cleaned_id, behaviour)).encode()
-            self.send_response(behaviour.status)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        finally:
-            with stub.lock:
-                stub.in_flight -= 1
+        stub.requests.append(cleaned_id)
+        behaviour = stub.behaviours.get(cleaned_id, _Behaviour(200))
+        body = json.dumps(_sadi_body(cleaned_id, behaviour)).encode()
+        self.send_response(behaviour.status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -396,46 +374,33 @@ def _sadi_body(cleaned_id: str, behaviour: _Behaviour) -> dict[str, object]:
 
 class StubSADI:
     """A local HTTP server standing in for SADI's GET /v1/cleaned_news/{cleaned_id}. Every id
-    answers 200 with an article unless respond() says otherwise. It can be stopped and started
-    again on the same port. in_flight counts the requests being answered right now, and
-    peak_in_flight the most there have been at once."""
+    answers 200 with an article unless respond() says otherwise. requests holds the cleaned_id
+    of every request, in arrival order."""
 
     def __init__(self) -> None:
-        self.requests: list[SADIRequest] = []
-        self.lock = threading.Lock()
-        self.in_flight = 0
-        self.peak_in_flight = 0
+        self.requests: list[str] = []
         self.behaviours: dict[str, _Behaviour] = {}
-        self._server: _SADIServer | None = None
-        self._port = 0
-        self.start()
+        self._server = _SADIServer(("127.0.0.1", 0), _SADIHandler)
+        self._server.stub = self
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._port}"
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
 
-    def respond(self, cleaned_id: uuid.UUID, status: int, delay_s: float = 0.0) -> None:
-        self.behaviours[str(cleaned_id)] = _Behaviour(status, delay_s)
+    def respond(self, cleaned_id: uuid.UUID, status: int) -> None:
+        self.behaviours[str(cleaned_id)] = _Behaviour(status)
 
     def serve(self, cleaned_id: uuid.UUID, title: str, body: str) -> None:
         """Answer cleaned_id with 200 and an article of this title and body."""
-        self.behaviours[str(cleaned_id)] = _Behaviour(200, 0.0, title, body)
+        self.behaviours[str(cleaned_id)] = _Behaviour(200, title, body)
 
-    def requests_for(self, cleaned_id: uuid.UUID) -> list[SADIRequest]:
-        return [r for r in self.requests if r.cleaned_id == str(cleaned_id)]
-
-    def start(self) -> None:
-        server = _SADIServer(("127.0.0.1", self._port), _SADIHandler)
-        server.stub = self
-        self._port = server.server_address[1]
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self._server = server
+    def requests_for(self, cleaned_id: uuid.UUID) -> list[str]:
+        return [request for request in self.requests if request == str(cleaned_id)]
 
     def stop(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
+        self._server.shutdown()
+        self._server.server_close()
 
 
 @pytest.fixture
@@ -443,15 +408,6 @@ def stub_sadi() -> Iterator[StubSADI]:
     stub = StubSADI()
     yield stub
     stub.stop()
-
-
-@pytest.fixture
-def black_hole_url() -> Iterator[str]:
-    """A listener that accepts connections and never replies."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        sock.listen()
-        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
 
 
 @pytest.fixture

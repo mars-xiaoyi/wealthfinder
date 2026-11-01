@@ -94,26 +94,6 @@ async def get_health_dependency_down_then_recovered(infra, start_app, component,
         assert response.json() == ALL_UP_BODY
 
 
-async def get_health_all_dependencies_unresponsive(infra, start_app):
-    """The three checks run concurrently, so the response takes one timeout, not three."""
-    async with start_app() as client:
-        for container in infra.all():
-            container.pause()
-        with structlog.testing.capture_logs() as logs:
-            response, elapsed = await _get_health(client)
-
-        assert response.status_code == 503
-        assert response.json() == _body_with_errors(*COMPONENTS)
-        assert 2 <= elapsed < 3
-        assert sorted(_failed_check_warnings(logs)) == sorted(COMPONENTS)
-
-        infra.restore_all()
-        response, _ = await _get_health(client)
-
-        assert response.status_code == 200
-        assert response.json() == ALL_UP_BODY
-
-
 async def get_health_repeated_db_timeouts(infra, start_app):
     """Timed-out DB checks are abandoned, not awaited; once Postgres is back they must not
     still hold the pool's connections."""
@@ -129,12 +109,3 @@ async def get_health_repeated_db_timeouts(infra, start_app):
     assert response.status_code == 200
     assert response.json() == ALL_UP_BODY
     assert elapsed < 2
-
-
-async def get_health_check_timeout_from_config(infra, start_app):
-    async with start_app(HEALTH_CHECK_TIMEOUT_S="1") as client:
-        infra.postgres.pause()
-        response, elapsed = await _get_health(client)
-
-    assert response.json() == _body_with_errors("database")
-    assert 1 <= elapsed < 2

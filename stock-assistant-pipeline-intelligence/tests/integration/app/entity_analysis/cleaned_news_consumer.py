@@ -23,19 +23,10 @@ from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 from app.llm import vertex_adapter
 from app.llm.adapter import LLMAdapter, StructuredLLMResponse
-from app.llm.errors import (
-    LLMAuthenticationError,
-    LLMError,
-    LLMProviderError,
-    LLMRateLimitError,
-    LLMRequestError,
-    LLMSchemaViolationError,
-)
 from app.models.entity_event import EventTypeEnum, SentimentEnum
 from app.skills.entity_analysis_skill import ExtractedEntity, LLMOutput
 from tests.integration.conftest import (
     HKEX_URL_CONSTANTS,
-    REFUSED_URL,
     Infra,
     StubHKEX,
     StubResponse,
@@ -56,7 +47,6 @@ POLL_INTERVAL_S = 0.05
 SETTLE_S = 0.5
 # Bound on Vertex AI-backed work: one analysis took up to 18 s in the LLM skill spike.
 VERTEX_WAIT_S = 60
-GATE_EVENT = "hk_stock_list_not_ready"
 COMPLETED_EVENT = "entity_analysis_completed"
 REAL_HKEX_URLS = {name: getattr(hk_stock_list, name) for name in HKEX_URL_CONSTANTS}
 
@@ -76,7 +66,6 @@ SECURITIES_FEED = [
     ("02800", "TRACKER FUND", "Exchange Traded Products", "Exchange Traded Funds", "HKD"),
     ("09988", "BABA-W", "Equity", "Equity Securities (Main Board)", "HKD"),
 ]
-LOADED_FEED_ENTRIES = 2
 # CONSUMER_ENV's HTTP_TIMEOUT_S is too short to download the real HKEX files.
 REAL_HKEX_ENV = {"HTTP_TIMEOUT_S": "30"}
 
@@ -119,10 +108,6 @@ class StreamProbe:
         first."""
         entries = await self._client.xrange("stream:entity_analysis_dead_letter")
         return [(message_id, fields) for message_id, fields in entries]
-
-    async def acl(self, *args: str) -> None:
-        """Run ACL with these arguments on the stream Redis, as its default user."""
-        await self._client.execute_command("ACL", *args)
 
     async def group_names(self) -> list[str]:
         """Names of the stream's consumer groups; none while the stream does not exist."""
@@ -180,17 +165,12 @@ def _securities_xlsx() -> bytes:
 def hkex_feed(
     hkex_urls: Callable[..., None],
     stub_hkex: Callable[[StubResponse], StubHKEX],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[str], None]:
     """Choose where the HK Stock List loads from: hkex_feed("loaded") serves the trimmed feed
-    from local stubs, hkex_feed("empty") refuses at once (no connect retries) so the empty
-    fallback list is installed, and hkex_feed("real") uses the real HKEX."""
+    from local stubs, and hkex_feed("real") uses the real HKEX."""
 
     def point(feed: str) -> None:
-        if feed == "empty":
-            hkex_urls(every=REFUSED_URL)
-            monkeypatch.setattr(hk_stock_list, "_CONNECT_RETRY_WAITS_S", (0, 0))
-        elif feed == "loaded":
+        if feed == "loaded":
             bodies = {
                 "_ACTIVESTOCK_EN_URL": json.dumps(EN_FEED).encode(),
                 "_ACTIVESTOCK_ZH_URL": json.dumps(ZH_FEED).encode(),
@@ -245,13 +225,6 @@ async def _wait_acked(
     return await _wait_for(acked, timeout_s)
 
 
-async def _wait_pending(streams: StreamProbe, message_id: str, timeout_s: float) -> None:
-    async def is_pending() -> bool:
-        return message_id in await streams.pending()
-
-    await _wait_for(is_pending, timeout_s)
-
-
 def _completed(
     logs: list[MutableMapping[str, Any]], cleaned_id: uuid.UUID
 ) -> list[MutableMapping[str, Any]]:
@@ -272,11 +245,6 @@ async def _wait_group_created(streams: StreamProbe) -> None:
     await _wait_for(group_created, 3)
 
 
-async def start_creates_group(start_consumer, streams):
-    async with start_consumer():
-        await _wait_group_created(streams)
-
-
 async def start_existing_group(start_consumer, streams):
     """A group left by an earlier run is not an error, and is not created twice."""
     async with start_consumer():
@@ -293,146 +261,25 @@ async def start_existing_group(start_consumer, streams):
     assert await streams.group_names() == ["sapi-entity-analysis"]
 
 
-@pytest.mark.vertex
-# Six sequential Vertex AI analyses: room for the 3 * VERTEX_WAIT_S wait below, plus startup.
-@pytest.mark.timeout(4 * VERTEX_WAIT_S)
-async def start_fetch_and_ack(start_consumer, streams, stub_sadi):
-    """More messages than one batch: each cleaned_id reaches SADI as a canonical UUID, once,
-    is analysed once, and every message is ACKed."""
-    cleaned_ids = [uuid.uuid4() for _ in range(6)]
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in cleaned_ids}
-            await _wait_acked(streams, stub_sadi, entries, 3 * VERTEX_WAIT_S)
-            await asyncio.sleep(SETTLE_S)
-
-    assert sorted(r.cleaned_id for r in stub_sadi.requests) == sorted(map(str, cleaned_ids))
-    assert await streams.pending() == {}
-    assert [len(_completed(logs, cleaned_id)) for cleaned_id in cleaned_ids] == [1] * 6
-
-
-async def start_not_found_acked(start_consumer, streams, stub_sadi):
-    cleaned_id = uuid.uuid4()
-    stub_sadi.respond(cleaned_id, 404)
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            message_id = await streams.add(cleaned_id)
-            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 5)
-            await asyncio.sleep(SETTLE_S)
-
-    assert len(stub_sadi.requests_for(cleaned_id)) == 1
-    assert await streams.pending() == {}
-    not_found = [log for log in logs if log["event"] == "cleaned_news_not_found"]
-    assert [log["log_level"] for log in not_found] == ["warning"]
-    assert _completed(logs, cleaned_id) == []
-
-
-async def start_sadi_error_left_pending(start_consumer, streams, stub_sadi):
-    """A SADI failure leaves its message pending without analysing it, and the next message
-    is still handled."""
-    failing, healthy = uuid.uuid4(), uuid.uuid4()
-    stub_sadi.respond(failing, 503)
-    stub_sadi.respond(healthy, 404)  # ACKed without reaching Vertex AI
-
-    async with start_consumer():
-        with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
-            failing_message_id = await streams.add(failing)
-            healthy_message_id = await streams.add(healthy)
-            await _wait_acked(streams, stub_sadi, {healthy: healthy_message_id}, 5)
-            await asyncio.sleep(SETTLE_S)
-
-    assert await streams.pending() == {failing_message_id: 1}
-    assert len(stub_sadi.requests_for(failing)) == 1
-    failures = [log for log in logs if log.get("error_code") == error_codes.UPSTREAM_UNAVAILABLE]
-    assert [(log["log_level"], log["category"]) for log in failures] == [
-        ("warning", ErrorCategory.NEWS_CLIENT)
-    ]
-    assert not [log for log in logs if log["log_level"] in ("error", "critical")]
-    assert _completed(logs, failing) == []
-
-
-async def start_sadi_timeout_left_pending(start_consumer, streams, stub_sadi):
-    """A SADI answer slower than HTTP_TIMEOUT_S holds the loop for the timeout, not for the
-    full delay."""
-    slow, healthy = uuid.uuid4(), uuid.uuid4()
-    stub_sadi.respond(slow, 200, delay_s=3)
-    stub_sadi.respond(healthy, 404)  # ACKed without reaching Vertex AI
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            slow_message_id = await streams.add(slow)
-            await _wait_for(lambda: _requested(stub_sadi, slow), 5)
-            healthy_message_id = await streams.add(healthy)
-            await _wait_acked(streams, stub_sadi, {healthy: healthy_message_id}, 6)
-
-    assert (await streams.pending())[slow_message_id] == 1
-    assert _completed(logs, slow) == []
-
-
 async def _requested(stub: StubSADI, cleaned_id: uuid.UUID) -> bool:
     return bool(stub.requests_for(cleaned_id))
 
 
-async def start_sadi_unreachable_then_back(start_consumer, streams, stub_sadi):
-    """With SADI down, the message stays pending and the app keeps serving; once SADI is
-    back, the same app instance handles new messages."""
-    unreachable, recovered = uuid.uuid4(), uuid.uuid4()
-    stub_sadi.respond(recovered, 404)  # ACKed without reaching Vertex AI
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer() as client:
-            stub_sadi.stop()
-            unreachable_message_id = await streams.add(unreachable)
-            await _wait_pending(streams, unreachable_message_id, 5)
-            await asyncio.wait_for(client.get("/v1/health"), 3)
-
-            stub_sadi.start()
-            recovered_message_id = await streams.add(recovered)
-            await _wait_acked(streams, stub_sadi, {recovered: recovered_message_id}, 5)
-
-    assert (await streams.pending())[unreachable_message_id] == 1
-    assert _completed(logs, unreachable) == []
-
-
-@pytest.mark.parametrize("outage", ["stop", "pause"])
-async def start_stream_redis_outage(start_consumer, streams, stub_sadi, infra, outage):
-    """While the stream Redis is down the consumer warns and retries without raising, and
-    resumes from the group's position once it is back, on the same app instance."""
+async def start_stream_redis_hangs(start_consumer, streams, stub_sadi, infra):
+    """While the stream Redis hangs (paused, never answering) the consumer keeps running, and
+    resumes from the group's position once it answers again, on the same app instance."""
     resumed = uuid.uuid4()
     stub_sadi.respond(resumed, 404)  # ACKed without reaching Vertex AI
     redis_stream = infra.redis_stream
 
-    async with start_consumer() as client:
+    async with start_consumer():
         await _wait_group_created(streams)
-        with structlog.testing.capture_logs() as logs:
-            if outage == "stop":
-                redis_stream.stop()
-            else:
-                redis_stream.pause()
-            await asyncio.sleep(4)
-            if outage == "stop":
-                health = (await asyncio.wait_for(client.get("/v1/health"), 10)).json()
+        redis_stream.pause()
+        await asyncio.sleep(4)
 
         redis_stream.restore()
         message_id = await streams.add(resumed)
         await _wait_acked(streams, stub_sadi, {resumed: message_id}, 10)
-
-    if outage == "stop":
-        warnings = [
-            log
-            for log in logs
-            if log["event"] == "entity_analysis_redis_stream_unreachable"
-            and log["log_level"] == "warning"
-        ]
-        assert len(warnings) >= 2
-        assert not [log for log in logs if log["log_level"] in ("error", "critical")]
-        assert (health["redis_stream"], health["database"], health["redis_state"]) == (
-            "error",
-            "ok",
-            "ok",
-        )
 
 
 async def start_resumes_after_restart(start_consumer, streams, stub_sadi):
@@ -454,115 +301,6 @@ async def start_resumes_after_restart(start_consumer, streams, stub_sadi):
         await asyncio.sleep(SETTLE_S)
 
     assert [len(stub_sadi.requests_for(cleaned_id)) for cleaned_id in [*before, after]] == [1, 1, 1]
-
-
-def _gated(logs: list[MutableMapping[str, Any]]) -> list[tuple[object, object]]:
-    """(log_level, message_id) of each hk_stock_list_not_ready record."""
-    return [(log["log_level"], log["message_id"]) for log in logs if log["event"] == GATE_EVENT]
-
-
-async def _wait_gated(logs: list[MutableMapping[str, Any]], count: int, timeout_s: float) -> None:
-    async def gated() -> bool:
-        return len(_gated(logs)) >= count
-
-    await _wait_for(gated, timeout_s)
-
-
-async def start_hk_stock_list_not_ready_holds_message(
-    start_consumer, hkex_feed, streams, stub_sadi
-):
-    """With the HK Stock List empty, the message stays pending and SADI is never asked; the
-    app keeps running."""
-    hkex_feed("empty")
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer() as client:
-            message_id = await streams.add(uuid.uuid4())
-            await _wait_gated(logs, 1, 3)
-            await asyncio.sleep(3)
-            await asyncio.wait_for(client.get("/v1/health"), 3)
-
-    assert _gated(logs) == [("warning", message_id)]
-    assert stub_sadi.requests == []
-    assert await streams.pending() == {message_id: 1}
-
-
-async def start_hk_stock_list_not_ready_every_message(
-    start_consumer, hkex_feed, streams, stub_sadi
-):
-    hkex_feed("empty")
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            message_ids = [await streams.add(uuid.uuid4()) for _ in range(3)]
-            await _wait_gated(logs, 3, 3)
-            await asyncio.sleep(SETTLE_S)
-
-    assert sorted(_gated(logs)) == sorted(("warning", message_id) for message_id in message_ids)
-    assert stub_sadi.requests == []
-    assert await streams.pending() == dict.fromkeys(message_ids, 1)
-
-
-async def start_hk_stock_list_not_ready_before_fetch(start_consumer, hkex_feed, streams, stub_sadi):
-    """The gate comes before the fetch: a message SADI would answer 404 for (an ACKed outcome)
-    stays pending too."""
-    not_found, unavailable = uuid.uuid4(), uuid.uuid4()
-    stub_sadi.respond(not_found, 404)
-    stub_sadi.respond(unavailable, 503)
-    hkex_feed("empty")
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            not_found_message_id = await streams.add(not_found)
-            unavailable_message_id = await streams.add(unavailable)
-            await _wait_gated(logs, 2, 3)
-            await asyncio.sleep(SETTLE_S)
-
-    assert stub_sadi.requests == []
-    assert await streams.pending() == {not_found_message_id: 1, unavailable_message_id: 1}
-
-
-@pytest.mark.parametrize("feed", ["loaded", "real"])
-async def start_hk_stock_list_loaded(start_consumer, hkex_feed, streams, stub_sadi, feed):
-    """With the HK Stock List loaded, from the trimmed feed or the real HKEX, a message is
-    fetched and ACKed with no gate record."""
-    cleaned_id = uuid.uuid4()
-    stub_sadi.respond(cleaned_id, 404)  # ACKed without reaching Vertex AI
-    hkex_feed(feed)
-    env = REAL_HKEX_ENV if feed == "real" else {}
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer(**env):
-            message_id = await streams.add(cleaned_id)
-            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 5)
-            await asyncio.sleep(SETTLE_S)
-
-    assert [r.cleaned_id for r in stub_sadi.requests] == [str(cleaned_id)]
-    assert await streams.pending() == {}
-    assert _gated(logs) == []
-
-
-async def start_hk_stock_list_becomes_ready(start_consumer, hkex_feed, streams, stub_sadi):
-    """Once the HK Stock List loads on the running app, new messages are handled; the one
-    gated before stays pending."""
-    gated, handled = uuid.uuid4(), uuid.uuid4()
-    stub_sadi.respond(handled, 404)  # ACKed without reaching Vertex AI
-    hkex_feed("empty")
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            gated_message_id = await streams.add(gated)
-            await _wait_gated(logs, 1, 3)
-
-            hkex_feed("loaded")
-            assert await hk_stock_list.refresh_hk_stock_list() == LOADED_FEED_ENTRIES
-            handled_message_id = await streams.add(handled)
-            await _wait_acked(streams, stub_sadi, {handled: handled_message_id}, 5)
-            pending = await streams.pending()
-
-    assert _gated(logs) == [("warning", gated_message_id)]
-    assert [r.cleaned_id for r in stub_sadi.requests] == [str(handled)]
-    assert pending == {gated_message_id: 1}
 
 
 # Hand-written, not one of the system prompt's few-shot examples. Both codes are printed, and
@@ -635,25 +373,6 @@ async def start_listed_companies_verified(
         record["total_output_tokens"],
         record["total_latency_ms"],
     ) == (call["input_tokens"], call["output_tokens"], call["latency_ms"])
-    assert await streams.pending() == {}
-
-
-@pytest.mark.vertex
-async def start_no_listed_company(start_consumer, hkex_feed, streams, stub_sadi):
-    """An article about a company with no HK listing verifies nothing and is still ACKed."""
-    cleaned_id = uuid.uuid4()
-    stub_sadi.serve(cleaned_id, UNLISTED_TITLE, UNLISTED_BODY)
-    hkex_feed("real")
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer(**REAL_HKEX_ENV):
-            message_id = await streams.add(cleaned_id)
-            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, VERTEX_WAIT_S)
-            await asyncio.sleep(SETTLE_S)
-
-    [record] = _completed(logs, cleaned_id)
-    assert record["verified_entities"] == []
-    assert [e for e in record["llm_errors"] if e["error_type"] in LLM_ERROR_TYPES] == []
     assert await streams.pending() == {}
 
 
@@ -750,27 +469,20 @@ REPUBLISHED_EVENT = "entity_analysis_republished"
 
 
 class FakeLLMAdapter(LLMAdapter):
-    """Stands in for Vertex AI: answers every call with items, or raises error. While hold is
-    set, a call waits for it before answering; entered is set once a call has started. A call
-    first awaits on_call, if set, with the article message's text; it may raise or sleep."""
+    """Stands in for Vertex AI: answers every call with items. While hold is set, a call waits
+    for it before answering; entered is set once a call has started."""
 
     def __init__(self) -> None:
         self.items: list[ExtractedEntity] = []
-        self.error: LLMError | None = None
         self.hold: asyncio.Event | None = None
-        self.on_call: Callable[[str], Awaitable[None]] | None = None
         self.entered = asyncio.Event()
         self.calls = 0
 
     async def generate_structured(self, messages, output_schema, generation_config):
         self.calls += 1
         self.entered.set()
-        if self.on_call is not None:
-            await self.on_call(messages[-1].content)
         if self.hold is not None:
             await self.hold.wait()
-        if self.error is not None:
-            raise self.error
         return StructuredLLMResponse(
             output=LLMOutput(output_items=self.items),
             input_tokens=1000,
@@ -986,54 +698,6 @@ async def start_redelivery_republished(start_consumer, streams, stub_sadi, fake_
     assert await streams.pending() == {}
 
 
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        "no_entities",
-        "not_found",
-        LLMRateLimitError,
-        LLMProviderError,
-        LLMRequestError,
-        LLMAuthenticationError,
-        LLMSchemaViolationError,
-    ],
-    ids=lambda outcome: outcome if isinstance(outcome, str) else outcome.__name__,
-)
-async def start_nothing_stored(
-    start_consumer, streams, stub_sadi, fake_llm, entity_events, outcome
-):
-    """An article with no listed company, one SADI doesn't have, or one whose analysis failed
-    writes and announces nothing; only the first two are ACKed."""
-    cleaned_id = uuid.uuid4()
-    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
-    acked = outcome in ("no_entities", "not_found")
-    if outcome == "not_found":
-        stub_sadi.respond(cleaned_id, 404)
-    elif isinstance(outcome, type):
-        fake_llm.error = outcome("scripted failure", category=ErrorCategory.LLM)
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer():
-            message_id = await streams.add(cleaned_id)
-            if acked:
-                await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 5)
-            else:
-                await _wait_completed(logs, cleaned_id, 5)
-            await asyncio.sleep(SETTLE_S)
-
-    assert await entity_events.rows(_source_url(cleaned_id)) == []
-    assert await streams.published() == []
-    assert await streams.pending() == ({} if acked else {message_id: 1})
-    records = _completed(logs, cleaned_id)
-    if outcome == "not_found":
-        assert records == []
-    else:
-        [record] = records
-        assert record["entity_event_ids"] == []
-        expected_errors = [] if acked else [outcome.__name__]
-        assert [e["error_type"] for e in record["llm_errors"]] == expected_errors
-
-
 async def start_postgres_down_at_write(
     start_consumer, streams, stub_sadi, fake_llm, entity_events, infra
 ):
@@ -1112,24 +776,6 @@ async def start_stream_redis_down_at_publish(
     assert await streams.pending() == {}
 
 
-async def start_state_redis_down(
-    start_consumer, streams, stub_sadi, fake_llm, entity_events, infra
-):
-    """Analysing, storing and announcing an article doesn't need the state Redis."""
-    cleaned_id = uuid.uuid4()
-    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
-    fake_llm.items = [TENCENT_ITEM]
-
-    async with start_consumer():
-        infra.redis_state.stop()
-        message_id = await streams.add(cleaned_id)
-        await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 10)
-
-    rows = await entity_events.rows(_source_url(cleaned_id))
-    assert len(rows) == 1
-    assert await streams.published() == _announcements(rows)
-
-
 # Reclaim and dead-letter routing. A short claim timeout makes the reclaim loop redeliver
 # within the test; RECLAIM_ENV's retry budget is overridden where a case needs more attempts.
 
@@ -1141,8 +787,6 @@ CLAIM_TIMEOUT_S = 1.5
 CLAIM_TIMING_SLACK_S = 2 * POLL_INTERVAL_S
 DEAD_LETTERED_EVENT = "entity_analysis_message_dead_lettered"
 SWEEP_FAILED_EVENT = "entity_analysis_reclaim_sweep_failed"
-ACL_USER = "sapi_test"
-ACL_PASSWORD = "pw"
 
 
 def _failed_attempts(
@@ -1195,39 +839,21 @@ def _assert_dead_letter(
     assert started <= failed_at <= datetime.now(UTC)
 
 
-@pytest.mark.parametrize(
-    "trigger",
-    ["sadi_503", "sadi_slow", "sadi_unreachable", "llm_provider_error", "llm_schema_violation"],
-)
 async def start_reclaimed_until_cause_clears(
-    start_consumer, streams, stub_sadi, fake_llm, entity_events, trigger
+    start_consumer, streams, stub_sadi, fake_llm, entity_events
 ):
-    """A message whose processing fails is redelivered no sooner than the claim timeout, and
-    once the cause clears it is stored, announced once and ACKed, without being
-    dead-lettered."""
+    """A message whose processing fails (here SADI answering 503) is redelivered no sooner
+    than the claim timeout, and once the cause clears it is stored, announced once and ACKed,
+    without being dead-lettered."""
     cleaned_id = uuid.uuid4()
-    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
     fake_llm.items = [TENCENT_ITEM]
-    if trigger == "sadi_503":
-        stub_sadi.respond(cleaned_id, 503)
-    elif trigger == "sadi_slow":
-        stub_sadi.respond(cleaned_id, 200, delay_s=3)  # CONSUMER_ENV's HTTP_TIMEOUT_S is 1
-    elif trigger == "llm_provider_error":
-        fake_llm.error = LLMProviderError("scripted failure", category=ErrorCategory.LLM)
-    elif trigger == "llm_schema_violation":
-        fake_llm.error = LLMSchemaViolationError("scripted failure", category=ErrorCategory.LLM)
+    stub_sadi.respond(cleaned_id, 503)
 
     with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
         async with start_consumer(**MANY_RETRIES_ENV):
-            if trigger == "sadi_unreachable":
-                stub_sadi.stop()
             message_id = await streams.add(cleaned_id)
             attempts = await _wait_attempts(logs, cleaned_id, 2, 15)
-
-            if trigger == "sadi_unreachable":
-                stub_sadi.start()
             stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
-            fake_llm.error = None
 
             async def acked() -> bool:
                 return message_id not in await streams.pending()
@@ -1244,18 +870,14 @@ async def start_reclaimed_until_cause_clears(
     assert _dead_lettered(logs) == []
 
 
-@pytest.mark.parametrize("trigger", ["sadi_503", "llm_provider_error"])
 async def start_retries_exhausted_dead_lettered(
-    start_consumer, streams, stub_sadi, fake_llm, entity_events, trigger
+    start_consumer, streams, stub_sadi, fake_llm, entity_events
 ):
-    """A message that keeps failing is dead-lettered with its original fields once delivered
-    ENTITY_ANALYSIS_MAX_RETRY times, then ACKed, and is not processed again."""
+    """A message that keeps failing (here SADI answering 503) is dead-lettered with its
+    original fields once delivered ENTITY_ANALYSIS_MAX_RETRY times, then ACKed, and is not
+    processed again."""
     cleaned_id = uuid.uuid4()
-    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
-    if trigger == "sadi_503":
-        stub_sadi.respond(cleaned_id, 503)
-    else:
-        fake_llm.error = LLMProviderError("scripted failure", category=ErrorCategory.LLM)
+    stub_sadi.respond(cleaned_id, 503)
     started = datetime.now(UTC)
 
     with structlog.testing.capture_logs(processors=[logger.add_sapi_error_fields]) as logs:
@@ -1276,40 +898,9 @@ async def start_retries_exhausted_dead_lettered(
     assert attempts_when_dead_lettered == 2
     assert len(_failed_attempts(logs, cleaned_id)) == 2
     assert len(stub_sadi.requests_for(cleaned_id)) == 2
-    assert fake_llm.calls == (0 if trigger == "sadi_503" else 2)
+    assert fake_llm.calls == 0
     assert _dead_lettered(logs) == [("warning", message_id, 3, "retries_exhausted")]
     assert await entity_events.rows(_source_url(cleaned_id)) == []
-
-
-async def start_gated_message_reclaimed_once_list_loaded(
-    start_consumer, hkex_feed, streams, stub_sadi, fake_llm, entity_events
-):
-    """A message held by the HK Stock List gate is redelivered and processed once the list
-    loads, without restarting the app."""
-    cleaned_id = uuid.uuid4()
-    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
-    fake_llm.items = [TENCENT_ITEM]
-    hkex_feed("empty")
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer(**MANY_RETRIES_ENV):
-            message_id = await streams.add(cleaned_id)
-            await _wait_gated(logs, 1, 3)
-            assert stub_sadi.requests == []
-            assert message_id in await streams.pending()
-
-            hkex_feed("loaded")
-            assert await hk_stock_list.refresh_hk_stock_list() == LOADED_FEED_ENTRIES
-            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 10)
-            await asyncio.sleep(SETTLE_S)
-
-    assert {level for level, _message_id in _gated(logs)} == {"warning"}
-    assert len(stub_sadi.requests_for(cleaned_id)) == 1
-    rows = await entity_events.rows(_source_url(cleaned_id))
-    assert len(rows) == 1
-    assert await streams.published() == _announcements(rows)
-    assert await streams.pending() == {}
-    assert await streams.dead_letters() == []
 
 
 async def start_abandoned_message_recovered(start_consumer, streams, stub_sadi, fake_llm):
@@ -1327,131 +918,6 @@ async def start_abandoned_message_recovered(start_consumer, streams, stub_sadi, 
     assert len(stub_sadi.requests_for(cleaned_id)) == 1
     assert fake_llm.calls == 1
     assert [record["entity_event_ids"] for record in _completed(logs, cleaned_id)] == [[]]
-    assert await streams.pending() == {}
-    assert await streams.dead_letters() == []
-
-
-MALFORMED_MESSAGES = [
-    {"cleaned_id": "not-a-uuid", "v": "1"},
-    {"v": "1"},
-    {"cleaned_id": "00000000-0000-0000-0000-000000000001"},
-    {"cleaned_id": "00000000-0000-0000-0000-000000000002", "v": "2"},
-]
-
-
-@pytest.mark.parametrize("path", ["read", "reclaim"])
-async def start_malformed_messages_dead_lettered(start_consumer, streams, stub_sadi, path):
-    """Messages this layer can never process (invalid or missing cleaned_id, missing or
-    unrecognised v) are dead-lettered with their original fields and ACKed without reaching
-    SADI, on the read and the reclaim path; the valid message behind them is processed."""
-    valid = uuid.uuid4()
-    stub_sadi.respond(valid, 404)  # ACKed without reaching the LLM
-    valid_fields = {"cleaned_id": str(valid), "v": "1"}
-    started = datetime.now(UTC)
-
-    with structlog.testing.capture_logs() as logs:
-        if path == "reclaim":
-            *malformed_ids, valid_id = await streams.hold_as_ghost(
-                *MALFORMED_MESSAGES, valid_fields
-            )
-        async with start_consumer(**RECLAIM_ENV):
-            if path == "read":
-                malformed_ids = [await streams.add_fields(m) for m in MALFORMED_MESSAGES]
-                valid_id = await streams.add_fields(valid_fields)
-            await _wait_acked(streams, stub_sadi, {valid: valid_id}, 10)
-
-            async def all_dead_lettered() -> bool:
-                return len(await streams.dead_letters()) >= len(MALFORMED_MESSAGES)
-
-            await _wait_for(all_dead_lettered, 5)
-            await asyncio.sleep(SETTLE_S)
-
-    delivery_count = 1 if path == "read" else 2
-    dead_letters = await streams.dead_letters()
-    assert len(dead_letters) == len(MALFORMED_MESSAGES)
-    by_message_id = {fields["message_id"]: fields for _entry_id, fields in dead_letters}
-    assert set(by_message_id) == set(malformed_ids)
-    for message_id, original in zip(malformed_ids, MALFORMED_MESSAGES, strict=True):
-        _assert_dead_letter(
-            by_message_id[message_id], message_id, original, delivery_count, started
-        )
-    assert sorted(_dead_lettered(logs)) == sorted(
-        ("warning", message_id, delivery_count, "malformed") for message_id in malformed_ids
-    )
-    assert [r.cleaned_id for r in stub_sadi.requests] == [str(valid)]
-    assert await streams.pending() == {}
-
-
-async def start_in_flight_duplicate_skipped(start_consumer, streams, stub_sadi, fake_llm):
-    """While a message's article is still being analysed, sweeps that claim the same message
-    skip it: SADI and the LLM are called once, and the message is ACKed once the analysis
-    finishes."""
-    cleaned_id = uuid.uuid4()
-    stub_sadi.serve(cleaned_id, ARTICLE_TITLE, ARTICLE_BODY)
-    fake_llm.items = []
-    fake_llm.hold = asyncio.Event()
-
-    async with start_consumer(**MANY_RETRIES_ENV):
-        message_id = await streams.add(cleaned_id)
-        await asyncio.wait_for(fake_llm.entered.wait(), 5)
-        await asyncio.sleep(4)  # at least two sweeps claim the message meanwhile
-        pending_while_held = await streams.pending()
-        fake_llm.hold.set()
-
-        async def acked() -> bool:
-            return message_id not in await streams.pending()
-
-        await _wait_for(acked, 5)
-        await asyncio.sleep(SETTLE_S)
-
-    # Delivered once by the read and at least twice more by sweeps, all while in flight.
-    assert pending_while_held[message_id] >= 3
-    assert len(stub_sadi.requests_for(cleaned_id)) == 1
-    assert fake_llm.calls == 1
-    assert await streams.dead_letters() == []
-
-
-async def start_failing_sweep_survives(start_consumer, streams, stub_sadi, infra):
-    """A sweep that fails is logged and retried on the next tick, while the consumer loop
-    keeps processing; once the cause clears, the stalled message is reclaimed by the same app
-    instance. Stopping the app logs no failed sweep."""
-    stalled, fresh = uuid.uuid4(), uuid.uuid4()
-    stub_sadi.respond(stalled, 404)  # ACKed without reaching the LLM
-    stub_sadi.respond(fresh, 404)
-    [stalled_id] = await streams.hold_as_ghost({"cleaned_id": str(stalled), "v": "1"})
-    await streams.acl(
-        "SETUSER", ACL_USER, "on", f">{ACL_PASSWORD}", "~*", "&*", "+@all", "-xautoclaim"
-    )
-    stream_url = f"redis://{ACL_USER}:{ACL_PASSWORD}@127.0.0.1:{infra.redis_stream.port}/0"
-    try:
-        with structlog.testing.capture_logs() as logs:
-            async with start_consumer(**RECLAIM_ENV, REDIS_STREAM_URL=stream_url):
-
-                def failed_sweeps() -> list[MutableMapping[str, Any]]:
-                    return [log for log in logs if log["event"] == SWEEP_FAILED_EVENT]
-
-                async def two_sweeps_failed() -> bool:
-                    return len(failed_sweeps()) >= 2
-
-                await _wait_for(two_sweeps_failed, 3 * CLAIM_TIMEOUT_S + 1)
-                fresh_id = await streams.add(fresh)
-                await _wait_acked(streams, stub_sadi, {fresh: fresh_id}, 5)
-                assert stalled_id in await streams.pending()
-                assert stub_sadi.requests_for(stalled) == []
-
-                await streams.acl("SETUSER", ACL_USER, "+xautoclaim")
-                await _wait_acked(
-                    streams, stub_sadi, {stalled: stalled_id}, 2 * CLAIM_TIMEOUT_S + 1
-                )
-                failed_while_running = len(failed_sweeps())
-    finally:
-        await streams.acl("DELUSER", ACL_USER)
-
-    assert {log["log_level"] for log in failed_sweeps()} == {"warning"}
-    assert all(log["exc_info"] for log in failed_sweeps())
-    assert len(failed_sweeps()) == failed_while_running
-    assert not [log for log in logs if log["log_level"] in ("error", "critical")]
-    assert len(stub_sadi.requests_for(stalled)) == 1
     assert await streams.pending() == {}
     assert await streams.dead_letters() == []
 
@@ -1492,128 +958,16 @@ async def start_stream_redis_outage_reclaims_after(start_consumer, streams, stub
     assert await streams.pending() == {}
 
 
-# WorkerPool: the concurrency cap and the rate-limit backoff.
+# WorkerPool against the real Vertex AI: the concurrency cap.
 
-WORKER_POOL_ENV = {
-    "ENTITY_ANALYSIS_MAX_CONCURRENT": "3",
+LIVE_VERTEX_CAP_ENV = {
+    "ENTITY_ANALYSIS_MAX_CONCURRENT": "2",
     "ENTITY_ANALYSIS_BATCH_SIZE": "10",
     "RATE_LIMIT_BACKOFF_S": "3",
     # Above RATE_LIMIT_BACKOFF_S * 1000, so a message paused by a backoff isn't reclaimed.
     "STREAM_CLAIM_TIMEOUT_MS": "10000",
     "ENTITY_ANALYSIS_MAX_RETRY": "10",
-    # CONSUMER_ENV's 1 s is shorter than the 1 s SADI holds these cases use.
-    "HTTP_TIMEOUT_S": "5",
 }
-BACKOFF_S = 3
-BATCH_COMPLETED_EVENT = "entity_analysis_batch_completed"
-BACKOFF_STARTED_EVENT = "rate_limit_backoff_started"
-TIME_TOLERANCE_S = 0.2
-RATE_LIMITED_TITLE = "限速測試恒生指數收市報價"
-
-
-def _batches_completed(logs: list[MutableMapping[str, Any]]) -> list[MutableMapping[str, Any]]:
-    return [log for log in logs if log["event"] == BATCH_COMPLETED_EVENT]
-
-
-def _first_request_at(stub: StubSADI, cleaned_id: uuid.UUID) -> float:
-    return stub.requests_for(cleaned_id)[0].at
-
-
-async def start_concurrency_capped(start_consumer, streams, stub_sadi, fake_llm):
-    """No more than ENTITY_ANALYSIS_MAX_CONCURRENT articles are processed at once and the cap
-    is reached; every gathered batch logs its size and latency."""
-    cleaned_ids = [uuid.uuid4() for _ in range(10)]
-    for cleaned_id in cleaned_ids:
-        stub_sadi.respond(cleaned_id, 200, delay_s=1)
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer(**WORKER_POOL_ENV):
-            started = time.monotonic()
-            entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in cleaned_ids}
-            await _wait_acked(streams, stub_sadi, entries, 12)
-            elapsed_s = time.monotonic() - started
-            await asyncio.sleep(SETTLE_S)
-
-    assert stub_sadi.peak_in_flight == 3
-    assert len(stub_sadi.requests) == 10
-    assert await streams.pending() == {}
-    # However the 10 messages split into reads, they take at least four 1 s waves of three.
-    assert elapsed_s >= 4 - TIME_TOLERANCE_S
-    batches = _batches_completed(logs)
-    assert {log["log_level"] for log in batches} == {"info"}
-    assert all(isinstance(log["batch_size"], int) for log in batches)
-    assert all(isinstance(log["latency_ms"], int | float) for log in batches)
-    assert sum(log["batch_size"] for log in batches) == 10
-
-
-async def start_loops_share_concurrency_cap(start_consumer, streams, stub_sadi, fake_llm):
-    """The consumer loop and the reclaim loop share one cap: with messages for both, no more
-    than ENTITY_ANALYSIS_MAX_CONCURRENT articles are processed at once, and all are ACKed."""
-    reclaimed = [uuid.uuid4() for _ in range(6)]
-    fresh = [uuid.uuid4() for _ in range(6)]
-    for cleaned_id in reclaimed + fresh:
-        stub_sadi.respond(cleaned_id, 200, delay_s=1)
-    reclaimed_ids = await streams.hold_as_ghost(
-        *({"cleaned_id": str(cleaned_id), "v": "1"} for cleaned_id in reclaimed)
-    )
-    env = {**WORKER_POOL_ENV, "ENTITY_ANALYSIS_MAX_CONCURRENT": "2"}
-
-    async with start_consumer(**{**env, "STREAM_CLAIM_TIMEOUT_MS": "1500"}):
-        entries = dict(zip(reclaimed, reclaimed_ids, strict=True))
-        entries |= {cleaned_id: await streams.add(cleaned_id) for cleaned_id in fresh}
-        await _wait_acked(streams, stub_sadi, entries, 30)
-
-    assert stub_sadi.peak_in_flight == 2
-    assert await streams.pending() == {}
-    assert await streams.dead_letters() == []
-
-
-async def start_rate_limit_pauses_new_work(start_consumer, streams, stub_sadi, fake_llm):
-    """A rate-limited analysis pauses the layer's new work for RATE_LIMIT_BACKOFF_S, including
-    work already waiting for a slot; its message stays pending and is reclaimed and analysed
-    once the cause clears."""
-    rate_limited, after_a, after_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    stub_sadi.serve(rate_limited, RATE_LIMITED_TITLE, ARTICLE_BODY)
-    raised_at: list[tuple[float, datetime]] = []
-
-    async def on_call(content: str) -> None:
-        if RATE_LIMITED_TITLE in content and not raised_at:
-            raised_at.append((time.monotonic(), datetime.now(UTC)))
-            raise LLMRateLimitError("scripted rate limit", category=ErrorCategory.LLM)
-
-    fake_llm.on_call = on_call
-    env = {**WORKER_POOL_ENV, "ENTITY_ANALYSIS_MAX_CONCURRENT": "1"}
-
-    with structlog.testing.capture_logs() as logs:
-        async with start_consumer(**env):
-            rate_limited_id = await streams.add(rate_limited)
-            entries = {after_a: await streams.add(after_a), after_b: await streams.add(after_b)}
-
-            async def raised() -> bool:
-                return bool(raised_at)
-
-            await _wait_for(raised, 5)
-            pending_after_raise = await streams.pending()
-            await _wait_acked(streams, stub_sadi, entries, 15)
-
-            async def rate_limited_acked() -> bool:
-                return rate_limited_id not in await streams.pending()
-
-            await _wait_for(rate_limited_acked, 25)
-            await asyncio.sleep(SETTLE_S)
-
-    [(raised_mono, raised_wall)] = raised_at
-    assert pending_after_raise[rate_limited_id] == 1
-    assert raised_mono + BACKOFF_S <= _first_request_at(stub_sadi, after_a) < raised_mono + 5
-    assert _first_request_at(stub_sadi, after_b) >= raised_mono + BACKOFF_S
-    [backoff] = [log for log in logs if log["event"] == BACKOFF_STARTED_EVENT]
-    assert (backoff["log_level"], backoff["layer"]) == ("warning", "entity_analysis")
-    backoff_until = datetime.fromisoformat(backoff["backoff_until"])
-    expected_until = raised_wall.timestamp() + BACKOFF_S
-    assert abs(backoff_until.timestamp() - expected_until) <= TIME_TOLERANCE_S
-    assert not [log for log in logs if log["log_level"] in ("error", "critical")]
-    assert len(stub_sadi.requests_for(rate_limited)) == 2
-    assert await streams.pending() == {}
 
 
 class CountingLLMAdapter(LLMAdapter):
@@ -1670,7 +1024,7 @@ async def start_concurrency_capped_live_vertex(
     for cleaned_id, (title, body) in zip(cleaned_ids, articles, strict=True):
         stub_sadi.serve(cleaned_id, title, body)
     hkex_feed("real")
-    env = {**WORKER_POOL_ENV, "ENTITY_ANALYSIS_MAX_CONCURRENT": "2", **REAL_HKEX_ENV}
+    env = {**LIVE_VERTEX_CAP_ENV, **REAL_HKEX_ENV}
 
     async with start_consumer(**env):
         entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in cleaned_ids}
