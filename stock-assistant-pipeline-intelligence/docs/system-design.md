@@ -1124,8 +1124,10 @@ On Task exit:
 │   → no restart
 └── Unexpected exit (exception)
     → log CRITICAL with exception detail
-    → recreate Task (auto-restart)
+    → recreate Task after a short delay (auto-restart)
 ```
+
+The delay keeps a crash that recurs on every start — e.g. the stream Redis still unreachable when the restarted layer creates its consumer group — from spinning into a tight crash-restart loop. During it the crashed Task stays registered, so `GET /health` reports the layer as `error`; a restart whose delay ends after shutdown has begun is skipped.
 
 A layer Task cancelled at shutdown can still end with an exception, e.g. Aggregation's final flush failing because the DB is already unreachable. Restarting it then would create a Task that shutdown never cancels, running past the lifespan against closed clients, so the monitor restarts only while the service is running.
 

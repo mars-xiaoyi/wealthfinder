@@ -300,11 +300,11 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for the `asyncio.TaskGroup` in `start()`, so a restart never races a leftover sibling loop)
 **Scope:** Auto-restart the Entity Analysis layer's Task when it crashes, and report its real liveness in `GET /v1/health` (impl.md §16 Coroutine Monitoring, §15.2, §15.6; design.md §12.1).
-- `app/main.py`: `_make_monitored()` with its `done_callback` (CRITICAL `layer_task_crashed`, then restart), `register_layer_tasks(layer_tasks)`, and cancel-and-gather of every layer Task at shutdown (§16). Only `"entity_analysis"` is registered; each later layer adds its own line.
+- `app/main.py`: `_make_monitored()` with its `done_callback` (CRITICAL `layer_task_crashed`, then restart after `LAYER_RESTART_DELAY_S`, a new `HealthConfig.layer_restart_delay_s`, default 1 s), `register_layer_tasks(layer_tasks)`, and cancel-and-gather of every layer Task at shutdown (§16). Only `"entity_analysis"` is registered; each later layer adds its own line.
 - `app/layer_tasks.py`: `register_layer_tasks()`/`get_layer_tasks()` (§15.6).
-- `app/api/routes/health.py`: `layers.entity_analysis` reflects whether its Task is running; `degraded` is derived per §15.2. The other three `layers.*` fields stay hardcoded to their failure state until their layers exist.
+- `app/api/routes/health.py`: `layers.entity_analysis` reflects whether its Task is running; `degraded` is derived per §15.2. Every `layers.*` field is read from `get_layer_tasks()`, so the other three report `error` until their layers register a Task.
 **Acceptance criteria** (per impl.md §15.2/§16; api.md §3.2):
-- A crash in `CleanedNewsConsumer.start()` logs `layer_task_crashed` at CRITICAL and starts a new Task on the same consumer instance.
+- A crash in `CleanedNewsConsumer.start()` logs `layer_task_crashed` at CRITICAL and, after `LAYER_RESTART_DELAY_S`, starts a new Task on the same consumer instance; `layers.entity_analysis` is `error` during the delay. A restart whose delay ends after shutdown began is skipped.
 - A cancelled Task (shutdown) is never restarted.
 - `layers.entity_analysis` flips between `ok` and `error` with the Task's state; overall status is `degraded`, `HTTP 200`, since no other layer exists yet.
 - The Health Check ticket's integration cases re-run with `layers.entity_analysis` real: with everything up the response is `degraded`, `HTTP 200` — `database`/`redis_stream`/`redis_state`/`hk_stock_list` and `layers.entity_analysis` all `ok`, the other three `layers.*` still `error`. Each Postgres/Redis stop or pause gives `unhealthy`, `HTTP 503`, with only the failed field `error` and `layers.entity_analysis` still `ok` (the consumer retries rather than exiting, §6.1). Recovery returns to `degraded`, `HTTP 200`, without restarting the app.

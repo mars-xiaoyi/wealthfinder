@@ -466,8 +466,10 @@ class HttpConfig:
 @dataclass
 class HealthConfig:
     """Per-check bound for GET /v1/health's DB/Redis checks (§15.2). Keep it below the
-    orchestrator readiness probe's own timeout, so SAPI's 503 arrives before the probe gives up."""
-    check_timeout_s: int   # env: HEALTH_CHECK_TIMEOUT_S (default 2)
+    orchestrator readiness probe's own timeout, so SAPI's 503 arrives before the probe gives up.
+    layer_restart_delay_s is Coroutine Monitoring's wait before restarting a crashed layer Task (§16)."""
+    check_timeout_s: int        # env: HEALTH_CHECK_TIMEOUT_S (default 2)
+    layer_restart_delay_s: int  # env: LAYER_RESTART_DELAY_S (default 1)
 ```
 
 #### Class: `RedisConfig`
@@ -5335,7 +5337,8 @@ redis_state  = ok  if RedisStateClient.ping() (§6.2) succeeds, else error
 hk_stock_list = ok if len(get_hk_stock_list_cache()) > 0, else not_ready   # §4.2 — in-process,
     no Redis
 layers.{entity_analysis,aggregation,scoring,cache} = ok if the corresponding asyncio.Task
-    from get_layer_tasks() (§15.6) is still running (not done()), else error
+    from get_layer_tasks() (§15.6) is still running (not done()), else error — including a
+    layer with no registered Task yet
 
 status = unhealthy (HTTP 503) if database=error OR any redis=error OR hk_stock_list=not_ready
 status = degraded  (HTTP 200) if any layers.*=error (database/Redis/HK-Stock-List are all fine,
@@ -5577,12 +5580,16 @@ async def lifespan(app: FastAPI):
 
         layer_tasks: dict[str, asyncio.Task] = {}   # registered below for GET /health (§15.6)
         shutting_down = False
+        loop = asyncio.get_running_loop()
 
         # Launch each layer as a monitored Task (system-design.md §12.1 Coroutine Monitoring). start() runs
         # its loops in one asyncio.TaskGroup (§6.1), so when _on_done fires both of the layer's coroutines have stopped and
         # the restart can't race a live sibling.
         def _make_monitored(name: str, coro_factory):
             task = asyncio.create_task(coro_factory())
+            def _restart():
+                if not shutting_down:   # shutdown may have begun during the delay
+                    layer_tasks[name] = _make_monitored(name, coro_factory)
             def _on_done(t: asyncio.Task):
                 if t.cancelled():
                     return
@@ -5592,8 +5599,10 @@ async def lifespan(app: FastAPI):
                 if shutting_down:   # no restart during shutdown (system-design.md §12.1)
                     logger.error("layer_task_failed_during_shutdown", layer=name, exc_info=exc)
                     return
-                logger.critical("layer_task_crashed", layer=name, exc_info=exc)
-                layer_tasks[name] = _make_monitored(name, coro_factory)  # auto-restart
+                logger.critical("layer_task_crashed", layer=name,
+                                restart_in_s=config.health.layer_restart_delay_s, exc_info=exc)
+                # auto-restart after a delay; until then layer_tasks still holds the crashed Task
+                loop.call_later(config.health.layer_restart_delay_s, _restart)
             task.add_done_callback(_on_done)
             return task
 
