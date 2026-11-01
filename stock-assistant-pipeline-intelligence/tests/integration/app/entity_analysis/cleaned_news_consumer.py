@@ -751,18 +751,22 @@ REPUBLISHED_EVENT = "entity_analysis_republished"
 
 class FakeLLMAdapter(LLMAdapter):
     """Stands in for Vertex AI: answers every call with items, or raises error. While hold is
-    set, a call waits for it before answering; entered is set once a call has started."""
+    set, a call waits for it before answering; entered is set once a call has started. A call
+    first awaits on_call, if set, with the article message's text; it may raise or sleep."""
 
     def __init__(self) -> None:
         self.items: list[ExtractedEntity] = []
         self.error: LLMError | None = None
         self.hold: asyncio.Event | None = None
+        self.on_call: Callable[[str], Awaitable[None]] | None = None
         self.entered = asyncio.Event()
         self.calls = 0
 
     async def generate_structured(self, messages, output_schema, generation_config):
         self.calls += 1
         self.entered.set()
+        if self.on_call is not None:
+            await self.on_call(messages[-1].content)
         if self.hold is not None:
             await self.hold.wait()
         if self.error is not None:
@@ -1485,4 +1489,192 @@ async def start_stream_redis_outage_reclaims_after(start_consumer, streams, stub
     assert not [log for log in logs if log["event"] == SWEEP_FAILED_EVENT]
     assert not [log for log in logs if log["log_level"] in ("error", "critical")]
     assert len(stub_sadi.requests_for(stalled)) >= 2
+    assert await streams.pending() == {}
+
+
+# WorkerPool: the concurrency cap and the rate-limit backoff.
+
+WORKER_POOL_ENV = {
+    "ENTITY_ANALYSIS_MAX_CONCURRENT": "3",
+    "ENTITY_ANALYSIS_BATCH_SIZE": "10",
+    "RATE_LIMIT_BACKOFF_S": "3",
+    # Above RATE_LIMIT_BACKOFF_S * 1000, so a message paused by a backoff isn't reclaimed.
+    "STREAM_CLAIM_TIMEOUT_MS": "10000",
+    "ENTITY_ANALYSIS_MAX_RETRY": "10",
+    # CONSUMER_ENV's 1 s is shorter than the 1 s SADI holds these cases use.
+    "HTTP_TIMEOUT_S": "5",
+}
+BACKOFF_S = 3
+BATCH_COMPLETED_EVENT = "entity_analysis_batch_completed"
+BACKOFF_STARTED_EVENT = "rate_limit_backoff_started"
+TIME_TOLERANCE_S = 0.2
+RATE_LIMITED_TITLE = "限速測試恒生指數收市報價"
+
+
+def _batches_completed(logs: list[MutableMapping[str, Any]]) -> list[MutableMapping[str, Any]]:
+    return [log for log in logs if log["event"] == BATCH_COMPLETED_EVENT]
+
+
+def _first_request_at(stub: StubSADI, cleaned_id: uuid.UUID) -> float:
+    return stub.requests_for(cleaned_id)[0].at
+
+
+async def start_concurrency_capped(start_consumer, streams, stub_sadi, fake_llm):
+    """No more than ENTITY_ANALYSIS_MAX_CONCURRENT articles are processed at once and the cap
+    is reached; every gathered batch logs its size and latency."""
+    cleaned_ids = [uuid.uuid4() for _ in range(10)]
+    for cleaned_id in cleaned_ids:
+        stub_sadi.respond(cleaned_id, 200, delay_s=1)
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(**WORKER_POOL_ENV):
+            started = time.monotonic()
+            entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in cleaned_ids}
+            await _wait_acked(streams, stub_sadi, entries, 12)
+            elapsed_s = time.monotonic() - started
+            await asyncio.sleep(SETTLE_S)
+
+    assert stub_sadi.peak_in_flight == 3
+    assert len(stub_sadi.requests) == 10
+    assert await streams.pending() == {}
+    # However the 10 messages split into reads, they take at least four 1 s waves of three.
+    assert elapsed_s >= 4 - TIME_TOLERANCE_S
+    batches = _batches_completed(logs)
+    assert {log["log_level"] for log in batches} == {"info"}
+    assert all(isinstance(log["batch_size"], int) for log in batches)
+    assert all(isinstance(log["latency_ms"], int | float) for log in batches)
+    assert sum(log["batch_size"] for log in batches) == 10
+
+
+async def start_loops_share_concurrency_cap(start_consumer, streams, stub_sadi, fake_llm):
+    """The consumer loop and the reclaim loop share one cap: with messages for both, no more
+    than ENTITY_ANALYSIS_MAX_CONCURRENT articles are processed at once, and all are ACKed."""
+    reclaimed = [uuid.uuid4() for _ in range(6)]
+    fresh = [uuid.uuid4() for _ in range(6)]
+    for cleaned_id in reclaimed + fresh:
+        stub_sadi.respond(cleaned_id, 200, delay_s=1)
+    reclaimed_ids = await streams.hold_as_ghost(
+        *({"cleaned_id": str(cleaned_id), "v": "1"} for cleaned_id in reclaimed)
+    )
+    env = {**WORKER_POOL_ENV, "ENTITY_ANALYSIS_MAX_CONCURRENT": "2"}
+
+    async with start_consumer(**{**env, "STREAM_CLAIM_TIMEOUT_MS": "1500"}):
+        entries = dict(zip(reclaimed, reclaimed_ids, strict=True))
+        entries |= {cleaned_id: await streams.add(cleaned_id) for cleaned_id in fresh}
+        await _wait_acked(streams, stub_sadi, entries, 30)
+
+    assert stub_sadi.peak_in_flight == 2
+    assert await streams.pending() == {}
+    assert await streams.dead_letters() == []
+
+
+async def start_rate_limit_pauses_new_work(start_consumer, streams, stub_sadi, fake_llm):
+    """A rate-limited analysis pauses the layer's new work for RATE_LIMIT_BACKOFF_S, including
+    work already waiting for a slot; its message stays pending and is reclaimed and analysed
+    once the cause clears."""
+    rate_limited, after_a, after_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    stub_sadi.serve(rate_limited, RATE_LIMITED_TITLE, ARTICLE_BODY)
+    raised_at: list[tuple[float, datetime]] = []
+
+    async def on_call(content: str) -> None:
+        if RATE_LIMITED_TITLE in content and not raised_at:
+            raised_at.append((time.monotonic(), datetime.now(UTC)))
+            raise LLMRateLimitError("scripted rate limit", category=ErrorCategory.LLM)
+
+    fake_llm.on_call = on_call
+    env = {**WORKER_POOL_ENV, "ENTITY_ANALYSIS_MAX_CONCURRENT": "1"}
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(**env):
+            rate_limited_id = await streams.add(rate_limited)
+            entries = {after_a: await streams.add(after_a), after_b: await streams.add(after_b)}
+
+            async def raised() -> bool:
+                return bool(raised_at)
+
+            await _wait_for(raised, 5)
+            pending_after_raise = await streams.pending()
+            await _wait_acked(streams, stub_sadi, entries, 15)
+
+            async def rate_limited_acked() -> bool:
+                return rate_limited_id not in await streams.pending()
+
+            await _wait_for(rate_limited_acked, 25)
+            await asyncio.sleep(SETTLE_S)
+
+    [(raised_mono, raised_wall)] = raised_at
+    assert pending_after_raise[rate_limited_id] == 1
+    assert raised_mono + BACKOFF_S <= _first_request_at(stub_sadi, after_a) < raised_mono + 5
+    assert _first_request_at(stub_sadi, after_b) >= raised_mono + BACKOFF_S
+    [backoff] = [log for log in logs if log["event"] == BACKOFF_STARTED_EVENT]
+    assert (backoff["log_level"], backoff["layer"]) == ("warning", "entity_analysis")
+    backoff_until = datetime.fromisoformat(backoff["backoff_until"])
+    expected_until = raised_wall.timestamp() + BACKOFF_S
+    assert abs(backoff_until.timestamp() - expected_until) <= TIME_TOLERANCE_S
+    assert not [log for log in logs if log["log_level"] in ("error", "critical")]
+    assert len(stub_sadi.requests_for(rate_limited)) == 2
+    assert await streams.pending() == {}
+
+
+class CountingLLMAdapter(LLMAdapter):
+    """Forwards every call to the real adapter, counting how many run at once."""
+
+    def __init__(self, inner: LLMAdapter) -> None:
+        self._inner = inner
+        self.in_flight = 0
+        self.peak_in_flight = 0
+
+    async def generate_structured(self, messages, output_schema, generation_config):
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            return await self._inner.generate_structured(messages, output_schema, generation_config)
+        finally:
+            self.in_flight -= 1
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+@pytest.fixture
+def counting_llm(monkeypatch: pytest.MonkeyPatch) -> Callable[[], CountingLLMAdapter]:
+    """Make the app's lifespan register the real Vertex AI adapter behind a CountingLLMAdapter.
+    Returns a getter for it, as it exists only once the app has started."""
+    created: list[CountingLLMAdapter] = []
+    create_real = vertex_adapter.create_llm_adapter
+
+    def create_llm_adapter(config: Any) -> CountingLLMAdapter:
+        counting = CountingLLMAdapter(create_real(config))
+        monkeypatch.setattr(vertex_adapter, "_llm_adapter", counting)
+        created.append(counting)
+        return counting
+
+    monkeypatch.setattr(main, "create_llm_adapter", create_llm_adapter)
+    return lambda: created[0]
+
+
+@pytest.mark.vertex
+# Room for the 300 s wait below, plus startup with the real HKEX download.
+@pytest.mark.timeout(360)
+async def start_concurrency_capped_live_vertex(
+    start_consumer, hkex_feed, streams, stub_sadi, counting_llm
+):
+    """Against the real Vertex AI, no more than ENTITY_ANALYSIS_MAX_CONCURRENT calls run at once
+    and the cap is reached; every message is ACKed, a rate-limited one by the reclaim loop."""
+    articles = [
+        (LISTED_TITLE, LISTED_BODY),
+        (UNLISTED_TITLE, UNLISTED_BODY),
+        (ARTICLE_TITLE, ARTICLE_BODY),
+    ] * 2
+    cleaned_ids = [uuid.uuid4() for _ in articles]
+    for cleaned_id, (title, body) in zip(cleaned_ids, articles, strict=True):
+        stub_sadi.serve(cleaned_id, title, body)
+    hkex_feed("real")
+    env = {**WORKER_POOL_ENV, "ENTITY_ANALYSIS_MAX_CONCURRENT": "2", **REAL_HKEX_ENV}
+
+    async with start_consumer(**env):
+        entries = {cleaned_id: await streams.add(cleaned_id) for cleaned_id in cleaned_ids}
+        await _wait_acked(streams, stub_sadi, entries, 300)
+
+    assert counting_llm().peak_in_flight == 2
     assert await streams.pending() == {}
