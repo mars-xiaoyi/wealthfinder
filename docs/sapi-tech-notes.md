@@ -2,7 +2,7 @@
 
 Learning notes from designing SAPI, the Redis Streams–based pipeline in this repo (Entity Analysis → Aggregation → Scoring → Cache). SAPI's binding design lives in `stock-assistant-pipeline-intelligence/docs/` (`impl.md` = `implementation.md`, `design.md` = `system-design.md` below); nothing here is a design decision for it.
 
-- **Part 1** gives SAPI's technical highlights for a reader new to the project: what the system does, then what was decided and why, with measured results where there are any. It stands alone, without the design docs. Its LLM items come from two spikes, whose full write-ups are `poc/sapi/fuzzy-match/README.md` and `poc/sapi/llm-skill/README.md`.
+- **Part 1** gives SAPI's technical highlights for a reader new to the project: what the system does, then what was decided and why, with measured results where there are any. It stands alone, without the design docs. Its LLM items come from three spikes, whose full write-ups are `poc/sapi/fuzzy-match/README.md`, `poc/sapi/llm-skill/README.md` and `poc/sapi/scoring-skills/README.md`.
 - **Part 2** covers the general topics behind those highlights, for future investigation. Each ends with questions worth digging into.
 
 ---
@@ -34,6 +34,8 @@ Stack: Python 3.12, asyncio, FastAPI, Redis Streams, PostgreSQL, Vertex AI (Gemi
 | **Flush** | Aggregation keeps live stories in Redis, and periodically writes them to Postgres and tells Scoring which ones changed |
 | **HK Stock List** | the exchange's official list of about 2,800 listed equities, used to verify stock codes |
 | **Acknowledge / redeliver** | a consumer marks a message done. A message not acknowledged within a timeout is redelivered, and after N deliveries it goes to a dead-letter queue. |
+| **Brief summary** | a story's short Morning Brief text, written by one LLM call from the one-line summaries of its mentions |
+| **Impact score** | a second LLM call reads the brief summary and rates the story's likely effect on the share price, from −5 to +5 |
 
 **Why it's hard.**
 - **An LLM in the hot path:** every article costs money and seconds, the provider rate-limits, and the output is non-deterministic, so it has to be verified.
@@ -139,6 +141,8 @@ The matcher answers in p99 ~5 ms over the whole list, so it doesn't need a worke
 - **Leakage checks and re-scoring:** constructed test sets are scanned for leaked labels, and stored model outputs are re-scored offline after every verifier change.
 - **No third-party text** is committed.
 
+**It happened again.** In the Scoring spike, once the design docs had changed, the evaluation scripts read the earlier prompts from a pinned commit, so earlier variants still ran as they had. Rebuilding the earlier few-shot examples by reverse string replacement also edited an input line that happened to contain the same sentence. Review caught it before any figure depended on it.
+
 **Shows:** treating the numbers behind a design decision like code that needs review, and handling data governance. Background: §2.10.
 
 ### A5. De-risking an external API before committing to a design
@@ -152,6 +156,58 @@ The matcher answers in p99 ~5 ms over the whole list, so it doesn't need a worke
 - **A cost lever that didn't apply.** Prompt caching needs ≥ 4,096 tokens, and the prompt is ~1,800.
 
 **Shows:** treating a third-party dependency as unknown until measured, and turning each surprise into an explicit setting (timeout, retry owner, token budget, input cap). Background: §2.9.
+
+### A6. A prompt that contradicted itself, found only by checking every claim against the sources
+
+**Problem.** Scoring makes two LLM calls per story: one writes the brief summary, and the next reads it and gives the impact score. The summary prompt asked for "background, key figures and potential impact" while also forbidding anything the input doesn't contain. Articles rarely state an impact, so the model filled the gap with its own reading ("reflects heavy short-selling pressure"). 41% of held-out summaries carried a claim no source supports (49% on the tuning half).
+
+**Why it's subtle.**
+- **The cheap check passed.** A script that flags any number missing from the input found almost nothing real. Of 51 flags, 49 were correct conversions or rounding (1.3倍 → +130%), and the other two were one real error. The invented claims were words, not numbers.
+- **It surfaced only with a judge that reads every source.** `gemini-3.1-pro-preview` graded each summary against all of the story's mention summaries, and listing what it flagged showed the pattern at once.
+- **The error travels.** The impact score reads the summary, so the model's own opinion becomes the next step's evidence.
+
+**Decision.**
+- **The fix:** the summary states impact or outlook only where a source does, and never adds an assessment of its own (「反映…」「顯示…」). The few-shot examples had modelled the same habit, so they were trimmed to match.
+- **Two smaller rules:** copy numbers as written, and when one measure appears with several values (intraday and full-day), use the full-day one.
+- **A limit removed:** a 200-character cap on the summary's input dropped summaries holding price-relevant figures in about 1% of stories. The input was already bounded at three summaries per source.
+
+**Result** (91 held-out stories, graded the same way):
+
+| | Before | After |
+|---|---|---|
+| Summaries with a claim no source supports | 41% | **2%** |
+| Price-relevant facts missed, per multi-article story | 0.48 | **0.28** |
+| Judge quality (1–5) | 4.36 | **4.85** |
+
+The impact score's agreement with the reference moved the right way, but within noise (A7).
+
+**Trade-off accepted.** The model still converts units that the rule asks it to copy (1.3倍 → +130%). The conversions are correct, so the tested wording stayed. One real number error is left: a share placing in HKD and a bond in RMB added into one total.
+
+**Shows:** reading model failures instead of only counting them, spotting a contradiction in the instructions, and tracing an error across chained LLM steps. Background: §2.8.
+
+### A7. Knowing when to stop tuning
+
+**Problem.** With the summaries fixed, the impact score looked like the next target. The cheap model's ranking of stories agreed with the reference's (Gemini 3.1 Pro scoring each story from all of its mention summaries) at about 0.85 (Spearman), while the reference agreed with itself at 0.94–0.97. In all, nine variants were compared, including different or no few-shot examples, scoring from the mention summaries instead of the brief summary, one combined call for both steps, a stricter rule on figures, and a stronger model.
+
+**Approach.** Before comparing anything, four noise floors were measured:
+- **The reference against itself:** two runs of the Pro scorer give the ceiling.
+- **The judge against itself:** grading the same summaries twice moved the unsupported-claim rate by 1.5 points.
+- **The pipeline against itself:** rerunning an unchanged configuration at temperature 0 still changed 20 of 132 summaries and 4 scores, and moved rank agreement by 0.016.
+- **Paired bootstrap intervals** on every difference, on a set split by stock into a tuning half and a held-out half.
+
+**Finding.** No cheap-model variant beat the original scorer beyond noise.
+- **One combined call** scored slightly better but wrote clearly worse summaries (judge quality 3.80 against 4.77).
+- **The stricter figures rule** halved the remaining figure-timing errors in summaries, but lowered score agreement beyond noise (Spearman −0.045, interval −0.092..−0.010). Improving one step can cost the next.
+- **The stronger model** (Gemini 3.8 Flash) scored best on both halves, but not significantly (held-out +0.045, interval −0.013..+0.126). It cost 2.5× the output tokens and about three times the latency: p95 20 s against 7 s for both calls.
+
+**Why it's subtle.**
+- **Temperature 0 isn't deterministic** on a hosted model. Without an unchanged rerun, run-to-run change looks like an effect.
+- **The metric can encode the reference's habits.** The reference uses almost only the scale's anchor values (±1, ±3, ±5), while the few-shot examples teach in-between ones (+4, −2). Mean absolute error penalised those even when the ranking was the same, so variants were compared by rank correlation and sign agreement.
+- **Not every rule kept is a metric win.** "Score only what the event adds" stopped routine notices from long-suspended companies scoring −4 or −5. Its effect on agreement was within noise, and it was kept on that judgement.
+
+**Decision.** Keep the cheap model and the original scoring design, stop tuning, and re-check the stronger model once there is production volume.
+
+**Shows:** measuring the noise before trusting a difference, choosing a metric the reference can't skew, and stopping when the evidence says the remaining gap is the model. Background: §2.10.
 
 ---
 
@@ -640,7 +696,14 @@ Rule: **if verification can run after the call, run it after the call.** A tool 
 ### Schema-valid is not correct
 Structured output guarantees the shape: fields, types, enums. It doesn't guarantee the content. Keep business validation (length limits, allowed combinations, cross-field rules) in code after the call, and decide per rule whether to fix (truncate) or reject.
 
-SAPI: §A1, §A2.
+### Chaining LLM steps
+When one model's output is the next model's input, each step's errors become the next step's evidence.
+- **Keep each step's output to what its input supports.** An upstream summary that adds its own reading hands the downstream step an opinion as if it were a fact.
+- **Look for contradictions in the instructions.** A prompt that asks for something the input rarely contains, while forbidding anything not in the input, leaves the model to resolve the conflict. It does so silently, and usually in favour of producing output.
+- **"Copy as written" rules hold only partly.** They still yield correct conversions (1.3倍 → +130%) and the occasional wrong sum. If exact figures matter, check them against the source in code.
+- **Evaluate the chain, not only each step.** A change that helps one step can hurt the next.
+
+SAPI: §A1, §A2, §A6, §A7.
 
 ### To investigate
 - Constrained decoding: how JSON-schema output is enforced at the token level, and what it does to quality.
@@ -690,7 +753,7 @@ SAPI: §A5.
 
 ## 2.10 Running a spike as a measured experiment
 
-A spike answers a design question with evidence. Both Entity Analysis spikes worked because they were run like small experiments, and the PR review of one showed how easily such an experiment drifts (§A4).
+A spike answers a design question with evidence. SAPI's spikes worked because they were run like small experiments, and the PR review of the first LLM spike showed how easily such an experiment drifts (§A4).
 
 ### Build the test set from real data
 - **Look for labels the data gives you for free:** news articles print `name(code)`, and HKEX announcements print the issuer's code in the header. Foreign tickers (`name(TICKER.US)`) give negatives, cases where the right answer is "no match".
@@ -705,6 +768,15 @@ A spike answers a design question with evidence. Both Entity Analysis spikes wor
 ### Measure in context, cheaply
 Component accuracy and end-to-end accuracy can disagree (§A3). **Store raw model outputs, then replay them offline** with one component swapped: the fuzzy-matching spike compared five fallbacks on the LLM spike's stored outputs with no API calls and no LLM randomness between variants.
 
+### Know your noise before comparing
+With a hosted model, measure four noise floors before calling any difference real:
+- **The reference against itself** (two runs): the best agreement any variant can reach.
+- **The judge against itself:** the same outputs graded twice.
+- **The system against itself:** an unchanged configuration rerun. Temperature 0 is not deterministic on hosted models.
+- **A paired bootstrap interval** on each difference, since every variant runs on the same items.
+
+Pick metrics the reference can't skew. If the reference rounds to a few anchor values, absolute error penalises in-between answers that rank items the same way; rank correlation and sign agreement don't.
+
 ### Make every figure reproducible
 - Freeze the inputs: prompt copies, list snapshots, commit hashes.
 - Derive every split and number from a committed script, never from a hand edit.
@@ -716,10 +788,11 @@ Component accuracy and end-to-end accuracy can disagree (§A3). **Store raw mode
 ### Small samples
 127 articles is small. 0.954 vs 0.962 is a handful of entities. Read the actual errors behind a difference before believing the score, and treat gaps within the reference model's own disagreement as ties.
 
-SAPI: §A1–§A5.
+SAPI: §A1–§A7.
 
 ### To investigate
-- Bootstrap confidence intervals and paired tests (McNemar's test) for small evaluation sets.
+- Paired tests beyond the bootstrap (McNemar's test, permutation tests), and corrections for trying many variants on one set.
+- Judge design: rubric wording, a judge's leniency toward equivalent restatements, and calibrating an LLM judge against human labels.
 - Overfitting to a dev set through repeated tuning: adaptive data analysis, the "garden of forking paths", and reusable holdouts.
 - Pre-registration: why fixing the pass bar in advance matters.
 - A taxonomy of data leakage (Kaufman et al., "Leakage in Data Mining").
@@ -735,3 +808,4 @@ SAPI: §A1–§A5.
 - Chip Huyen, *AI Engineering*: the chapters on evaluation methodology and on building inference pipelines around a model.
 - Peng, Yu & Dredze, "An Empirical Study of Chinese Name Matching and Applications" (ACL 2015), and the study of Chinese abbreviations as ordered subsequences at [arXiv 1712.06289](https://ar5iv.arxiv.org/html/1712.06289): the two papers behind the fuzzy-matching spike's direction.
 - Kaufman, Rosset & Perlich, "Leakage in Data Mining: Formulation, Detection, and Avoidance" (KDD 2011).
+- Zheng et al., "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena" (NeurIPS 2023): position, verbosity and self-preference biases in LLM judges.
