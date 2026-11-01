@@ -287,7 +287,7 @@ This document does not introduce new design — every ticket below implements so
 - An `LLMRateLimitError` from any one article triggers the layer-wide backoff and leaves that message un-ACKed.
 - Unit-tested with fake coroutines and a real 1 s backoff.
 - Integration pass against live Vertex AI at the configured concurrency.
-- The integration cases from Entity Analysis: Reclaim, Dead Letter & Schema-Version Check re-run with both loops dispatching through `WorkerPool`, and the `HTTP 429` case from Entity Analysis: LLM Entity Extraction re-run with the backoff in force: the same results, except that a rate-limited article now delays the next article's start by `RATE_LIMIT_BACKOFF_S`.
+- The integration cases from Entity Analysis: Reclaim, Dead Letter & Schema-Version Check re-run with both loops dispatching through `WorkerPool`: the same results.
 - Each backoff logs WARNING `rate_limit_backoff_started` with `layer` and `backoff_until`, and each gathered batch logs INFO `entity_analysis_batch_completed` with `batch_size` and `latency_ms` (impl.md §11.3).
 **Config note:** `RATE_LIMIT_BACKOFF_S * 1000` must stay below `STREAM_CLAIM_TIMEOUT_MS` (§11.3), or messages paused by a backoff get reclaimed as stalled — a deployment constraint, not checked in code.
 **Docs:** impl.md §4.1, §11.2, §11.3, §16; design.md §3.3, §12.1. Validated by: Entity Analysis: Post-Release Tuning Validation (Q-1, Q-9).
