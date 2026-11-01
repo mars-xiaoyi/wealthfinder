@@ -1,9 +1,10 @@
 import asyncio
+import time
 
 import pytest
 import structlog.testing
 
-from app import logger
+from app import logger, main
 from app.common import error_codes
 from app.common.error_categories import ErrorCategory
 from tests.integration.conftest import REFUSED_URL
@@ -42,3 +43,14 @@ async def lifespan_hk_stock_list_load_failed(start_app, hkex_urls):
     assert failures[0]["error_code"] == error_codes.UPSTREAM_UNAVAILABLE
     assert response.status_code == 503
     assert response.json() == NOT_READY_BODY
+
+
+async def lifespan_shutdown_db_unresponsive(infra, monkeypatch):
+    """Closing the pool against a paused Postgres gives up after DB_CLOSE_TIMEOUT_S."""
+    monkeypatch.setenv("DB_CLOSE_TIMEOUT_S", "1")
+
+    async with main.app.router.lifespan_context(main.app):
+        infra.postgres.pause()
+        started = time.monotonic()
+
+    assert 1 <= time.monotonic() - started < 2
