@@ -1122,6 +1122,9 @@ On Task exit:
 ├── Exception while the service is shutting down
 │   → log ERROR with exception detail
 │   → no restart
+├── Stopped without an exception while the service is running (returned, or cancelled)
+│   → log ERROR
+│   → no restart
 └── Unexpected exit (exception)
     → log CRITICAL with exception detail
     → recreate Task after a short delay (auto-restart)

@@ -3650,7 +3650,7 @@ Two layers, both required, one per class:
 
 ```python
 class WorkerPool:
-    def __init__(self, layer: str, max_concurrent: int, rate_limit_backoff_s: int): ...   # layer: "entity_analysis" | "scoring", for logs
+    def __init__(self, layer: Layer, max_concurrent: int, rate_limit_backoff_s: int): ...   # layer (§15.6): ENTITY_ANALYSIS | SCORING, for logs
 
     async def dispatch(self, coro_factory: Callable[[], Awaitable[None]]) -> None:
         """Acquire the semaphore, check rate_limit_until, run coro_factory().
@@ -5438,15 +5438,21 @@ Errors  : HTTP 503 COMMON-5002 (ServiceUnavailableError) if HKEXnews is unreacha
 The four layer Tasks follow the same singleton-plus-getter pattern as every infra resource (§5.1): `main.py`'s lifespan registers them (§16), and `GET /health` reads them (§15.2).
 
 ```python
-_layer_tasks: Optional[dict[str, asyncio.Task]] = None
+class Layer(StrEnum):   # keys of the layer-Task dict; also WorkerPool's log label (§11.3)
+    ENTITY_ANALYSIS = "entity_analysis"
+    AGGREGATION = "aggregation"
+    SCORING = "scoring"
+    CACHE = "cache"
 
-def register_layer_tasks(tasks: dict[str, asyncio.Task]) -> None:
-    """Register {"entity_analysis": ..., "aggregation": ..., "scoring": ..., "cache": ...}. main.py
+_layer_tasks: Optional[dict[Layer, asyncio.Task]] = None
+
+def register_layer_tasks(tasks: dict[Layer, asyncio.Task]) -> None:
+    """Register one Task per Layer. main.py
     passes the dict its monitor keeps updated, so an auto-restarted Task is visible here."""
     global _layer_tasks
     _layer_tasks = tasks
 
-def get_layer_tasks() -> dict[str, asyncio.Task]:
+def get_layer_tasks() -> dict[Layer, asyncio.Task]:
     if _layer_tasks is None:
         raise ServiceUnavailableError("layer tasks are not registered")
     return _layer_tasks
@@ -5507,7 +5513,7 @@ from app.scoring.scoring_consumer import ScoringConsumer
 from app.persistent.cache_store import create_cache_store
 from app.cache.cache_service import create_cache_service
 from app.cache.cache_consumer import CacheConsumer
-from app.layer_tasks import register_layer_tasks
+from app.layer_tasks import Layer, register_layer_tasks
 from app.api.main import create_app
 
 configure_logging()   # §4.3
@@ -5554,8 +5560,8 @@ async def lifespan(app: FastAPI):
         # WorkerPools are layer-owned collaborators, constructed here and passed to their Consumer.
         # Skills are never constructed here.
 
-        entity_analysis_worker_pool = WorkerPool("entity_analysis", config.entity_analysis.max_concurrent, config.llm.rate_limit_backoff_s)
-        scoring_worker_pool = WorkerPool("scoring", config.scoring.max_concurrent, config.llm.rate_limit_backoff_s)
+        entity_analysis_worker_pool = WorkerPool(Layer.ENTITY_ANALYSIS, config.entity_analysis.max_concurrent, config.llm.rate_limit_backoff_s)
+        scoring_worker_pool = WorkerPool(Layer.SCORING, config.scoring.max_concurrent, config.llm.rate_limit_backoff_s)
 
         # Each Service takes only its config and pulls its infra via get_X(); each Consumer pulls its
         # Service via get_X_service() (§5.1).
@@ -5578,38 +5584,38 @@ async def lifespan(app: FastAPI):
 
         cache_consumer = CacheConsumer(config.cache)
 
-        layer_tasks: dict[str, asyncio.Task] = {}   # registered below for GET /health (§15.6)
+        layer_tasks: dict[Layer, asyncio.Task] = {}   # registered below for GET /health (§15.6)
         shutting_down = False
         loop = asyncio.get_running_loop()
 
         # Launch each layer as a monitored Task (system-design.md §12.1 Coroutine Monitoring). start() runs
         # its loops in one asyncio.TaskGroup (§6.1), so when _on_done fires both of the layer's coroutines have stopped and
         # the restart can't race a live sibling.
-        def _make_monitored(name: str, coro_factory):
+        def _make_monitored(layer: Layer, coro_factory):
             task = asyncio.create_task(coro_factory())
             def _restart():
                 if not shutting_down:   # shutdown may have begun during the delay
-                    layer_tasks[name] = _make_monitored(name, coro_factory)
+                    layer_tasks[layer] = _make_monitored(layer, coro_factory)
             def _on_done(t: asyncio.Task):
-                if t.cancelled():
-                    return
-                exc = t.exception()
-                if exc is None:
-                    return
+                exc = None if t.cancelled() else t.exception()
                 if shutting_down:   # no restart during shutdown (system-design.md §12.1)
-                    logger.error("layer_task_failed_during_shutdown", layer=name, exc_info=exc)
+                    if exc is not None:
+                        logger.error("layer_task_failed_during_shutdown", layer=layer, exc_info=exc)
                     return
-                logger.critical("layer_task_crashed", layer=name,
+                if exc is None:     # stopped without an error while running: no restart
+                    logger.error("layer_task_stopped", layer=layer, cancelled=t.cancelled())
+                    return
+                logger.critical("layer_task_crashed", layer=layer,
                                 restart_in_s=config.health.layer_restart_delay_s, exc_info=exc)
                 # auto-restart after a delay; until then layer_tasks still holds the crashed Task
                 loop.call_later(config.health.layer_restart_delay_s, _restart)
             task.add_done_callback(_on_done)
             return task
 
-        layer_tasks["entity_analysis"] = _make_monitored("entity_analysis", cleaned_news_consumer.start)
-        layer_tasks["aggregation"] = _make_monitored("aggregation", agg_consumer.start)
-        layer_tasks["scoring"] = _make_monitored("scoring", scoring_consumer.start)
-        layer_tasks["cache"] = _make_monitored("cache", cache_consumer.start)
+        layer_tasks[Layer.ENTITY_ANALYSIS] = _make_monitored(Layer.ENTITY_ANALYSIS, cleaned_news_consumer.start)
+        layer_tasks[Layer.AGGREGATION] = _make_monitored(Layer.AGGREGATION, agg_consumer.start)
+        layer_tasks[Layer.SCORING] = _make_monitored(Layer.SCORING, scoring_consumer.start)
+        layer_tasks[Layer.CACHE] = _make_monitored(Layer.CACHE, cache_consumer.start)
         register_layer_tasks(layer_tasks)
 
         async def _cancel_layer_tasks() -> None:
