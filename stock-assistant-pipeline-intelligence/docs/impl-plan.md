@@ -366,12 +366,12 @@ This document does not introduce new design — every ticket below implements so
 **Scope:** Consume `stream:entity_event_completed`, merge each EntityEvent into its group's active Event in Redis, and ACK once the Redis write lands (impl.md §12.1–§12.3, §12.5; design.md §4.2–§4.4).
 - `app/config.py`: `AggregationConfig.batch_size`/`batch_timeout_ms`/`max_concurrent`/`group_idle_timeout_s`/`consumer_name`, and `db_flush_interval_s` (default 300) for `ttl_for()`'s grace period.
 - `app/aggregation/sliding_window.py`: `is_late()` and `ttl_for()` (§12.4), tested through `AggregationService`.
-- `app/redis/state_client.py`: `hgetall()`/`hset()`/`expire()` only (§6.2).
+- `app/redis/state_client.py`: `hgetall()`/`multi_exec()` only (§6.2).
 - `app/aggregation/event_aggregation_store.py`: `EventAggregationStore` + singleton — `get_active_event()`/`upsert_active_event()` only, not `scan_all()` (§12.5).
 - `app/persistent/entity_event_repository.py`: `fetch_entity_event()` and `_row_to_entity_event()` (§10.1).
 - `app/aggregation/group_coroutine.py`: `GroupKey`, `GroupCoroutine` (§12.3).
-- `app/aggregation/aggregation_service.py`: `AggregationService` + singleton — `process_entity_event()` with the missing-row ACK, the in-Redis half of the duplicate check, and `_process()`'s `try`/`except` → `on_failed()` (§12.1).
-- `app/aggregation/aggregation_consumer.py`: `AggregationConsumer` with one consumer loop — `_route_one()` (including its pre-enqueue `try`/`except`), `_enqueued`, `_on_processed()` (§12.2).
+- `app/aggregation/aggregation_service.py`: `AggregationService` + singleton — `process_entity_event()` with the missing-row ACK, the in-Redis half of the duplicate check, and `_merge()`'s `try`/`except` → `on_failure()` (§12.1).
+- `app/aggregation/aggregation_consumer.py`: `AggregationConsumer` with one consumer loop — `_route_one()` (including its pre-enqueue `try`/`except`), `_enqueued`, `_on_success()` (§12.2).
 - `app/main.py`: `create_event_aggregation_store()`, `create_aggregation_service()`, the consumer started as a plain Task in `layer_tasks` (so the existing shutdown cancels and awaits it before clients close), and `AggregationService.close()` at shutdown after the layer Tasks are awaited (§12.1, §16).
 **Acceptance criteria** (per impl.md §12.1–§12.3, §12.6):
 - EntityEvents of one group are merged strictly in order; different groups run concurrently, bounded by `AGG_MAX_CONCURRENT`.
@@ -380,7 +380,7 @@ This document does not introduce new design — every ticket below implements so
 - A missing `entity_events` row logs `aggregation_entity_event_missing` and ACKs without merging.
 - An `entity_event_id` already in the active Event logs `aggregation_duplicate_skipped` and ACKs without merging again.
 - A late EntityEvent — dated before the active Event's `last_seen_at` by more than `SLIDING_WINDOW_HOURS`, with `published_at` falling back to `created_at` — logs `aggregation_late_entity_event_skipped` and ACKs; the active Event and its Redis key are untouched.
-- A failure before or inside the unit of work logs `aggregation_route_failed`/`aggregation_process_failed`, leaves the message un-ACKed, and releases its `_enqueued` entry; the group and the consumer loop keep running.
+- A failure before or inside the unit of work is logged at the error's own level (a `SAPIError`'s `log_level`, ERROR otherwise), leaves the message un-ACKed, and releases its `_enqueued` entry; the group and the consumer loop keep running.
 - A Redis `ConnectionError` in the consumer loop triggers the documented warn/sleep/retry (§6.1), without crashing.
 - Shutdown cancels and awaits the layer Task, then `AggregationService.close()` cancels any running groups, all before clients close.
 - `GroupCoroutine` (§12.3): an exception escaping `work()` logs `aggregation_group_work_failed` at CRITICAL and the group continues with its next item (no re-raise, no teardown); an item enqueued just as the idle timeout fires is still processed, not abandoned; the idle timeout releases the group's dict entry and semaphore permit via `on_idle`.
@@ -404,7 +404,7 @@ This document does not introduce new design — every ticket below implements so
 - `app/models/event_entity_map.py`: `EventEntityMap` (§3.4) — the Event↔EntityEvent relationship this ticket persists.
 - `app/persistent/event_repository.py`: `EventRepository` + singleton — `persist_events()` (conditional UPSERT, returns only rows written), `_row_to_event()` without `brief_summary` (`Event` has no such field yet; the column stays NULL until Scoring writes it), `fetch_unpublished_events()`, `mark_published()`, `fetch_mapped_event_id()` (§10.2).
 - `EventAggregationStore.scan_all()` (§12.5).
-- `AggregationService`: `flush()`, `_persist_and_publish()`, the DB half of the duplicate check, and flush-before-replace in `_process()` (§12.1).
+- `AggregationService`: `flush()`, `_persist_and_publish()`, the DB half of the duplicate check, and flush-before-replace in `_merge()` (§12.1).
 - `AggregationConsumer`: the queue-empty and `AGG_DB_FLUSH_INTERVAL_S` flush triggers, each wrapped in `except Exception` → `aggregation_flush_failed`, and `start()`'s `finally: flush()` (§12.2).
 - `app/main.py`: `create_event_repository()` (§16).
 **Acceptance criteria** (per impl.md §10.2, §12.1, §12.2):
@@ -470,7 +470,7 @@ This document does not introduce new design — every ticket below implements so
 **Depends on:** every Aggregation ticket above; Deployment: SAPI Container, Compose & Production-like Run (below — the real-traffic run), run for an agreed length.
 **Scope:** Answer the Aggregation tuning questions that need real volume, from production logs and Redis/stream metrics — no new instrumentation.
 - **Q-1 (Aggregation's share):** `AGG_BATCH_SIZE`/`AGG_BATCH_TIMEOUT_MS`/`AGG_DB_FLUSH_INTERVAL_S`, from throughput, flush frequency, and flush duration.
-- **Group permits:** peak live groups vs. `AGG_MAX_CONCURRENT`, and how long the consumer loop waits for a permit (design.md §4.3's known limitation) — sizes `AGG_MAX_CONCURRENT`/`AGG_GROUP_IDLE_TIMEOUT_S`, and shows whether the proper fix is needed sooner.
+- **Group permits:** peak live groups vs. `AGG_MAX_CONCURRENT`, how long the consumer loop waits for a permit, and how soon a group starts again after idling out, from `aggregation_group_started` (`live_groups`, `permit_wait_ms`, `group_key`) (design.md §4.3's known limitation) — sizes `AGG_MAX_CONCURRENT`/`AGG_GROUP_IDLE_TIMEOUT_S`, and shows whether the proper fix is needed sooner.
 - **Late EntityEvents:** how often `aggregation_late_entity_event_skipped` fires, and from which sources — decides whether merging them into their older, already-flushed Event is worth building (design.md §4.4).
 - **`STREAM_CLAIM_TIMEOUT_MS` vs. group backlog** (impl.md §12.2's tuning note): busiest group's backlog depth × per-item time, against false reclaims.
 **Acceptance criteria:**
@@ -525,12 +525,12 @@ This document does not introduce new design — every ticket below implements so
 ### Scoring: Source Weights via Admin (M)
 
 **Status:** Created
-**Depends on:** Startup & Health: Fetch & Cache HK Stock List (for the shared `httpx` client); Aggregation: Consume & Merge into Active Events (for `RedisStateClient.hset()`/`expire()`)
+**Depends on:** Startup & Health: Fetch & Cache HK Stock List (for the shared `httpx` client); Aggregation: Consume & Merge into Active Events (for `RedisStateClient`)
 **Scope:** Read each source's authority weight and the active-source count from `source:config`, refreshing it from Admin on a cold key, with tier-default fallbacks (impl.md §9.2, §13.5; design.md §1.5).
 - `app/config.py`: `ScoringConfig.source_config_ttl_s`/`admin_api_url`/`total_active_sources_default`.
 - `app/clients/errors.py`: `AdminClientError`.
 - `app/clients/admin_client.py`: `AdminClient.fetch_sources()` + `create_admin_client()`/`get_admin_client()` (§9.2).
-- `app/redis/state_client.py`: `hmget()`/`hlen()` (§6.2) — not `exists()`, which nothing needs.
+- `app/redis/state_client.py`: `hmget()`/`hlen()`/`hset()`/`expire()` (§6.2) — not `exists()`, which nothing needs.
 - `app/scoring/rule_score.py`: `get_source_weights()`, `count_active_sources()`, `_fallback_weights()`, `_SOURCE_TIER`/`_DEFAULT_TIER_WEIGHTS` (§13.5).
 - `app/main.py`: `create_admin_client()` (§16).
 **Acceptance criteria** (per impl.md §9.2, §13.5):
@@ -721,7 +721,7 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Aggregation: Consume & Merge into Active Events (for `RedisStateClient`)
 **Scope:** Store Morning Brief versions in Redis and switch between them atomically (impl.md §10.4; design.md §6.5, §11.4).
-- `app/redis/state_client.py`: `get()`, `mget()`, `incr()`, `multi_exec()` (§6.2).
+- `app/redis/state_client.py`: `get()`, `mget()`, `incr()` (§6.2) — `multi_exec()` already exists (Aggregation: Consume & Merge into Active Events).
 - `app/persistent/cache_store.py`: `CacheStore` + `create_cache_store()`/`get_cache_store()` — `CachePointer`, `get_current_version()`, `get_current_pointer()`, `incr_version_counter()`, `write_cache_version()`, `read_cache_version()`, and the Redis-error translation (`_read()`, and in `get_current_pointer()`); not `scan_orphaned_versions()`.
 - `app/main.py`: `create_cache_store()` (§16).
 **Acceptance criteria** (per impl.md §10.4):

@@ -114,7 +114,7 @@ sapi/
 │   │   └── worker_pool.py               # WorkerPool: asyncio.Semaphore concurrency control + rate-limit-backoff coordination
 │   ├── aggregation/
 │   │   ├── aggregation_service.py       # AggregationService: process_entity_event() business logic; coroutine manager; flush()
-│   │   ├── aggregation_consumer.py      # AggregationConsumer: XREADGROUP consumer; _enqueued Set; on_processed callback; ACK
+│   │   ├── aggregation_consumer.py      # AggregationConsumer: XREADGROUP consumer; _enqueued Set; on_success callback; ACK
 │   │   ├── group_coroutine.py           # GroupCoroutine: per-group asyncio.Queue, strictly-serial execution — no business logic
 │   │   ├── sliding_window.py            # Pure sliding-window merge algorithm (no I/O)
 │   │   └── event_aggregation_store.py   # EventAggregationStore: Redis active-Event HASH read/write/scan (agg:event:*)
@@ -518,10 +518,10 @@ class EntityAnalysisConfig:
 ```python
 @dataclass
 class AggregationConfig:
-    batch_size: int                 # env: AGG_BATCH_SIZE
-    batch_timeout_ms: int           # env: AGG_BATCH_TIMEOUT_MS
-    max_concurrent: int             # env: AGG_MAX_CONCURRENT
-    group_idle_timeout_s: int       # env: AGG_GROUP_IDLE_TIMEOUT_S
+    batch_size: int                 # env: AGG_BATCH_SIZE (default 10)
+    batch_timeout_ms: int           # env: AGG_BATCH_TIMEOUT_MS (default 5000)
+    max_concurrent: int             # env: AGG_MAX_CONCURRENT (default 100) — live groups, see §12.1
+    group_idle_timeout_s: int       # env: AGG_GROUP_IDLE_TIMEOUT_S (default 10)
     db_flush_interval_s: int        # env: AGG_DB_FLUSH_INTERVAL_S (default 300)
     max_retry: int                  # env: AGG_MAX_RETRY
     sliding_window_hours: int       # env: SLIDING_WINDOW_HOURS (default 4)
@@ -2869,8 +2869,10 @@ The per-id read path into `entity_events`; `AggregationService.process_entity_ev
 _SELECT_ENTITY_EVENT_SQL = "SELECT * FROM entity_events WHERE entity_event_id = $1"
 
 def _row_to_entity_event(row: asyncpg.Record) -> EntityEvent:
+    additional_outcome = json.loads(row["additional_outcome"])   # no asyncpg JSON codec is registered, so JSONB
+    output = additional_outcome["output"]                        # comes back as text — the mirror of persist_entities()' json.dumps
     return EntityEvent(
-        source_id=UUID(row["metadata"]["cleaned_id"]),
+        source_id=UUID(json.loads(row["metadata"])["cleaned_id"]),
         source_url=row["source_url"],
         source_name=row["source_name"],
         published_at=row["published_at"],
@@ -2878,11 +2880,11 @@ def _row_to_entity_event(row: asyncpg.Record) -> EntityEvent:
         # Rebuild field-by-field: flat columns for stock_code/event_type_primary/sentiment_*; only
         # event_type_secondary is JSONB-only; company_name_* feed `stock` below.
         analysis_outcome=VersionedMetadata(
-            version=row["additional_outcome"]["version"],
+            version=additional_outcome["version"],
             output=AnalysisOutcome(
                 stock_code=row["stock_code"],
                 event_type_primary=row["event_type_primary"],
-                event_type_secondary=row["additional_outcome"]["output"]["event_type_secondary"],
+                event_type_secondary=output["event_type_secondary"],
                 sentiment_label=row["sentiment_label"],
                 sentiment_score=row["sentiment_score"],
                 headline=row["headline"],
@@ -2892,8 +2894,8 @@ def _row_to_entity_event(row: asyncpg.Record) -> EntityEvent:
         stock=Stock(   # §4.2 — rebuilt from the row alone, never from the live HKStockListCache (§11.1's EntityEvent notes)
             stock_code=row["stock_code"],
             exchange=row["exchange"],
-            company_name_zh=row["additional_outcome"]["output"]["company_name_zh"],
-            company_name_en=row["additional_outcome"]["output"]["company_name_en"],
+            company_name_zh=output["company_name_zh"],
+            company_name_en=output["company_name_en"],
         ),
         entity_event_id=row["entity_event_id"],
         created_at=row["created_at"],
@@ -3698,7 +3700,7 @@ The same `WorkerPool` class is used, as independent instances, by Entity Analysi
 
 Split three ways: `AggregationConsumer` (§12.2) owns `stream:entity_event_completed` consumption (loops, `_enqueued` guard, ACK, flush timing); `AggregationService` owns all business logic (group routing, `merge_or_create()` §12.4, `EventAggregationStore` writes §12.5, flush); `GroupCoroutine` (§12.3) is a pure serial scheduler with no business logic.
 
-ACK is deferred: a routed `EntityEvent` is ACKed when its `GroupCoroutine` reaches it (system-design.md §4.3), not when `process_entity_event()` returns. `AggregationConsumer._on_processed(entity_event_id, message_id)` (§12.2) ACKs and clears `_enqueued`; `_route_one()` wraps it in a zero-arg lambda for `process_entity_event()`'s `on_processed` parameter, since `message_id` has no other use there. `GroupCoroutine` only awaits the opaque `work` callable each queued item carries.
+ACK is deferred: a routed `EntityEvent` is ACKed when its `GroupCoroutine` reaches it (system-design.md §4.3), not when `process_entity_event()` returns. `AggregationConsumer._on_success(entity_event_id, message_id)` (§12.2) ACKs and clears `_enqueued`; `_route_one()` wraps it in a zero-arg lambda for `process_entity_event()`'s `on_success` parameter, since `message_id` has no other use there. `GroupCoroutine` only awaits the opaque `work` callable each queued item carries.
 
 #### Class: `AggregationService`
 
@@ -3706,7 +3708,7 @@ ACK is deferred: a routed `EntityEvent` is ACKed when its `GroupCoroutine` reach
 class AggregationService:
     def __init__(self, config: AggregationConfig):
         self._entity_event_repo = get_entity_event_repository()   # §10.1 — process_entity_event()'s read
-        self._event_repo = get_event_repository()         # §10.2 — _persist_and_publish()'s write, _process()'s duplicate check
+        self._event_repo = get_event_repository()         # §10.2 — _persist_and_publish()'s write, _merge()'s duplicate check
         self._redis_stream = get_redis_stream_client()    # §6.1 — publish only, never consumes here
         self._event_store = get_event_aggregation_store()   # §12.5
         self._config = config
@@ -3714,79 +3716,87 @@ class AggregationService:
         self._group_semaphore = asyncio.Semaphore(config.max_concurrent)
         self._last_flushed: dict[UUID, datetime] = {}   # event_id → aggregation_updated_at this process last flushed
 
-    async def process_entity_event(self, entity_event_id: UUID, on_processed: Callable[[], Awaitable[None]],
-                                   on_failed: Callable[[], None]) -> None:
+    async def process_entity_event(self, entity_event_id: UUID, on_success: Callable[[], Awaitable[None]],
+                                   on_failure: Callable[[], None]) -> None:
         """All business logic for one EntityEvent (GroupCoroutine, §12.3, runs none of it).
-        Safe to call directly, concurrently. on_processed (zero-arg, bound by
-        AggregationConsumer._route_one(), §12.2) ACKs; on_failed releases the caller's
+        Safe to call directly, concurrently. on_success (zero-arg, bound by
+        AggregationConsumer._route_one(), §12.2) ACKs; on_failure releases the caller's
         in-flight guard without ACKing so a redelivery retries (§12.2). A failure before
         the enqueue below propagates to the caller, which releases the guard itself."""
         entity_event = await self._entity_event_repo.fetch_entity_event(entity_event_id)   # §10.1 — same row EntityEventRepository.persist_entities() wrote
         if entity_event is None:
             # No row for this id — a redelivery can never make it appear, so ACK rather than retry (§12.6)
             logger.warning("aggregation_entity_event_missing", entity_event_id=entity_event_id)
-            await on_processed()
+            await on_success()
             return
         group_key = GroupKey(entity_event.stock.exchange, entity_event.stock.stock_code, entity_event.analysis_outcome.output.event_type_primary)   # §10.1 — EntityEvent has no flat fields of its own for these
+        group = await self._get_group(group_key)
+        await group.enqueue(lambda: self._merge(entity_event, group_key, on_success, on_failure))
+
+    async def _get_group(self, group_key: GroupKey) -> GroupCoroutine:
+        # Not dict.setdefault(...) — that would build the GroupCoroutine (and spawn its
+        # _run() Task, §12.3) unconditionally, orphaning a spurious task whose idle
+        # timeout would pop the real, active group instead.
         group = self._groups.get(group_key)
-        if group is None:
-            # Not dict.setdefault(...) — that would build the GroupCoroutine
-            # (and spawn its _run() Task, §12.3) unconditionally, even when
-            # group_key is already present, orphaning a spurious task whose
-            # eventual idle-timeout would pop the real, active group instead.
-            await self._group_semaphore.acquire()   # one permit per live group, held for its lifetime — released by _on_idle
-            group = self._groups.get(group_key)   # re-check: acquire() awaits, so another call may have
-            if group is None:                     # created group_key's GroupCoroutine while this one was waiting
-                def _on_idle(gk: GroupKey) -> None:
-                    self._groups.pop(gk, None)
-                    self._group_semaphore.release()
-                group = GroupCoroutine(group_key, self._config, _on_idle)
-                self._groups[group_key] = group
-            else:
-                self._group_semaphore.release()   # lost the race — give back the permit; group already exists
+        if group is not None:
+            return group
+        await self._group_semaphore.acquire()   # one permit per live group, held for its lifetime — released by _on_idle
+        group = self._groups.get(group_key)     # re-check: acquire() awaits, so another call may have
+        if group is not None:                   # started group_key's GroupCoroutine while this one waited
+            self._group_semaphore.release()
+            return group
+        group = GroupCoroutine(group_key, self._config, self._on_idle)
+        self._groups[group_key] = group
+        # Sizes AGG_MAX_CONCURRENT/AGG_GROUP_IDLE_TIMEOUT_S (Aggregation tuning): peak live
+        # groups, permit waits, and how soon a group restarts after idling out.
+        logger.info("aggregation_group_started", group_key=group_key,
+                    live_groups=len(self._groups), permit_wait_ms=...)   # time spent in acquire()
+        return group
 
-        async def _process() -> None:
-            step = "get_active_event"
-            try:
-                active_event = await self._event_store.get_active_event(entity_event.stock.exchange, entity_event.stock.stock_code, entity_event.analysis_outcome.output.event_type_primary)
-                # Duplicate signal (system-design.md §3.4/§4.4): already merged into the active
-                # Event (not yet flushed, or flushed but still active), or already flushed into
-                # some Event. Checked here, inside the group's serial queue, so it can't race
-                # a concurrent merge of the same entity_event_id.
-                step = "duplicate_check"
-                if (active_event is not None and entity_event_id in active_event.entity_event_ids) \
-                        or await self._event_repo.fetch_mapped_event_id(entity_event_id) is not None:
-                    logger.info("aggregation_duplicate_skipped", entity_event_id=entity_event_id, group_key=group_key)
-                    await on_processed()
-                    return
-                if active_event is not None and is_late(active_event, entity_event):   # §12.4
-                    # Skipped for now, not merged elsewhere (system-design.md §4.4) — ACKed,
-                    # since redelivery can't change the outcome
-                    logger.warning("aggregation_late_entity_event_skipped", entity_event_id=entity_event_id,
-                                   group_key=group_key, published_at=entity_event.published_at,
-                                   active_event_id=active_event.event_id, active_last_seen_at=active_event.last_seen_at)
-                    await on_processed()
-                    return
-                updated = merge_or_create(active_event, entity_event)
-                if active_event is not None and updated.event_id != active_event.event_id:
-                    # A new Event replaces the group's active one in the same Redis key —
-                    # persist the replaced Event's final state first, or its unflushed
-                    # merges are lost (system-design.md §4.5)
-                    step = "persist_replaced_event"
-                    await self._persist_and_publish([active_event])
-                step = "upsert_active_event"
-                await self._event_store.upsert_active_event(updated, ttl_for(updated))
-                step = "on_processed"
-                await on_processed()
-            except Exception:
-                # Never re-raised: one failed EntityEvent must not take down its group
-                # (GroupCoroutine, §12.3). on_failed() releases the in-flight guard
-                # without ACKing, so the reclaim loop retries it (§12.2).
-                logger.error("aggregation_process_failed", entity_event_id=entity_event_id,
-                             group_key=group_key, step=step, exc_info=True)
-                on_failed()
+    def _on_idle(self, group_key: GroupKey) -> None:   # synchronous — §12.3's invariant
+        self._groups.pop(group_key, None)
+        self._group_semaphore.release()
 
-        await group.enqueue(_process)
+    async def _merge(self, entity_event: EntityEvent, group_key: GroupKey,
+                     on_success: Callable[[], Awaitable[None]], on_failure: Callable[[], None]) -> None:
+        """The unit of work GroupCoroutine runs for one EntityEvent."""
+        entity_event_id = entity_event.entity_event_id
+        try:
+            active_event = await self._event_store.get_active_event(group_key.exchange, group_key.stock_code, group_key.event_type_primary)
+            # Duplicate signal (system-design.md §3.4/§4.4): already merged into the active
+            # Event (not yet flushed, or flushed but still active), or already flushed into
+            # some Event. Checked here, inside the group's serial queue, so it can't race
+            # a concurrent merge of the same entity_event_id.
+            if (active_event is not None and entity_event_id in active_event.entity_event_ids) \
+                    or await self._event_repo.fetch_mapped_event_id(entity_event_id) is not None:
+                logger.info("aggregation_duplicate_skipped", entity_event_id=entity_event_id, group_key=group_key)
+                await on_success()
+                return
+            if active_event is not None and is_late(active_event, entity_event):   # §12.4
+                # Skipped for now, not merged elsewhere (system-design.md §4.4) — ACKed,
+                # since redelivery can't change the outcome
+                logger.warning("aggregation_late_entity_event_skipped", entity_event_id=entity_event_id,
+                               group_key=group_key, published_at=entity_event.get_published_at(),
+                               active_event_id=active_event.event_id, active_last_seen_at=active_event.last_seen_at)
+                await on_success()
+                return
+            updated = merge_or_create(active_event, entity_event)
+            if active_event is not None and updated.event_id != active_event.event_id:
+                # A new Event replaces the group's active one in the same Redis key —
+                # persist the replaced Event's final state first, or its unflushed
+                # merges are lost (system-design.md §4.5)
+                await self._persist_and_publish([active_event])
+            await self._event_store.upsert_active_event(updated, ttl_for(updated))
+            await on_success()
+        # Never re-raised: one failed EntityEvent must not take down its group (§12.3).
+        # on_failure() releases the in-flight guard without ACKing, so the reclaim loop
+        # retries it (§12.2). Logged at the error's own level; the traceback shows the step.
+        except SAPIError as exc:
+            logger.log(exc.log_level, exc.dev_message, entity_event_id=entity_event_id, group_key=group_key, exc_info=exc)
+            on_failure()
+        except Exception as exc:
+            logger.error(f"Unhandled exception: {exc!r}", entity_event_id=entity_event_id, group_key=group_key, exc_info=exc)
+            on_failure()
 
     async def flush(self) -> None:
         """Pure business logic:
@@ -3804,7 +3814,7 @@ class AggregationService:
         Event — crash recovery is unchanged. It's reassigned only after
         _persist_and_publish() returns, so a failed flush re-sends the same
         Events next time; rebuilding it from `active` also drops entries for
-        keys that expired or were replaced. A key changed by _process()
+        keys that expired or were replaced. A key changed by _merge()
         between scan_all() and the reassignment records its older scanned
         value, which differs from the newer one, so the next flush sends it.
         No consumer-loop concerns — AggregationConsumer decides *when* to
@@ -3833,7 +3843,7 @@ class AggregationService:
         pending, so Scoring never re-scores an unchanged Event. Delivery is
         at-least-once: a crash between publish and mark_published re-publishes
         the same version, which Scoring re-scores harmlessly. Shared by
-        flush() and _process()'s replaced-Event branch."""
+        flush() and _merge()'s replaced-Event branch."""
 
     async def close(self) -> None:
         """Cancels every live GroupCoroutine's Task (§12.3) and awaits them.
@@ -3873,10 +3883,11 @@ Owns `stream:entity_event_completed` consumption (loops, `_enqueued` guard, flus
 
 ```python
 class AggregationConsumer:
-    def __init__(self, config: AggregationConfig):
+    def __init__(self, config: AggregationConfig, redis_config: RedisConfig):
         self._service = get_aggregation_service()          # §12.1
         self._redis_stream = get_redis_stream_client()    # §6.1 — consumes, reclaims, ACKs
         self._config = config
+        self._reconnect_interval_s = redis_config.reconnect_interval_s   # §6.1's reconnect behaviour
         self._enqueued: set[UUID] = set()
 
     async def start(self) -> None:
@@ -3919,17 +3930,17 @@ flowchart TD
     C -->|Messages| RTE{entity_event_id in\n_enqueued Set?}
     RTE -->|Yes| SKIP[Skip - already in flight\nleave unACKed for this delivery]
     RTE -->|No| ADD[Add to _enqueued Set — no await\nbetween this check and this insert]
-    ADD --> D[service.process_entity_event entity_event_id, on_processed\nAggregationService — see above]
+    ADD --> D[service.process_entity_event entity_event_id, on_success\nAggregationService — see above]
     D --> C
     FLUSH --> C
 ```
 
-> **`D` returns once the entity_event is enqueued onto its `GroupCoroutine`, not when it is processed.** The ACK happens later via `on_processed` → `self._on_processed(...)` (§12.3), so it isn't drawn here; `SKIP` is the only outcome `_route_one()` produces synchronously.
+> **`D` returns once the entity_event is enqueued onto its `GroupCoroutine`, not when it is processed.** The ACK happens later via `on_success` → `self._on_success(...)` (§12.3), so it isn't drawn here; `SKIP` is the only outcome `_route_one()` produces synchronously.
 
-#### Method: `AggregationConsumer._on_processed(entity_event_id: UUID, message_id: str) -> None`
+#### Method: `AggregationConsumer._on_success(entity_event_id: UUID, message_id: str) -> None`
 
 ```python
-async def _on_processed(self, entity_event_id: UUID, message_id: str) -> None:
+async def _on_success(self, entity_event_id: UUID, message_id: str) -> None:
     self._enqueued.discard(entity_event_id)
     await self._redis_stream.ack(EntityEventCompletedStream.NAME, EntityEventCompletedStream.CONSUMER_GROUP, message_id)
 ```
@@ -3944,12 +3955,15 @@ Purpose : Shared entry point for routing one EntityEvent id, whether it
           autoclaim() (§6.1). Implements the flowchart above from the
           _enqueued check onward, then calls
           self._service.process_entity_event(entity_event_id,
-          lambda: self._on_processed(entity_event_id, message_id),
-          lambda: self._enqueued.discard(entity_event_id)) inside
-          try/except Exception: a failure before the enqueue (e.g. the
-          fetch_entity_event() DB read) discards entity_event_id from
-          _enqueued, logs warning aggregation_route_failed with exc_info,
-          and leaves the message unACKed — not re-raised, so one bad
+          lambda: self._on_success(entity_event_id, message_id),
+          lambda: self._enqueued.discard(entity_event_id)). A failure
+          before the enqueue (e.g. the fetch_entity_event() DB read)
+          discards entity_event_id from _enqueued and leaves the message
+          unACKed. A stream Redis connection/timeout error (the missing-row
+          ACK) is re-raised to the loop's reconnect handling (§6.1); any
+          other error is logged at its own level — a SAPIError as
+          logger.log(exc.log_level, exc.dev_message, ...), anything else as
+          ERROR "Unhandled exception" — and not re-raised, so one bad
           message never takes down the consumer loop.
 Why failures release the guard : _enqueued must be cleared on every outcome; an entry left
           behind would make every redelivery SKIP until the message dead-letters at
@@ -3961,10 +3975,10 @@ Why the _enqueued guard exists : merge_or_create() (§12.4) appends entity_event
           double-append. The check-then-insert has no `await` in between (same pattern as
           §11.2's processing_cleaned_ids and §13.2's _in_process). It covers duplicates
           arriving while the first copy is in flight; later duplicates are caught by
-          _process()'s duplicate check (§12.1).
+          _merge()'s duplicate check (§12.1).
 ```
 
-`_enqueued` entries are removed by `_on_processed()` when the unit of work completes, not on enqueue, so a message still in the group's backlog keeps reading as already enqueued.
+`_enqueued` entries are removed by `_on_success()` when the unit of work completes, not on enqueue, so a message still in the group's backlog keeps reading as already enqueued.
 
 #### `_reclaim_loop()` (§6.1's Reclaim and Dead Letter pattern, applied here)
 
@@ -3993,7 +4007,7 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
 class GroupKey:
     exchange: str
     stock_code: str
-    event_type_primary: str
+    event_type_primary: EventTypeEnum
 
 class GroupCoroutine:
     def __init__(self, group_key: GroupKey, config: AggregationConfig, on_idle: Callable[[GroupKey], None]):
@@ -4012,10 +4026,15 @@ class GroupCoroutine:
         what work does."""
         await self._queue.put(work)
 
+    async def close(self) -> None:
+        """Cancel this group's Task and wait for it — AggregationService.close() (§12.1)."""
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+
     async def _run(self) -> None:
         """Purely a serial scheduler: no merge_or_create(), no EventAggregationStore,
         no ACK logic of its own; whatever work does (merge, DB write,
-        on_processed call) is AggregationService's business, not this
+        on_success call) is AggregationService's business, not this
         class's."""
         while True:
             try:
@@ -4034,7 +4053,7 @@ class GroupCoroutine:
             try:
                 await work()
             except Exception:
-                # Backstop only — work() (_process(), §12.1) catches its own
+                # Backstop only — work() (_merge(), §12.1) catches its own
                 # failures, so this is a bug in that handling itself. This
                 # Task is never awaited, so re-raising would only end it
                 # silently and drop every item still queued. Log and move on:
@@ -4047,11 +4066,11 @@ class GroupCoroutine:
 
 `GroupKey` is `frozen=True` so it can be used as a `dict` key (`self._groups`, below) and passed around by value — the same triple as `Event.exchange`/`stock_code`/`event_type_primary` (§3.3), since a group's key and the `Event` it produces always share those three fields.
 
-`work` is a per-call closure built by `AggregationService.process_entity_event()` (§12.1). `GroupCoroutine` takes no `EventAggregationStore`, `on_processed`, or `redis_stream`, so it is testable with no knowledge of merging or Redis; a generic serial scheduler can only take something opaque. `on_idle` is the one callback parameter, carrying lifecycle bookkeeping only (removing the dict entry, releasing the semaphore permit); `_run()` calls it on the idle timeout. An exception from `work()` doesn't end the group: `_run()` logs it and continues. The other way the Task ends is cancellation by `AggregationService.close()` (§12.1).
+`work` is a per-call closure built by `AggregationService.process_entity_event()` (§12.1). `GroupCoroutine` takes no `EventAggregationStore`, `on_success`, or `redis_stream`, so it is testable with no knowledge of merging or Redis; a generic serial scheduler can only take something opaque. `on_idle` is the one callback parameter, carrying lifecycle bookkeeping only (removing the dict entry, releasing the semaphore permit); `_run()` calls it on the idle timeout. An exception from `work()` doesn't end the group: `_run()` logs it and continues. The other way the Task ends is cancellation by `AggregationService.close()` (§12.1).
 
 > **Invariant: this race-freedom depends on two things staying true that aren't visible from the code alone.** `self._queue` must stay unbounded (`asyncio.Queue()`, no `maxsize`) — an unbounded queue's `put()` never suspends, which is what makes a caller's "look up group → enqueue → put on queue" one uninterruptible stretch relative to `_run()`'s own "check `queue.empty()` → evict" stretch; either can run first safely, but only because neither can be interrupted mid-way. `_on_idle` (§12.1's `_on_idle`) must also stay fully synchronous — no `await` inside it — for the same reason: an `await` there would let another task interleave between the empty-check and the dict `pop()`, reopening the exact race this design closes. If `self._queue` ever gets a `maxsize` (e.g. for backpressure) or `_on_idle` ever needs to `await` something, this section's whole safety argument needs revisiting, not just a local tweak.
 
-> **Trade-off: opaque `work` hides context from the stack trace.** A `work()` exception surfaces at `_run()`'s `await work()` with no indication of the step or `entity_event_id`, so `_process()` (§12.1) logs `aggregation_process_failed` with `entity_event_id`, `group_key` and the step itself, and doesn't re-raise; `_run()`'s `except` is the backstop.
+> **Trade-off: opaque `work` hides context from the stack trace.** A `work()` exception surfaces at `_run()`'s `await work()` with no indication of the `entity_event_id`, so `_merge()` (§12.1) catches and logs its own failures with `entity_event_id` and `group_key`, and doesn't re-raise; `_run()`'s `except` is the backstop.
 
 The Coroutine Manager (`self._groups`, gated by `self._group_semaphore`, §12.1) lives directly in `AggregationService`; it is routing and lifecycle only, not a separate module.
 
@@ -4154,10 +4173,10 @@ Called by `AggregationService.process_entity_event()`'s unit-of-work closure (§
 Owns the `agg:event:*` key format and the `Event` (Redis-active stage, §3.3) ↔ hash encode/decode, built on `RedisStateClient`'s generic primitives (§6.2). `AggregationService` sees only typed `Event`s, and `GroupCoroutine` doesn't touch it (§12.3). The hash stores five fields (`event_id`, `first_seen_at`, `last_seen_at`, `aggregation_updated_at`, `entity_event_ids`); `aggregation_updated_at` must survive the round-trip to `EventRepository.persist_events()` (§10.2). Other `Event` fields come back `None` (§3.3).
 
 ```python
-def _key(exchange: str, stock_code: str, event_type_primary: str) -> str:
+def _get_key(exchange: str, stock_code: str, event_type_primary: EventTypeEnum) -> str:
     return f"agg:event:{exchange}:{stock_code}:{event_type_primary}"
 
-def _decode(exchange: str, stock_code: str, event_type_primary: str, fields: dict) -> Event:
+def _decode(exchange: str, stock_code: str, event_type_primary: EventTypeEnum, fields: dict[str, str]) -> Event:
     return Event(
         event_id=UUID(fields["event_id"]),
         exchange=exchange, stock_code=stock_code, event_type_primary=event_type_primary,
@@ -4172,24 +4191,27 @@ class EventAggregationStore:
         self._state_client = get_redis_state_client()   # §6.2
 
     async def get_active_event(self, exchange, stock_code, event_type_primary) -> Optional[Event]:
-        fields = await self._state_client.hgetall(_key(exchange, stock_code, event_type_primary))
+        fields = await self._state_client.hgetall(_get_get_key(exchange, stock_code, event_type_primary))
         if fields is None:
             return None
         return _decode(exchange, stock_code, event_type_primary, fields)
 
     async def upsert_active_event(self, active_event: Event, ttl_s: int) -> None:
-        key = _key(active_event.exchange, active_event.stock_code, active_event.event_type_primary)
-        encoded = {
+        key = _get_key(active_event.exchange, active_event.stock_code, active_event.event_type_primary)
+        fields = {
             "event_id": str(active_event.event_id),
             "first_seen_at": active_event.first_seen_at.isoformat(),
             "last_seen_at": active_event.last_seen_at.isoformat(),
             "aggregation_updated_at": active_event.aggregation_updated_at.isoformat(),
             "entity_event_ids": json.dumps([str(i) for i in active_event.entity_event_ids]),
         }
-        await self._state_client.hset(key, encoded)
-        await self._state_client.expire(key, ttl_s)   # always both together — system-design.md §4.4:
-                                                        # reset TTL to min(SLIDING_WINDOW_HOURS,
-                                                        # remaining_lifespan) on every merge
+        # One MULTI/EXEC (multi_exec, §6.2): TTL reset on every merge (system-design.md §4.4),
+        # and a key never exists without its TTL — a failure between two separate calls would
+        # leave one that a redelivery, skipped as a duplicate, never fixes.
+        def queue_upsert(pipe: redis.asyncio.client.Pipeline) -> None:
+            pipe.hset(key, mapping=fields)
+            pipe.expire(key, ttl_s)
+        await self._state_client.multi_exec(queue_upsert)
 
     async def scan_all(self) -> list[Event]:
         """Parses each Redis key back into its (exchange, stock_code, event_type_primary)
@@ -4227,11 +4249,11 @@ def create_event_aggregation_store() -> EventAggregationStore:
 
 | Scenario | Implementation |
 |---|---|
-| DB read failure (EntityEvent fetch) | `EntityEventRepository.fetch_entity_event()` (§10.1) raises inside `AggregationService.process_entity_event()`, before anything is enqueued; caught by `AggregationConsumer._route_one()` (§12.2): discard from `_enqueued`, log warning `aggregation_route_failed`, leave unACKed — the reclaim loop retries |
-| EntityEvent row not found | `fetch_entity_event()` returns `None` — `stream:entity_event_completed` is only published after `persist_entities()` commits (§11.1), so this means the row is gone, and no redelivery can fix it. `process_entity_event()` logs `aggregation_entity_event_missing` (warning) and calls `on_processed()` (ACK) without enqueueing |
-| `RedisStateClient` unreachable, or any other failure inside the unit of work (duplicate-check read, replaced-Event persist, merge, upsert, ACK) | Caught by `_process()`'s own `try`/`except` (§12.1): log ERROR `aggregation_process_failed` with `entity_event_id`/`group_key`/`step`, call `on_failed()` (discard from `_enqueued`, no ACK), don't re-raise — the group keeps running and the reclaim loop retries |
+| DB read failure (EntityEvent fetch) | `EntityEventRepository.fetch_entity_event()` (§10.1) raises inside `AggregationService.process_entity_event()`, before anything is enqueued; caught by `AggregationConsumer._route_one()` (§12.2): discard from `_enqueued`, log at the error's own level, leave unACKed — the reclaim loop retries |
+| EntityEvent row not found | `fetch_entity_event()` returns `None` — `stream:entity_event_completed` is only published after `persist_entities()` commits (§11.1), so this means the row is gone, and no redelivery can fix it. `process_entity_event()` logs `aggregation_entity_event_missing` (warning) and calls `on_success()` (ACK) without enqueueing |
+| `RedisStateClient` unreachable, or any other failure inside the unit of work (duplicate-check read, replaced-Event persist, merge, upsert, ACK) | Caught by `_merge()`'s own `try`/`except` (§12.1): log with `entity_event_id`/`group_key` at the error's own level (a `SAPIError`'s `log_level`; ERROR for anything else, including untranslated Redis errors), call `on_failure()` (discard from `_enqueued`, no ACK), don't re-raise — the group keeps running and the reclaim loop retries |
 | DB Flush failure | `EventRepository.persist_events()` (§10.2) rolls back and re-raises after `_db_write_with_retry()`'s retries are exhausted (§5.2); `AggregationService.flush()` propagates; `_consumer_loop()` (§12.2) logs warning `aggregation_flush_failed` and continues — the next trigger retries the same still-active Redis state, nothing is lost |
-| `GroupCoroutine` failure | Only reachable by a bug in `_process()`'s own failure handling (§12.3's backstop): `_run()` logs CRITICAL `aggregation_group_work_failed` and continues with the group's next item — the group, the consumer loop, and the layer Task all keep running. Each group runs in its own never-awaited Task, so this never reaches Coroutine Monitoring (§16) or `layers.aggregation`. Only the failing item is lost: its `_enqueued` entry stays set, so redeliveries are skipped until it's dead-lettered at `AGG_MAX_RETRY` — acceptable for a genuine bug, which redelivery couldn't fix anyway |
+| `GroupCoroutine` failure | Only reachable by a bug in `_merge()`'s own failure handling (§12.3's backstop): `_run()` logs CRITICAL `aggregation_group_work_failed` and continues with the group's next item — the group, the consumer loop, and the layer Task all keep running. Each group runs in its own never-awaited Task, so this never reaches Coroutine Monitoring (§16) or `layers.aggregation`. Only the failing item is lost: its `_enqueued` entry stays set, so redeliveries are skipped until it's dead-lettered at `AGG_MAX_RETRY` — acceptable for a genuine bug, which redelivery couldn't fix anyway |
 | `RedisStreamClient` unreachable | Per §6.1's reconnect behaviour |
 
 ---
@@ -5569,7 +5591,7 @@ async def lifespan(app: FastAPI):
         cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis, config.redis)
         aggregation_service = create_aggregation_service(config.aggregation)
         resources.push_async_callback(aggregation_service.close)   # group Tasks outlive the layer Task (§12.1)
-        agg_consumer = AggregationConsumer(config.aggregation)
+        agg_consumer = AggregationConsumer(config.aggregation, config.redis)
         create_scoring_service(config.scoring)
         scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring)
         cache_service = create_cache_service(config.cache)
