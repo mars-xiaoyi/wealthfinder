@@ -29,12 +29,13 @@ from app.models.versioned_metadata import VersionedMetadata
 from app.persistent import entity_event_repository as entity_event_repository_module
 from app.persistent.entity_event_repository import EntityEventRepository
 from app.redis import stream_client as stream_client_module
-from app.redis.stream_client import STREAM_ENTITY_EVENT_COMPLETED, RedisStreamClient
+from app.redis.stream_client import RedisStreamClient
 from app.skills.entity_analysis_skill import ExtractedEntity, LLMOutput
 
 CONFIG = EntityAnalysisConfig(
     batch_size=10,
     batch_timeout_ms=5000,
+    max_retry=3,
     max_input_chars=30000,
     sadi_api_url="http://sadi:8000",
     consumer_name="pod-1",
@@ -92,7 +93,8 @@ def _entity_event(stock: Stock, entity_event_id: UUID | None = None) -> EntityEv
 def _published(*entity_event_ids: UUID) -> list:
     return [
         mock.call(
-            STREAM_ENTITY_EVENT_COMPLETED, {"entity_event_id": str(entity_event_id), "v": "1"}
+            "stream:entity_event_completed",
+            {"entity_event_id": str(entity_event_id), "v": "1"},
         )
         for entity_event_id in entity_event_ids
     ]
@@ -165,10 +167,12 @@ async def find_entity_events_success(news_client, adapter, repository, redis_str
     assert calls.mock_calls == [
         mock.call.persist_entities([_entity_event(TENCENT), _entity_event(HSBC)]),
         mock.call.publish(
-            STREAM_ENTITY_EVENT_COMPLETED, {"entity_event_id": str(UUID(int=1)), "v": "1"}
+            "stream:entity_event_completed",
+            {"entity_event_id": str(UUID(int=1)), "v": "1"},
         ),
         mock.call.publish(
-            STREAM_ENTITY_EVENT_COMPLETED, {"entity_event_id": str(UUID(int=2)), "v": "1"}
+            "stream:entity_event_completed",
+            {"entity_event_id": str(UUID(int=2)), "v": "1"},
         ),
     ]
 

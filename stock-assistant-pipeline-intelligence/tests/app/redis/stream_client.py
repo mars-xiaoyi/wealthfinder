@@ -7,7 +7,7 @@ import redis.exceptions
 
 from app.common.errors import ServiceUnavailableError
 from app.redis import stream_client as stream_client_module
-from app.redis.stream_client import RedisStreamClient, StreamMessage
+from app.redis.stream_client import ReclaimedMessage, RedisStreamClient, StreamMessage
 
 REDIS_URL = "redis://localhost:6379/0"
 STREAM = "stream:test"
@@ -127,6 +127,65 @@ async def ack(redis_mock):
     await RedisStreamClient(redis_mock, RECONNECT_INTERVAL_S).ack(STREAM, GROUP, "1-0")
 
     redis_mock.xack.assert_awaited_once_with(STREAM, GROUP, "1-0")
+
+
+def _pending(message_id: str, times_delivered: int) -> list[dict[str, object]]:
+    return [
+        {
+            "message_id": message_id,
+            "consumer": "consumer-1",
+            "time_since_delivered": 0,
+            "times_delivered": times_delivered,
+        }
+    ]
+
+
+async def autoclaim_success(redis_mock):
+    """Each claimed message carries its delivery count; one ACKed since the claim (no pending
+    entry left) is left out."""
+    redis_mock.xautoclaim = AsyncMock(
+        return_value=[
+            "0-0",
+            [
+                ("1-0", {"cleaned_id": "a", "v": "1"}),
+                ("2-0", {"cleaned_id": "b", "v": "1"}),
+                ("3-0", {"cleaned_id": "c", "v": "1"}),
+            ],
+            [],
+        ]
+    )
+    pipe = MagicMock()
+    pipe.__aenter__.return_value = pipe
+    pipe.execute = AsyncMock(return_value=[_pending("1-0", 2), [], _pending("3-0", 5)])
+    redis_mock.pipeline.return_value = pipe
+
+    messages = await RedisStreamClient(redis_mock, RECONNECT_INTERVAL_S).autoclaim(
+        STREAM, GROUP, "consumer-1", min_idle_ms=1500, count=5
+    )
+
+    assert messages == [
+        ReclaimedMessage(id="1-0", fields={"cleaned_id": "a", "v": "1"}, delivery_count=2),
+        ReclaimedMessage(id="3-0", fields={"cleaned_id": "c", "v": "1"}, delivery_count=5),
+    ]
+    redis_mock.xautoclaim.assert_awaited_once_with(
+        STREAM, GROUP, "consumer-1", min_idle_time=1500, count=5
+    )
+    redis_mock.pipeline.assert_called_once_with(transaction=False)
+    assert pipe.xpending_range.call_args_list == [
+        mock.call(STREAM, GROUP, min=message_id, max=message_id, count=1)
+        for message_id in ("1-0", "2-0", "3-0")
+    ]
+
+
+async def autoclaim_nothing_pending(redis_mock):
+    redis_mock.xautoclaim = AsyncMock(return_value=["0-0", [], []])
+
+    messages = await RedisStreamClient(redis_mock, RECONNECT_INTERVAL_S).autoclaim(
+        STREAM, GROUP, "consumer-1", min_idle_ms=1500, count=5
+    )
+
+    assert messages == []
+    redis_mock.pipeline.assert_not_called()
 
 
 async def ping(redis_mock):
