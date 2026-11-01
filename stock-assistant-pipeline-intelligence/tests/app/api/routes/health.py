@@ -69,10 +69,16 @@ def config():
             reconnect_interval_s=5,
             stream_claim_timeout_ms=300000,
         ),
-        llm=LLMConfig(vertex_project="wealthfinder", vertex_location="global", api_timeout_s=30),
+        llm=LLMConfig(
+            vertex_project="wealthfinder",
+            vertex_location="global",
+            api_timeout_s=30,
+            rate_limit_backoff_s=60,
+        ),
         entity_analysis=EntityAnalysisConfig(
             batch_size=10,
             batch_timeout_ms=5000,
+            max_concurrent=3,
             max_retry=3,
             max_input_chars=30000,
             sadi_api_url="http://sadi:8000",

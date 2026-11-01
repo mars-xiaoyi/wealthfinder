@@ -42,11 +42,13 @@ OPTIONAL_ENV = (
     "STREAM_CLAIM_TIMEOUT_MS",
     "ENTITY_ANALYSIS_BATCH_SIZE",
     "ENTITY_ANALYSIS_BATCH_TIMEOUT_MS",
+    "ENTITY_ANALYSIS_MAX_CONCURRENT",
     "ENTITY_ANALYSIS_MAX_RETRY",
     "SADI_API_URL",
     "HOSTNAME",
     "VERTEX_AI_LOCATION",
     "LLM_API_TIMEOUT_S",
+    "RATE_LIMIT_BACKOFF_S",
     "ENTITY_ANALYSIS_MAX_INPUT_CHARS",
 )
 # A project id for cases that never call Vertex AI; nothing is sent to it.
@@ -354,14 +356,21 @@ class _SADIHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         cleaned_id = self.path.rsplit("/", 1)[-1]
         stub = self.server.stub
-        stub.requests.append(SADIRequest(cleaned_id, time.monotonic()))
-        behaviour = stub.behaviours.get(cleaned_id, _Behaviour(200, 0.0))
-        time.sleep(behaviour.delay_s)
-        body = json.dumps(_sadi_body(cleaned_id, behaviour)).encode()
-        self.send_response(behaviour.status)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        with stub.lock:
+            stub.requests.append(SADIRequest(cleaned_id, time.monotonic()))
+            stub.in_flight += 1
+            stub.peak_in_flight = max(stub.peak_in_flight, stub.in_flight)
+        try:
+            behaviour = stub.behaviours.get(cleaned_id, _Behaviour(200, 0.0))
+            time.sleep(behaviour.delay_s)
+            body = json.dumps(_sadi_body(cleaned_id, behaviour)).encode()
+            self.send_response(behaviour.status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        finally:
+            with stub.lock:
+                stub.in_flight -= 1
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -388,10 +397,14 @@ def _sadi_body(cleaned_id: str, behaviour: _Behaviour) -> dict[str, object]:
 class StubSADI:
     """A local HTTP server standing in for SADI's GET /v1/cleaned_news/{cleaned_id}. Every id
     answers 200 with an article unless respond() says otherwise. It can be stopped and started
-    again on the same port."""
+    again on the same port. in_flight counts the requests being answered right now, and
+    peak_in_flight the most there have been at once."""
 
     def __init__(self) -> None:
         self.requests: list[SADIRequest] = []
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.peak_in_flight = 0
         self.behaviours: dict[str, _Behaviour] = {}
         self._server: _SADIServer | None = None
         self._port = 0
