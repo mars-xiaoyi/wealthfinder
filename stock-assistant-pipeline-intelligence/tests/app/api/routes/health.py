@@ -19,6 +19,7 @@ from app.common.errors import ServiceUnavailableError
 from app.common.hk_stock_list import HKStockListCache
 from app.common.stock import Stock
 from app.config import (
+    AggregationConfig,
     AppConfig,
     DatabaseConfig,
     EntityAnalysisConfig,
@@ -84,6 +85,7 @@ def config():
             sadi_api_url="http://sadi:8000",
             consumer_name="sapi-entity-analysis-1",
         ),
+        aggregation=AggregationConfig(sliding_window_hours=4, event_max_timespan_hours=24),
     )
 
 

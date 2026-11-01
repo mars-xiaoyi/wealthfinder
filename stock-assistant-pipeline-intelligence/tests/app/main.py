@@ -10,6 +10,7 @@ from app import main as main_module
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ParseError, ServiceUnavailableError
 from app.config import (
+    AggregationConfig,
     AppConfig,
     DatabaseConfig,
     EntityAnalysisConfig,
@@ -50,6 +51,7 @@ CONFIG = AppConfig(
         sadi_api_url="http://sadi:8000",
         consumer_name="sapi-entity-analysis-1",
     ),
+    aggregation=AggregationConfig(sliding_window_hours=4, event_max_timespan_hours=24),
 )
 
 
