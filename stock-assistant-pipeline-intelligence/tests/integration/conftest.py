@@ -285,14 +285,12 @@ class StubResponse:
 
 class _StubServer(http.server.ThreadingHTTPServer):
     response: StubResponse
-    requests: int
 
 
 class _StubHandler(http.server.BaseHTTPRequestHandler):
     server: _StubServer
 
     def do_GET(self) -> None:
-        self.server.requests += 1
         self.send_response(self.server.response.status)
         self.send_header("Content-Length", str(len(self.server.response.body)))
         self.end_headers()
@@ -309,10 +307,6 @@ class StubHKEX:
     url: str
     server: _StubServer
 
-    @property
-    def requests(self) -> int:
-        return self.server.requests
-
 
 @pytest.fixture
 def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
@@ -321,7 +315,6 @@ def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
     def start(response: StubResponse) -> StubHKEX:
         server = _StubServer(("127.0.0.1", 0), _StubHandler)
         server.response = response
-        server.requests = 0
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
         return StubHKEX(url=f"http://127.0.0.1:{server.server_address[1]}", server=server)
@@ -330,11 +323,6 @@ def stub_hkex() -> Iterator[Callable[[StubResponse], StubHKEX]]:
     for server in servers:
         server.shutdown()
         server.server_close()
-
-
-@dataclasses.dataclass
-class SADIRequest:
-    cleaned_id: str
 
 
 @dataclasses.dataclass
@@ -354,7 +342,7 @@ class _SADIHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         cleaned_id = self.path.rsplit("/", 1)[-1]
         stub = self.server.stub
-        stub.requests.append(SADIRequest(cleaned_id))
+        stub.requests.append(cleaned_id)
         behaviour = stub.behaviours.get(cleaned_id, _Behaviour(200))
         body = json.dumps(_sadi_body(cleaned_id, behaviour)).encode()
         self.send_response(behaviour.status)
@@ -386,19 +374,19 @@ def _sadi_body(cleaned_id: str, behaviour: _Behaviour) -> dict[str, object]:
 
 class StubSADI:
     """A local HTTP server standing in for SADI's GET /v1/cleaned_news/{cleaned_id}. Every id
-    answers 200 with an article unless respond() says otherwise. It can be stopped and started
-    again on the same port."""
+    answers 200 with an article unless respond() says otherwise. requests holds the cleaned_id
+    of every request, in arrival order."""
 
     def __init__(self) -> None:
-        self.requests: list[SADIRequest] = []
+        self.requests: list[str] = []
         self.behaviours: dict[str, _Behaviour] = {}
-        self._server: _SADIServer | None = None
-        self._port = 0
-        self.start()
+        self._server = _SADIServer(("127.0.0.1", 0), _SADIHandler)
+        self._server.stub = self
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._port}"
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
 
     def respond(self, cleaned_id: uuid.UUID, status: int) -> None:
         self.behaviours[str(cleaned_id)] = _Behaviour(status)
@@ -407,21 +395,12 @@ class StubSADI:
         """Answer cleaned_id with 200 and an article of this title and body."""
         self.behaviours[str(cleaned_id)] = _Behaviour(200, title, body)
 
-    def requests_for(self, cleaned_id: uuid.UUID) -> list[SADIRequest]:
-        return [r for r in self.requests if r.cleaned_id == str(cleaned_id)]
-
-    def start(self) -> None:
-        server = _SADIServer(("127.0.0.1", self._port), _SADIHandler)
-        server.stub = self
-        self._port = server.server_address[1]
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self._server = server
+    def requests_for(self, cleaned_id: uuid.UUID) -> list[str]:
+        return [request for request in self.requests if request == str(cleaned_id)]
 
     def stop(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
+        self._server.shutdown()
+        self._server.server_close()
 
 
 @pytest.fixture

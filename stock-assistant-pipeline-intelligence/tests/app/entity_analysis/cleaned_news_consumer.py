@@ -567,13 +567,13 @@ async def start_loops_share_worker_pool(redis_stream, service):
         await _new_consumer().start()
 
     assert peak == 2
-    assert sorted(call.args[0] for call in service.find_entity_events.await_args_list) == [
-        ID_A,
-        ID_B,
-        ID_C,
+    assert service.find_entity_events.await_args_list == [
+        mock.call(ID_A),
+        mock.call(ID_B),
+        mock.call(ID_C),
     ]
-    assert sorted(call.args[2] for call in redis_stream.ack.await_args_list) == [
-        MESSAGE_A.id,
-        MESSAGE_B.id,
-        MESSAGE_C.id,
+    assert redis_stream.ack.await_args_list == [
+        _ack_call(MESSAGE_A),
+        _ack_call(MESSAGE_B),
+        _ack_call(MESSAGE_C),
     ]

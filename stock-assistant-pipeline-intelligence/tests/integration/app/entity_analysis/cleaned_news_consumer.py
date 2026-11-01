@@ -23,9 +23,6 @@ from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 from app.llm import vertex_adapter
 from app.llm.adapter import LLMAdapter, StructuredLLMResponse
-from app.llm.errors import (
-    LLMError,
-)
 from app.models.entity_event import EventTypeEnum, SentimentEnum
 from app.skills.entity_analysis_skill import ExtractedEntity, LLMOutput
 from tests.integration.conftest import (
@@ -472,12 +469,11 @@ REPUBLISHED_EVENT = "entity_analysis_republished"
 
 
 class FakeLLMAdapter(LLMAdapter):
-    """Stands in for Vertex AI: answers every call with items, or raises error. While hold is
-    set, a call waits for it before answering; entered is set once a call has started."""
+    """Stands in for Vertex AI: answers every call with items. While hold is set, a call waits
+    for it before answering; entered is set once a call has started."""
 
     def __init__(self) -> None:
         self.items: list[ExtractedEntity] = []
-        self.error: LLMError | None = None
         self.hold: asyncio.Event | None = None
         self.entered = asyncio.Event()
         self.calls = 0
@@ -487,8 +483,6 @@ class FakeLLMAdapter(LLMAdapter):
         self.entered.set()
         if self.hold is not None:
             await self.hold.wait()
-        if self.error is not None:
-            raise self.error
         return StructuredLLMResponse(
             output=LLMOutput(output_items=self.items),
             input_tokens=1000,
