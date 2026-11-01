@@ -319,7 +319,7 @@ Within each Group Coroutine, EntityEvents are processed in arrival order from th
 
 > **Duplicate EntityEvents:** the Entity Analysis Layer's signal is at-least-once (§3.4), and the merge itself is not idempotent — merging the same EntityEvent twice double-counts it, or, once its original Event has been flushed and left Redis, creates a second Event for an EntityEvent that already belongs to one. Before merging, the Group Coroutine therefore skips (and ACKs) any EntityEvent already in the group's active Event or already mapped in `event_entity_map` (§10.4). The check runs inside the group's serial queue (§4.3), so it can't race with a concurrent merge of the same EntityEvent.
 
-> **`published_at` fallback:** Retrieved via `COALESCE(published_at, created_at)` at query time. Source data is not modified.
+> **`published_at` fallback:** an EntityEvent without a publication time is placed at its `created_at` for the merge math, in code rather than in the query (implementation.md §11.1). Source data is not modified.
 
 ### 4.5 DB Flush
 
@@ -344,7 +344,7 @@ On each flush, within a single DB transaction:
 
 ### 4.6 Configuration Parameters
 
-Defined as `AggConfig`: implementation.md §4.1.
+Defined as `AggregationConfig`: implementation.md §4.1.
 
 ### 4.7 Error Handling
 

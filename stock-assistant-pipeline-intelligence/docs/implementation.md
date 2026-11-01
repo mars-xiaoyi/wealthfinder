@@ -247,6 +247,7 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.models.entity_event import EventTypeEnum            # §3.1
 from app.models.versioned_metadata import VersionedMetadata   # §3.2
 
 class BriefSummary(BaseModel):
@@ -256,7 +257,7 @@ class BriefSummary(BaseModel):
     key_numbers: list[str]  # max 3 items; may be empty
 
 @dataclass
-class SourceListItem:
+class EntitySource:
     source_name: str        # e.g. "HKEX", "MINGPAO"; matches entity_events.source_name / source:config keys
     url: str                # Original article URL for this source's constituent EntityEvent
     published_at: datetime  # UTC
@@ -266,11 +267,11 @@ class Event:
     event_id: UUID                       # Primary key; generate with uuid.uuid4() on first creation
     exchange: str                        # Morning Brief API filter
     stock_code: str                      # Morning Brief API filter
-    event_type_primary: str              # Morning Brief API filter
+    event_type_primary: EventTypeEnum    # Morning Brief API filter
     first_seen_at: datetime              # published_at of earliest constituent EntityEvent
     last_seen_at: datetime               # published_at of most recent constituent EntityEvent
-    event_type_secondary: Optional[list[str]] = None       # Up to 2 secondary types, frequency-ranked (PRD §OQ-8) — None until persisted; the UPSERT computes it (§10.2), so whatever's set pre-persist is never read
-    source_list: Optional[list[SourceListItem]] = None      # One entry per distinct source reporting this Event — None until persisted, same as event_type_secondary
+    event_type_secondary: Optional[list[EventTypeEnum]] = None       # Up to 2 secondary types, frequency-ranked (PRD §OQ-8) — None until persisted; the UPSERT computes it (§10.2), so whatever's set pre-persist is never read
+    source_list: Optional[list[EntitySource]] = None      # One entry per distinct source reporting this Event — None until persisted, same as event_type_secondary
     brief_summary: Optional[VersionedMetadata[BriefSummary]] = None  # NULL until the Scoring Layer's first pass (§13.1)
     brief_summary_aggregation_updated_at: Optional[datetime] = None  # the aggregation_updated_at brief_summary was generated for — lets a retry reuse it (§13.1 step 2)
     brief_summary_fallback: Optional[bool] = None                    # whether brief_summary came from BriefSummarySkill's fallback (§8.3)
@@ -278,6 +279,10 @@ class Event:
     updated_at: Optional[datetime] = None                    # same
     created_at: Optional[datetime] = None                    # same — preserved across re-flushes of the same event_id by the UPSERT's own ON CONFLICT clause, which never re-sets it
     entity_event_ids: Optional[list[UUID]] = None            # Aggregation Layer-only, pre-persist: drives EventRepository.persist_events()'s event_entity_map write (§10.2). Never populated by fetch_event() — nothing reads it back off a persisted Event.
+
+    def is_active_event(self) -> bool:
+        """Return whether this is a group's active Event, which EntityEvents are merged into."""
+        return self.entity_event_ids is not None and len(self.entity_event_ids) > 0
 
     @property
     def source_count(self) -> Optional[int]:
@@ -287,7 +292,7 @@ class Event:
 
 `Event` is one type across its three lifecycle stages: Redis-active (§12.3–§12.5), input to `EventRepository.persist_events()` (§10.2), and the persisted row read back by Scoring/Cache (§13.1/§14.1). `event_id`/`exchange`/`stock_code`/`event_type_primary`/`first_seen_at`/`last_seen_at`/`aggregation_updated_at` are set by `merge_or_create()` (§12.4); the remaining fields are `Optional` because the DB write computes them. After a read-back every field except `entity_event_ids` is populated.
 
-> `source_list` is stored as JSONB (§17) but modelled as `list[SourceListItem]` for attribute access. Serialize with `dataclasses.asdict()` when writing the column or the cache payload (§14.5), and deserialize into `SourceListItem` on read. It is a plain dataclass, like the rest of `app/models/`.
+> `source_list` is stored as JSONB (§17) but modelled as `list[EntitySource]` for attribute access. Serialize with `dataclasses.asdict()` when writing the column or the cache payload (§14.5), and deserialize into `EntitySource` on read. It is a plain dataclass, like the rest of `app/models/`.
 
 > **`brief_summary` wraps `BriefSummarySkill`'s output type directly.** `ScoringService` wraps the `BriefSummaryResult.output` without conversion:
 > ```python
@@ -506,19 +511,19 @@ class EntityAnalysisConfig:
     consumer_name: str                    # env: HOSTNAME, fallback "sapi-entity-analysis-1" — see §6.1's Reclaim pattern
 ```
 
-#### Class: `AggConfig`
+#### Class: `AggregationConfig`
 
 ```python
 @dataclass
-class AggConfig:
+class AggregationConfig:
     batch_size: int                 # env: AGG_BATCH_SIZE
     batch_timeout_ms: int           # env: AGG_BATCH_TIMEOUT_MS
     max_concurrent: int             # env: AGG_MAX_CONCURRENT
     group_idle_timeout_s: int       # env: AGG_GROUP_IDLE_TIMEOUT_S
-    db_flush_interval_s: int        # env: AGG_DB_FLUSH_INTERVAL_S
+    db_flush_interval_s: int        # env: AGG_DB_FLUSH_INTERVAL_S (default 300)
     max_retry: int                  # env: AGG_MAX_RETRY
-    sliding_window_hours: int       # env: SLIDING_WINDOW_HOURS
-    event_max_timespan_hours: int   # env: EVENT_MAX_TIMESPAN_HOURS
+    sliding_window_hours: int       # env: SLIDING_WINDOW_HOURS (default 4)
+    event_max_timespan_hours: int   # env: EVENT_MAX_TIMESPAN_HOURS (default 24)
     consumer_name: str               # env: HOSTNAME, fallback "sapi-aggregation-1" — see §6.1's Reclaim pattern
 ```
 
@@ -583,7 +588,7 @@ class AppConfig:
     redis: RedisConfig
     llm: LLMConfig
     entity_analysis: EntityAnalysisConfig
-    agg: AggConfig
+    aggregation: AggregationConfig
     scoring: ScoringConfig
     cache: CacheConfig
 ```
@@ -1441,7 +1446,7 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`
 
 `autoclaim()` alone (§6.1 above) is not sufficient — something has to call it periodically, decide when a reclaimed message has exhausted its retries, and route it to that layer's Dead Letter Stream. All four layers (§11–§14) implement the *same* pattern, specified once here rather than four times:
 
-- **`config.consumer_name`** — each layer's own config (`EntityAnalysisConfig`/`AggConfig`/`ScoringConfig`/`CacheConfig`, §4.1) carries a `consumer_name` field, sourced from the `HOSTNAME` env var with a layer-specific fallback string for local/docker-compose runs (§4.1's note), so it's automatically unique per pod under horizontal scaling with no operator action required. Passed as the `consumer` argument to every `read_from()`/`autoclaim()` call that layer makes.
+- **`config.consumer_name`** — each layer's own config (`EntityAnalysisConfig`/`AggregationConfig`/`ScoringConfig`/`CacheConfig`, §4.1) carries a `consumer_name` field, sourced from the `HOSTNAME` env var with a layer-specific fallback string for local/docker-compose runs (§4.1's note), so it's automatically unique per pod under horizontal scaling with no operator action required. Passed as the `consumer` argument to every `read_from()`/`autoclaim()` call that layer makes.
 - **`_reclaim_loop()`** — a coroutine each layer's `start()` runs alongside its main consumer loop in one `asyncio.TaskGroup` (Layer Supervision, below) (**except Cache Layer — see §14.2's note; its reclaim step runs inside the single serial loop, not as a separate coroutine**). Wakes every `STREAM_CLAIM_TIMEOUT_MS` milliseconds and calls `autoclaim(stream, group, config.consumer_name, min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=<layer's batch size>)`. The loop body is wrapped in `except Exception` (not bare `except:`, so `asyncio.CancelledError` still propagates for shutdown) that logs a warning and does not re-raise; Coroutine Monitoring (§16) is the backstop.
 - **Per-message isolation, in both loops.** Each message from a `read_from()` or `autoclaim()` batch is handled — shape check, retry-exhaustion check, routing — inside its own `except Exception` that logs a WARNING `<layer>_message_handling_failed` with `message_id` and `exc_info` and leaves that message un-ACKed (Redis unreachable is re-raised to the loop instead, Reconnect behaviour above), so one message's failure never abandons the rest of its batch (on the reclaim path, every message in the batch has already had its `delivery_count` incremented by `autoclaim()`, so an abandoned batch would push healthy messages toward dead-lettering unprocessed).
 - **Retry-exhaustion check, per reclaimed message, before anything else:**
@@ -2899,7 +2904,7 @@ async def fetch_entity_event(self, entity_event_id: UUID) -> Optional[EntityEven
 
 `source_id` comes from the `metadata` JSONB (`{"cleaned_id": ...}`); `entity_events` has no `source_id` column. `fetch_entity_events_for_event()` below shares `_row_to_entity_event()`.
 
-> **`published_at` is returned as stored, `NULL` included** (nullable, system-design.md §10.1). The fallback to `created_at` belongs to `merge_or_create()` (§12.4), the one place it feeds business logic (rule 9).
+> **`published_at` is returned as stored, `NULL` included** (nullable, system-design.md §10.1). The fallback to `created_at` belongs to `EntityEvent.get_published_at()` (§11.1), which only the merge algorithm (§12.4) calls (rule 9).
 
 #### Method: `fetch_entity_events_for_event(event_id: UUID) -> list[EntityEvent]`
 
@@ -2975,7 +2980,7 @@ def _row_to_event(row: asyncpg.Record) -> Event:
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
         event_type_secondary=row["event_type_secondary"],
-        source_list=[SourceListItem(**item) for item in row["source_list"]],   # source_count derives from this at read time too — no row["source_count"] column exists (§3.3)
+        source_list=[EntitySource(**item) for item in row["source_list"]],   # source_count derives from this at read time too — no row["source_count"] column exists (§3.3)
         brief_summary=VersionedMetadata(version=row["brief_summary"]["version"], output=BriefSummary(**row["brief_summary"]["output"]))
                      if row["brief_summary"] is not None else None,
         brief_summary_aggregation_updated_at=datetime.fromisoformat(row["brief_summary"]["aggregation_updated_at"])
@@ -3491,11 +3496,20 @@ class EntityEvent:
     source_id: UUID              # CleanedNews.cleaned_id — which article this came from, nothing else
     source_url: str
     source_name: str
-    published_at: Optional[datetime]   # nullable in entity_events (system-design.md §10.1) — CleanedNews.published_at is Optional too; merge_or_create() (§12.4) applies the created_at fallback, not this repository
+    published_at: Optional[datetime]   # nullable in entity_events (system-design.md §10.1) — CleanedNews.published_at is Optional too; get_published_at() below applies the created_at fallback, not the repository
     analysis_outcome: VersionedMetadata[AnalysisOutcome]   # §3.2/§8.2; persisted under additional_outcome — the other fields are read off .output
     stock: Stock                                    # §4.2 — write: the Stock verification matched (§8.2); read-back: rebuilt from the row (§10.1)
     entity_event_id: Optional[UUID] = None       # set by EntityEventRepository.persist_entities() only if this row's insert actually succeeds
     created_at: Optional[datetime] = None        # mirrors the row's created_at — same datetime.now(timezone.utc) value, set alongside entity_event_id
+
+    def is_persistent_event(self) -> bool:
+        """Return whether this EntityEvent has been stored."""
+        return self.entity_event_id is not None and self.created_at is not None
+
+    def get_published_at(self) -> Optional[datetime]:
+        """Return the article's publication time, or the time this EntityEvent was stored when
+        the article has none."""
+        return self.published_at or self.created_at
 ```
 
 `exchange`/`stock_code` are read off `stock`, and `event_type_primary`/`sentiment_label`/`sentiment_score`/`headline`/`entity_summary` off `analysis_outcome.output`. The DB row has its own columns for all seven (system-design.md §10.1); the repository reads and writes them from those sources.
@@ -3688,7 +3702,7 @@ ACK is deferred: a routed `EntityEvent` is ACKed when its `GroupCoroutine` reach
 
 ```python
 class AggregationService:
-    def __init__(self, config: AggConfig):
+    def __init__(self, config: AggregationConfig):
         self._entity_event_repo = get_entity_event_repository()   # §10.1 — process_entity_event()'s read
         self._event_repo = get_event_repository()         # §10.2 — _persist_and_publish()'s write, _process()'s duplicate check
         self._redis_stream = get_redis_stream_client()    # §6.1 — publish only, never consumes here
@@ -3743,7 +3757,7 @@ class AggregationService:
                     logger.info("aggregation_duplicate_skipped", entity_event_id=entity_event_id, group_key=group_key)
                     await on_processed()
                     return
-                if active_event is not None and is_late(active_event, entity_event, self._config):   # §12.4
+                if active_event is not None and is_late(active_event, entity_event):   # §12.4
                     # Skipped for now, not merged elsewhere (system-design.md §4.4) — ACKed,
                     # since redelivery can't change the outcome
                     logger.warning("aggregation_late_entity_event_skipped", entity_event_id=entity_event_id,
@@ -3751,7 +3765,7 @@ class AggregationService:
                                    active_event_id=active_event.event_id, active_last_seen_at=active_event.last_seen_at)
                     await on_processed()
                     return
-                updated = merge_or_create(active_event, entity_event, self._config)
+                updated = merge_or_create(active_event, entity_event)
                 if active_event is not None and updated.event_id != active_event.event_id:
                     # A new Event replaces the group's active one in the same Redis key —
                     # persist the replaced Event's final state first, or its unflushed
@@ -3759,7 +3773,7 @@ class AggregationService:
                     step = "persist_replaced_event"
                     await self._persist_and_publish([active_event])
                 step = "upsert_active_event"
-                await self._event_store.upsert_active_event(updated, ttl_for(updated, self._config))
+                await self._event_store.upsert_active_event(updated, ttl_for(updated))
                 step = "on_processed"
                 await on_processed()
             except Exception:
@@ -3843,13 +3857,13 @@ def get_aggregation_service() -> AggregationService:
         raise ServiceUnavailableError("aggregation service is not initialized")
     return _aggregation_service
 
-def create_aggregation_service(config: AggConfig) -> AggregationService:
+def create_aggregation_service(config: AggregationConfig) -> AggregationService:
     global _aggregation_service
     _aggregation_service = AggregationService(config)
     return _aggregation_service
 ```
 
-`create_aggregation_service()` is called from `main.py` (§16) with `config.agg`.
+`create_aggregation_service()` is called from `main.py` (§16) with `config.aggregation`.
 
 ### 12.2 `app/aggregation/aggregation_consumer.py` — `AggregationConsumer`
 
@@ -3857,7 +3871,7 @@ Owns `stream:entity_event_completed` consumption (loops, `_enqueued` guard, flus
 
 ```python
 class AggregationConsumer:
-    def __init__(self, config: AggConfig):
+    def __init__(self, config: AggregationConfig):
         self._service = get_aggregation_service()          # §12.1
         self._redis_stream = get_redis_stream_client()    # §6.1 — consumes, reclaims, ACKs
         self._config = config
@@ -3980,7 +3994,7 @@ class GroupKey:
     event_type_primary: str
 
 class GroupCoroutine:
-    def __init__(self, group_key: GroupKey, config: AggConfig, on_idle: Callable[[GroupKey], None]):
+    def __init__(self, group_key: GroupKey, config: AggregationConfig, on_idle: Callable[[GroupKey], None]):
         self._group_key = group_key
         self._config = config   # only for AGG_GROUP_IDLE_TIMEOUT_S — no merge/EventAggregationStore knowledge
         self._on_idle = on_idle
@@ -4041,55 +4055,58 @@ The Coroutine Manager (`self._groups`, gated by `self._group_semaphore`, §12.1)
 
 ### 12.4 `app/aggregation/sliding_window.py` — pure merge algorithm
 
-#### Function: `merge_or_create(active_event: Optional[Event], entity_event: EntityEvent, config: AggConfig) -> Event`
+All three functions read `get_config().aggregation` (§4.1) rather than taking a config parameter.
+
+#### Function: `merge_or_create(active_event: Optional[Event], entity_event: EntityEvent) -> Event`
 
 ```
 Purpose : Given the group's current active Event (Redis-active stage, §3.3, or None) and one
           incoming EntityEvent, decide merge vs new Event and return the Event ready for
           EventAggregationStore.upsert_active_event(). Pure, no I/O.
-          published_at fallback (system-design.md §4.4/§10.1): published_at is nullable, so
-          this function falls back to entity_event.created_at for the merge-window/hard-cap
-          math; entity_events.published_at itself stays NULL.
+          Validates both inputs first: active_event must be a group's active Event
+          (Event.is_active_event(), §3.3) and entity_event must be stored
+          (EntityEvent.is_persistent_event(), §11.1); either failing raises SAPIError
+          (category AGGREGATION), which can only mean a bug in the caller.
+          published_at fallback (system-design.md §4.4/§10.1): EntityEvent.get_published_at()
+          falls back to created_at for the merge-window/hard-cap math;
+          entity_events.published_at itself stays NULL.
           aggregation_updated_at is set here (datetime.now(timezone.utc), both branches): it
           is Scoring's staleness key (system-design.md §10.2), meaning "aggregation state
           actually changed", which the periodic flush can't know.
 ```
 
-Merge/hard-cap/TTL algorithm (rationale — out-of-order arrival, `published_at` fallback — in system-design.md §4.4):
+Merge/hard-cap/TTL algorithm (rationale — out-of-order arrival, `published_at` fallback — in system-design.md §4.4). The `assert`s only narrow types for mypy (a bool method can't): the validation above already guarantees them.
 
 ```python
-def merge_or_create(active_event: Optional[Event], entity_event: EntityEvent, config: AggConfig) -> Event:
-    published_at = entity_event.published_at or entity_event.created_at
+def merge_or_create(active_event: Optional[Event], entity_event: EntityEvent) -> Event:
+    if active_event is not None and not active_event.is_active_event():
+        raise SAPIError(..., category=ErrorCategory.AGGREGATION)
+    if not entity_event.is_persistent_event():
+        raise SAPIError(..., category=ErrorCategory.AGGREGATION)
+    published_at = entity_event.get_published_at()
+    entity_event_id = entity_event.entity_event_id
+    assert published_at is not None and entity_event_id is not None
+    config = get_config().aggregation
     aggregation_updated_at = datetime.now(timezone.utc)
 
-    if active_event is None:
-        return Event(
-            event_id=uuid4(),
-            exchange=entity_event.stock.exchange, stock_code=entity_event.stock.stock_code,
-            event_type_primary=entity_event.analysis_outcome.output.event_type_primary,
-            first_seen_at=published_at,
-            last_seen_at=published_at,
-            aggregation_updated_at=aggregation_updated_at,
-            entity_event_ids=[entity_event.entity_event_id],
-        )
+    if active_event is not None:
+        gap_hours = abs((published_at - active_event.last_seen_at).total_seconds()) / 3600
+        span_hours = (max(published_at, active_event.last_seen_at) - min(published_at, active_event.first_seen_at)).total_seconds() / 3600
+        remaining_lifespan_hours = config.event_max_timespan_hours - span_hours
+        if gap_hours <= config.sliding_window_hours and remaining_lifespan_hours > 0:
+            assert active_event.entity_event_ids is not None
+            return Event(
+                event_id=active_event.event_id,
+                exchange=active_event.exchange, stock_code=active_event.stock_code,
+                event_type_primary=active_event.event_type_primary,
+                # max/min, never blind overwrite — out-of-order arrival (system-design.md §4.4)
+                first_seen_at=min(active_event.first_seen_at, published_at),
+                last_seen_at=max(active_event.last_seen_at, published_at),
+                aggregation_updated_at=aggregation_updated_at,
+                entity_event_ids=[*active_event.entity_event_ids, entity_event_id],
+            )
 
-    gap_hours = abs((published_at - active_event.last_seen_at).total_seconds()) / 3600
-    span_hours = (max(published_at, active_event.last_seen_at) - min(published_at, active_event.first_seen_at)).total_seconds() / 3600
-    remaining_lifespan = config.event_max_timespan_hours - span_hours
-
-    if gap_hours <= config.sliding_window_hours and remaining_lifespan > 0:
-        return Event(
-            event_id=active_event.event_id,
-            exchange=active_event.exchange, stock_code=active_event.stock_code,
-            event_type_primary=active_event.event_type_primary,
-            # max/min, never blind overwrite — out-of-order arrival (system-design.md §4.4)
-            first_seen_at=min(active_event.first_seen_at, published_at),
-            last_seen_at=max(active_event.last_seen_at, published_at),
-            aggregation_updated_at=aggregation_updated_at,
-            entity_event_ids=[*active_event.entity_event_ids, entity_event.entity_event_id],
-        )
-
-    # No merge: hard cap breached or outside sliding window -> new Event
+    # No active Event, or hard cap breached / outside sliding window -> new Event
     return Event(
         event_id=uuid4(),
         exchange=entity_event.stock.exchange, stock_code=entity_event.stock.stock_code,
@@ -4097,26 +4114,29 @@ def merge_or_create(active_event: Optional[Event], entity_event: EntityEvent, co
         first_seen_at=published_at,
         last_seen_at=published_at,
         aggregation_updated_at=aggregation_updated_at,
-        entity_event_ids=[entity_event.entity_event_id],
+        entity_event_ids=[entity_event_id],
     )
 ```
 
-#### Function: `is_late(active_event: Event, entity_event: EntityEvent, config: AggConfig) -> bool`
+#### Function: `is_late(active_event: Event, entity_event: EntityEvent) -> bool`
 
-True when `entity_event` is dated before `active_event.last_seen_at` by more than `SLIDING_WINDOW_HOURS` — the case where `merge_or_create()` would otherwise start an older Event and take over the group's active key, closing a live Event early (system-design.md §4.4). Same `published_at` fallback as `merge_or_create()`. Pure, no I/O.
+True when `entity_event` is dated before `active_event.last_seen_at` by more than `SLIDING_WINDOW_HOURS` — the case where `merge_or_create()` would otherwise start an older Event and take over the group's active key, closing a live Event early (system-design.md §4.4). Same `published_at` fallback as `merge_or_create()`. Pure, no I/O. No validation of its own: its caller (§12.1) only passes an EntityEvent read back from `entity_events`, and the `assert` only narrows the type.
 
 ```python
-def is_late(active_event: Event, entity_event: EntityEvent, config: AggConfig) -> bool:
-    published_at = entity_event.published_at or entity_event.created_at
+def is_late(active_event: Event, entity_event: EntityEvent) -> bool:
+    published_at = entity_event.get_published_at()
+    assert published_at is not None
+    config = get_config().aggregation
     return (active_event.last_seen_at - published_at).total_seconds() / 3600 > config.sliding_window_hours
 ```
 
-#### Function: `ttl_for(active_event: Event, config: AggConfig) -> int`
+#### Function: `ttl_for(active_event: Event) -> int`
 
 `remaining_lifespan = EVENT_MAX_TIMESPAN_HOURS - span`, TTL `= min(SLIDING_WINDOW_HOURS, remaining_lifespan)` (the formula in `merge_or_create()`), computed from the returned `Event`. `last_seen_at` stands in for the incoming `published_at`: it equals it for in-order arrivals and is the best available reference otherwise.
 
 ```python
-def ttl_for(active_event: Event, config: AggConfig) -> int:
+def ttl_for(active_event: Event) -> int:
+    config = get_config().aggregation
     span_hours = (active_event.last_seen_at - active_event.first_seen_at).total_seconds() / 3600
     remaining_lifespan_hours = config.event_max_timespan_hours - span_hours
     grace_s = 2 * config.db_flush_interval_s   # every key outlives at least one flush (system-design.md §11.2)
@@ -4694,7 +4714,7 @@ The cache's own record shape is typed: `CacheRecord`/`CacheEventDetail`/`CacheSc
 class CacheEventDetail:
     event_type_secondary: list[str]
     source_count: int
-    source_list: list[SourceListItem]           # §3.3
+    source_list: list[EntitySource]           # §3.3
     summary_short: Optional[str]
     summary_full: Optional[str]
     key_numbers: list[str]
@@ -4712,7 +4732,7 @@ class CacheEventDetail:
     def from_dict(cls, d: dict) -> "CacheEventDetail":
         return cls(
             event_type_secondary=d["event_type_secondary"], source_count=d["source_count"],
-            source_list=[SourceListItem(**item) for item in d["source_list"]],
+            source_list=[EntitySource(**item) for item in d["source_list"]],
             summary_short=d["summary_short"], summary_full=d["summary_full"], key_numbers=d["key_numbers"],
             aggregation_updated_at=datetime.fromisoformat(d["aggregation_updated_at"]),
         )
@@ -5538,9 +5558,9 @@ async def lifespan(app: FastAPI):
         # Service via get_X_service() (§5.1).
         create_entity_analysis_service(config.entity_analysis)
         cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis, config.redis)
-        aggregation_service = create_aggregation_service(config.agg)
+        aggregation_service = create_aggregation_service(config.aggregation)
         resources.push_async_callback(aggregation_service.close)   # group Tasks outlive the layer Task (§12.1)
-        agg_consumer = AggregationConsumer(config.agg)
+        agg_consumer = AggregationConsumer(config.aggregation)
         create_scoring_service(config.scoring)
         scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring)
         cache_service = create_cache_service(config.cache)

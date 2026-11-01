@@ -343,8 +343,9 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Entity Analysis: LLM Entity Extraction (for `EntityEvent`/`AnalysisOutcome` and `app/models/`)
 **Scope:** The pure merge decision — whether an incoming EntityEvent extends its group's active Event or starts a new one (impl.md §12.4; design rationale: design.md §4.4).
-- `app/config.py`: `AggConfig.sliding_window_hours`/`event_max_timespan_hours`/`db_flush_interval_s` (the last one for `ttl_for()`'s grace period).
-- `app/models/event.py`: `Event` without its `brief_summary` field, and `SourceListItem` (§3.3).
+- `app/config.py`: `AggregationConfig.sliding_window_hours`/`event_max_timespan_hours`/`db_flush_interval_s` (the last one for `ttl_for()`'s grace period).
+- `app/models/event.py`: `Event` without its `brief_summary` field, and `EntitySource` (§3.3).
+- `app/models/entity_event.py`: `EntityEvent.is_persistent_event()`/`get_published_at()` (§11.1).
 - `app/aggregation/sliding_window.py`: `merge_or_create()`, `is_late()`, `ttl_for()`.
 **Acceptance criteria** (per impl.md §12.4):
 - Merge vs. new Event decided correctly at the sliding-window and hard-cap boundaries (just inside, exactly at, just outside).
@@ -355,7 +356,7 @@ This document does not introduce new design — every ticket below implements so
 - `ttl_for()` returns `min(SLIDING_WINDOW_HOURS, remaining lifespan)` in seconds plus `2 × AGG_DB_FLUSH_INTERVAL_S` — never `0`, even at the hard cap.
 - Unit-tested with fixed timestamps. No integration pass — a pure function with no I/O; its real-world behaviour is exercised by Aggregation: Consume & Merge into Active Events.
 **Docs:** impl.md §3.3, §4.1, §12.4; design.md §4.4, §11.2 (TTL grace period).
-**Explicitly deferred:** `Event.brief_summary` and `BriefSummary` (added by the first Scoring ticket that writes it); everything with I/O — Redis, DB, streams.
+**Explicitly deferred:** `Event.brief_summary` and `BriefSummary` (added by the first Scoring ticket that writes it); `Event.source_count` (added with its first reader); everything with I/O — Redis, DB, streams.
 
 ---
 
@@ -364,7 +365,7 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Aggregation: Sliding-Window Merge Algorithm (for `merge_or_create()`/`ttl_for()`, `Event`); Entity Analysis: Persist & Publish Entity Events (for the `stream:entity_event_completed` payload, `EntityEventRepository`, migration `001`)
 **Scope:** Consume `stream:entity_event_completed`, merge each EntityEvent into its group's active Event in Redis, and ACK once the Redis write lands (impl.md §12.1–§12.3, §12.5; design.md §4.2–§4.4).
-- `app/config.py`: `AggConfig.batch_size`/`batch_timeout_ms`/`max_concurrent`/`group_idle_timeout_s`/`consumer_name`.
+- `app/config.py`: `AggregationConfig.batch_size`/`batch_timeout_ms`/`max_concurrent`/`group_idle_timeout_s`/`consumer_name`.
 - `app/redis/state_client.py`: `hgetall()`/`hset()`/`expire()` only (§6.2).
 - `app/aggregation/event_aggregation_store.py`: `EventAggregationStore` + singleton — `get_active_event()`/`upsert_active_event()` only, not `scan_all()` (§12.5).
 - `app/persistent/entity_event_repository.py`: `fetch_entity_event()` and `_row_to_entity_event()` (§10.1).
@@ -431,7 +432,7 @@ This document does not introduce new design — every ticket below implements so
 **Status:** Created
 **Depends on:** Aggregation: Flush Active Events & Publish (for `start()`'s `finally: flush()`); Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
 **Scope:** Recover messages Aggregation leaves un-ACKed, and dead-letter the ones that keep failing or are malformed (missing or unrecognised `v`, missing or invalid `entity_event_id`) (impl.md §6.1's Reclaim and Dead Letter pattern, §12.2).
-- `app/config.py`: `AggConfig.max_retry`.
+- `app/config.py`: `AggregationConfig.max_retry`.
 - `AggregationConsumer`: `start()` runs `_consumer_loop()` and `_reclaim_loop()` in one `asyncio.TaskGroup`; `_reclaim_loop()` dead-letters to `stream:aggregation_dead_letter` at `AGG_MAX_RETRY` and otherwise calls the same `_route_one()`; each sweep wrapped in `except Exception` → `aggregation_reclaim_sweep_failed`.
 - The message shape check (`v` and `entity_event_id`) immediately after `read_from()`/`autoclaim()`, each message handled in isolation (§6.1's shape-check callout).
 **Acceptance criteria** (per impl.md §6.1, §12.2):
@@ -503,7 +504,7 @@ This document does not introduce new design — every ticket below implements so
 ### Scoring: Rule Score & Sentiment Aggregation (S)
 
 **Status:** Created
-**Depends on:** Aggregation: Sliding-Window Merge Algorithm (for `Event`, `SourceListItem`); Entity Analysis: LLM Entity Extraction (for `EntityEvent`/`AnalysisOutcome`, `VersionedMetadata`)
+**Depends on:** Aggregation: Sliding-Window Merge Algorithm (for `Event`, `EntitySource`); Entity Analysis: LLM Entity Extraction (for `EntityEvent`/`AnalysisOutcome`, `VersionedMetadata`)
 **Scope:** The pure rule-based half of an Event's score (impl.md §13.3; design rationale: design.md §5.6, §5.8).
 - `app/config.py`: `EventTypeScore`, `ScoringConfig.event_type_score` (one `EVENT_TYPE_WEIGHT_*` env var per event type, assembled by `load_config()`, §4.1).
 - `app/models/event_score.py`: `RuleScore` with its `base_rule_score` property only — not `LLMScore`/`EventScore`.
