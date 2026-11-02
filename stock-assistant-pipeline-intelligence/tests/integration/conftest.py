@@ -50,6 +50,13 @@ OPTIONAL_ENV = (
     "LLM_API_TIMEOUT_S",
     "RATE_LIMIT_BACKOFF_S",
     "ENTITY_ANALYSIS_MAX_INPUT_CHARS",
+    "AGG_BATCH_SIZE",
+    "AGG_BATCH_TIMEOUT_MS",
+    "AGG_MAX_CONCURRENT",
+    "AGG_GROUP_IDLE_TIMEOUT_S",
+    "AGG_DB_FLUSH_INTERVAL_S",
+    "SLIDING_WINDOW_HOURS",
+    "EVENT_MAX_TIMESPAN_HOURS",
 )
 # A project id for cases that never call Vertex AI; nothing is sent to it.
 PLACEHOLDER_VERTEX_PROJECT = "sapi-integration-test"

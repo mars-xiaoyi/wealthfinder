@@ -26,7 +26,7 @@ READY_BODY = {
     "hk_stock_list": "ok",
     "layers": {
         "entity_analysis": "ok",
-        "aggregation": "error",
+        "aggregation": "ok",
         "scoring": "error",
         "cache": "error",
     },
