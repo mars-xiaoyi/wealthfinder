@@ -63,7 +63,7 @@ def config():
             retry_base_wait_ms=100,
         ),
         http=HttpConfig(timeout_s=120),
-        health=HealthConfig(check_timeout_s=2),
+        health=HealthConfig(check_timeout_s=2, layer_restart_delay_s=1),
         redis=RedisConfig(
             stream_url="redis://localhost/0",
             state_url="redis://localhost/1",
@@ -114,14 +114,24 @@ def hk_stock_list():
     )
 
 
+@pytest.fixture
+async def layer_tasks():
+    """The registered layer Tasks: Entity Analysis running, the other layers not built yet."""
+    entity_analysis = asyncio.create_task(_hang_forever())
+    yield {"entity_analysis": entity_analysis}
+    entity_analysis.cancel()
+    await asyncio.gather(entity_analysis, return_exceptions=True)
+
+
 @pytest.fixture(autouse=True)
-def getters(monkeypatch, config, db, redis_stream, redis_state, hk_stock_list):
+def getters(monkeypatch, config, db, redis_stream, redis_state, hk_stock_list, layer_tasks):
     """Point every getter get_health calls at this test's config and mocks."""
     monkeypatch.setattr(health, "get_config", lambda: config)
     monkeypatch.setattr(health, "get_db_client", lambda: db)
     monkeypatch.setattr(health, "get_redis_stream_client", lambda: redis_stream)
     monkeypatch.setattr(health, "get_redis_state_client", lambda: redis_state)
     monkeypatch.setattr(health, "get_hk_stock_list_cache", lambda: hk_stock_list)
+    monkeypatch.setattr(health, "get_layer_tasks", lambda: layer_tasks)
 
 
 @pytest.fixture
@@ -137,7 +147,38 @@ async def unhandled_task_errors():
 
 
 async def get_health_hk_stock_list_ready(db, redis_stream, redis_state):
-    """Everything up and the list loaded: degraded, because the layers are still hardcoded."""
+    """Everything up and the list loaded: degraded, because only Entity Analysis is
+    registered."""
+    response = Response()
+
+    body = await health.get_health(response)
+
+    assert response.status_code == 200
+    assert body.status is HealthStatus.DEGRADED
+    assert body.database is ComponentStatus.OK
+    assert body.redis_stream is ComponentStatus.OK
+    assert body.redis_state is ComponentStatus.OK
+    assert body.hk_stock_list is HKStockListStatus.OK
+    assert body.layers == LayerStatus(
+        entity_analysis=ComponentStatus.OK,
+        aggregation=ComponentStatus.ERROR,
+        scoring=ComponentStatus.ERROR,
+        cache=ComponentStatus.ERROR,
+    )
+    db.fetch_one.assert_awaited_once_with("SELECT 1")
+    redis_stream.ping.assert_awaited_once()
+    redis_state.ping.assert_awaited_once()
+
+
+async def _crash() -> None:
+    raise RuntimeError("consumer loop bug")
+
+
+async def get_health_layer_not_running(layer_tasks):
+    """A stopped Entity Analysis Task reports error, which leaves the service degraded."""
+    stopped = asyncio.create_task(_crash())
+    await asyncio.gather(stopped, return_exceptions=True)
+    layer_tasks["entity_analysis"] = stopped
     response = Response()
 
     body = await health.get_health(response)
@@ -154,9 +195,6 @@ async def get_health_hk_stock_list_ready(db, redis_stream, redis_state):
         scoring=ComponentStatus.ERROR,
         cache=ComponentStatus.ERROR,
     )
-    db.fetch_one.assert_awaited_once_with("SELECT 1")
-    redis_stream.ping.assert_awaited_once()
-    redis_state.ping.assert_awaited_once()
 
 
 async def get_health_hk_stock_list_not_ready(monkeypatch, db, redis_stream, redis_state):
@@ -172,7 +210,7 @@ async def get_health_hk_stock_list_not_ready(monkeypatch, db, redis_stream, redi
     assert body.redis_state is ComponentStatus.OK
     assert body.hk_stock_list is HKStockListStatus.NOT_READY
     assert body.layers == LayerStatus(
-        entity_analysis=ComponentStatus.ERROR,
+        entity_analysis=ComponentStatus.OK,
         aggregation=ComponentStatus.ERROR,
         scoring=ComponentStatus.ERROR,
         cache=ComponentStatus.ERROR,

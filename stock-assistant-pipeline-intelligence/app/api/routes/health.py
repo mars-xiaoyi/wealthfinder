@@ -14,6 +14,7 @@ from app.api.schemas import (
 from app.common.hk_stock_list import get_hk_stock_list_cache
 from app.config import get_config
 from app.db.connection import get_db_client
+from app.layer_tasks import Layer, get_layer_tasks
 from app.logger import get_logger
 from app.redis.state_client import get_redis_state_client
 from app.redis.stream_client import get_redis_stream_client
@@ -21,15 +22,6 @@ from app.redis.stream_client import get_redis_stream_client
 logger = get_logger(__name__)
 
 router = APIRouter()
-
-# The layer Tasks don't exist yet, so they report their honest failure state rather than a
-# fabricated "ok".
-_LAYER_STATUS = LayerStatus(
-    entity_analysis=ComponentStatus.ERROR,
-    aggregation=ComponentStatus.ERROR,
-    scoring=ComponentStatus.ERROR,
-    cache=ComponentStatus.ERROR,
-)
 
 
 # Probes cancelled by a timeout or a cancelled request, still unwinding. Holding a reference
@@ -90,6 +82,24 @@ async def _check(
     return ComponentStatus.OK
 
 
+def _get_layer_status(
+    layer_tasks: dict[Layer, asyncio.Task[None]], layer: Layer
+) -> ComponentStatus:
+    """OK while the layer's Task is running; a layer not registered yet reports ERROR."""
+    task = layer_tasks.get(layer)
+    return ComponentStatus.OK if task is not None and not task.done() else ComponentStatus.ERROR
+
+
+def _get_layers_status() -> LayerStatus:
+    layer_tasks = get_layer_tasks()
+    return LayerStatus(
+        entity_analysis=_get_layer_status(layer_tasks, Layer.ENTITY_ANALYSIS),
+        aggregation=_get_layer_status(layer_tasks, Layer.AGGREGATION),
+        scoring=_get_layer_status(layer_tasks, Layer.SCORING),
+        cache=_get_layer_status(layer_tasks, Layer.CACHE),
+    )
+
+
 def _overall_status(
     database: ComponentStatus,
     redis_stream: ComponentStatus,
@@ -126,12 +136,14 @@ async def get_health(response: Response) -> HealthResponse:
         HKStockListStatus.OK if len(get_hk_stock_list_cache()) > 0 else HKStockListStatus.NOT_READY
     )
 
+    layers_status = _get_layers_status()
+
     overall = _overall_status(
         database_status,
         redis_stream_status,
         redis_state_status,
         hk_stock_list_status,
-        _LAYER_STATUS,
+        layers_status,
     )
     if overall is HealthStatus.UNHEALTHY:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -142,5 +154,5 @@ async def get_health(response: Response) -> HealthResponse:
         redis_stream=redis_stream_status,
         redis_state=redis_state_status,
         hk_stock_list=hk_stock_list_status,
-        layers=_LAYER_STATUS,
+        layers=layers_status,
     )

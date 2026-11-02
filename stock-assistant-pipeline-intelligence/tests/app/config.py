@@ -34,6 +34,7 @@ def load_config_defaults():
     assert config.db.retry_base_wait_ms == 100
     assert config.http.timeout_s == 120
     assert config.health.check_timeout_s == 2
+    assert config.health.layer_restart_delay_s == 1
     assert config.redis.stream_url == REQUIRED_ENV["REDIS_STREAM_URL"]
     assert config.redis.state_url == REQUIRED_ENV["REDIS_STATE_URL"]
     assert config.redis.reconnect_interval_s == 5
@@ -60,6 +61,7 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("DB_RETRY_BASE_WAIT_MS", "50")
     monkeypatch.setenv("HTTP_TIMEOUT_S", "30")
     monkeypatch.setenv("HEALTH_CHECK_TIMEOUT_S", "5")
+    monkeypatch.setenv("LAYER_RESTART_DELAY_S", "3")
     monkeypatch.setenv("REDIS_RECONNECT_INTERVAL_S", "1")
     monkeypatch.setenv("STREAM_CLAIM_TIMEOUT_MS", "1500")
     monkeypatch.setenv("VERTEX_AI_LOCATION", "us-central1")
@@ -83,6 +85,7 @@ def load_config_overrides(monkeypatch):
     assert config.db.retry_base_wait_ms == 50
     assert config.http.timeout_s == 30
     assert config.health.check_timeout_s == 5
+    assert config.health.layer_restart_delay_s == 3
     assert config.redis.reconnect_interval_s == 1
     assert config.redis.stream_claim_timeout_ms == 1500
     assert config.llm.vertex_location == "us-central1"

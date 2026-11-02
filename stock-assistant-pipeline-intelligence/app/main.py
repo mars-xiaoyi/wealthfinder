@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,6 +13,7 @@ from app.db.connection import create_db_client
 from app.entity_analysis.cleaned_news_consumer import CleanedNewsConsumer
 from app.entity_analysis.entity_analysis_service import create_entity_analysis_service
 from app.entity_analysis.worker_pool import WorkerPool
+from app.layer_tasks import Layer, register_layer_tasks
 from app.llm.vertex_adapter import create_llm_adapter
 from app.logger import configure_logging, get_logger
 from app.persistent.entity_event_repository import create_entity_event_repository
@@ -21,12 +22,6 @@ from app.redis.stream_client import create_stream_client
 
 configure_logging()
 logger = get_logger(__name__)
-
-
-async def _cancel_and_wait(task: asyncio.Task[None]) -> None:
-    """Cancel task and wait until it has stopped."""
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
 
 
 @asynccontextmanager
@@ -60,7 +55,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.critical("hk_stock_list_startup_load_failed", exc_info=True)
 
         entity_analysis_worker_pool = WorkerPool(
-            "entity_analysis",
+            Layer.ENTITY_ANALYSIS,
             config.entity_analysis.max_concurrent,
             config.llm.rate_limit_backoff_s,
         )
@@ -68,9 +63,59 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cleaned_news_consumer = CleanedNewsConsumer(
             entity_analysis_worker_pool, config.entity_analysis, config.redis
         )
-        consumer_task = asyncio.create_task(cleaned_news_consumer.start())
-        # Registered last, so on shutdown the consumer stops before the clients it uses close.
-        resources.push_async_callback(_cancel_and_wait, consumer_task)
+
+        layer_tasks: dict[Layer, asyncio.Task[None]] = {}
+        shutting_down = False
+        loop = asyncio.get_running_loop()
+
+        # A layer's start() runs its loops in one asyncio.TaskGroup, so once its Task is done
+        # every loop has stopped and a restart can't run beside a leftover one.
+        def _make_monitored(
+            layer: Layer, start: Callable[[], Coroutine[object, object, None]]
+        ) -> asyncio.Task[None]:
+            """Run start() as a Task that is restarted, after a delay, whenever it crashes."""
+
+            def _restart() -> None:
+                # The restart is skipped if shutdown began during the delay.
+                if not shutting_down:
+                    layer_tasks[layer] = _make_monitored(layer, start)
+
+            def _on_done(task: asyncio.Task[None]) -> None:
+                exc = None if task.cancelled() else task.exception()
+                if shutting_down:
+                    # A restart now would outlive the clients shutdown is about to close.
+                    if exc is not None:
+                        logger.error("layer_task_failed_during_shutdown", layer=layer, exc_info=exc)
+                    return
+                if exc is None:
+                    # Stopped without an error while the service runs: not restarted, but the
+                    # layer is down until the service restarts.
+                    logger.error("layer_task_stopped", layer=layer, cancelled=task.cancelled())
+                    return
+                restart_delay_s = config.health.layer_restart_delay_s
+                logger.critical(
+                    "layer_task_crashed", layer=layer, restart_in_s=restart_delay_s, exc_info=exc
+                )
+                loop.call_later(restart_delay_s, _restart)
+
+            task = asyncio.create_task(start())
+            task.add_done_callback(_on_done)
+            return task
+
+        layer_tasks[Layer.ENTITY_ANALYSIS] = _make_monitored(
+            Layer.ENTITY_ANALYSIS, cleaned_news_consumer.start
+        )
+        register_layer_tasks(layer_tasks)
+
+        async def _cancel_layer_tasks() -> None:
+            nonlocal shutting_down
+            shutting_down = True
+            for task in layer_tasks.values():
+                task.cancel()
+            await asyncio.gather(*layer_tasks.values(), return_exceptions=True)
+
+        # Registered last, so on shutdown the layers stop before the clients they use close.
+        resources.push_async_callback(_cancel_layer_tasks)
 
         logger.info("startup_complete")
 

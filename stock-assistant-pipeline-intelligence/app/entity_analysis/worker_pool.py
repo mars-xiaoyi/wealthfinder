@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
+from app.layer_tasks import Layer
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -11,7 +12,7 @@ class WorkerPool:
     """Bounds how much of a layer's work runs at once, and pauses the layer's new work after a
     rate limit. layer names the layer in logs."""
 
-    def __init__(self, layer: str, max_concurrent: int, rate_limit_backoff_s: int) -> None:
+    def __init__(self, layer: Layer, max_concurrent: int, rate_limit_backoff_s: int) -> None:
         self._layer = layer
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._rate_limit_backoff_s = rate_limit_backoff_s
