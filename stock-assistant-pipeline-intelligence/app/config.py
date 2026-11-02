@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from app.common.error_categories import ErrorCategory
 from app.common.errors import SAPIError, ServiceUnavailableError
+from app.models.entity_event import EventTypeEnum
 
 
 @dataclass
@@ -73,6 +74,19 @@ class AggregationConfig:
 
 
 @dataclass
+class EventTypeScore:
+    """One event type's Rule Score dimension input."""
+
+    event_type: EventTypeEnum
+    score: float  # [0, 10]
+
+
+@dataclass
+class ScoringConfig:
+    event_type_score: list[EventTypeScore]  # one entry per EventTypeEnum member
+
+
+@dataclass
 class AppConfig:
     db: DatabaseConfig
     http: HttpConfig
@@ -81,9 +95,22 @@ class AppConfig:
     llm: LLMConfig
     entity_analysis: EntityAnalysisConfig
     aggregation: AggregationConfig
+    scoring: ScoringConfig
 
 
 _config: AppConfig | None = None
+
+# env var and default score per event type, in EventTypeEnum order
+_EVENT_TYPE_SCORE_ENV = {
+    EventTypeEnum.EARNINGS: ("EVENT_TYPE_WEIGHT_EARNINGS", "9.0"),
+    EventTypeEnum.BUYBACK: ("EVENT_TYPE_WEIGHT_BUYBACK", "7.0"),
+    EventTypeEnum.MA: ("EVENT_TYPE_WEIGHT_MA", "8.5"),
+    EventTypeEnum.REGULATORY: ("EVENT_TYPE_WEIGHT_REGULATORY", "8.0"),
+    EventTypeEnum.MANAGEMENT_CHANGE: ("EVENT_TYPE_WEIGHT_MANAGEMENT_CHANGE", "7.0"),
+    EventTypeEnum.ANALYST_RATING: ("EVENT_TYPE_WEIGHT_ANALYST_RATING", "5.0"),
+    EventTypeEnum.DIVIDEND: ("EVENT_TYPE_WEIGHT_DIVIDEND", "6.0"),
+    EventTypeEnum.GENERAL_ANNOUNCEMENT: ("EVENT_TYPE_WEIGHT_GENERAL", "4.0"),
+}
 
 
 def _require(name: str) -> str:
@@ -147,6 +174,12 @@ def load_config() -> AppConfig:
             sliding_window_hours=int(os.environ.get("SLIDING_WINDOW_HOURS", "4")),
             event_max_timespan_hours=int(os.environ.get("EVENT_MAX_TIMESPAN_HOURS", "24")),
             consumer_name=os.environ.get("HOSTNAME", "sapi-aggregation-1"),
+        ),
+        scoring=ScoringConfig(
+            event_type_score=[
+                EventTypeScore(event_type=event_type, score=float(os.environ.get(env, default)))
+                for event_type, (env, default) in _EVENT_TYPE_SCORE_ENV.items()
+            ],
         ),
     )
     return _config

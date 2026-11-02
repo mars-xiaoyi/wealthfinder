@@ -35,3 +35,9 @@ class Event:
     def is_active_event(self) -> bool:
         """Return whether this is a group's active Event, which EntityEvents are merged into."""
         return self.entity_event_ids is not None and len(self.entity_event_ids) > 0
+
+    @property
+    def source_count(self) -> int | None:
+        """Return the number of distinct sources reporting this Event, or None before it is
+        persisted."""
+        return len(self.source_list) if self.source_list is not None else None

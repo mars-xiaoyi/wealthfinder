@@ -4,6 +4,8 @@ import pytest
 
 from app import config as config_module
 from app.common.errors import SAPIError, ServiceUnavailableError
+from app.config import EventTypeScore
+from app.models.entity_event import EventTypeEnum
 
 REQUIRED_ENV = {
     "DATABASE_URL": "postgresql://postgres:password@localhost:5432/sapi",
@@ -58,6 +60,16 @@ def load_config_defaults():
     assert config.aggregation.sliding_window_hours == 4
     assert config.aggregation.event_max_timespan_hours == 24
     assert config.aggregation.consumer_name == "sapi-aggregation-1"
+    assert config.scoring.event_type_score == [
+        EventTypeScore(EventTypeEnum.EARNINGS, 9.0),
+        EventTypeScore(EventTypeEnum.BUYBACK, 7.0),
+        EventTypeScore(EventTypeEnum.MA, 8.5),
+        EventTypeScore(EventTypeEnum.REGULATORY, 8.0),
+        EventTypeScore(EventTypeEnum.MANAGEMENT_CHANGE, 7.0),
+        EventTypeScore(EventTypeEnum.ANALYST_RATING, 5.0),
+        EventTypeScore(EventTypeEnum.DIVIDEND, 6.0),
+        EventTypeScore(EventTypeEnum.GENERAL_ANNOUNCEMENT, 4.0),
+    ]
 
 
 def load_config_overrides(monkeypatch):
@@ -87,6 +99,14 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("AGG_MAX_CONCURRENT", "50")
     monkeypatch.setenv("AGG_GROUP_IDLE_TIMEOUT_S", "30")
     monkeypatch.setenv("AGG_DB_FLUSH_INTERVAL_S", "120")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_EARNINGS", "1.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_BUYBACK", "2.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_MA", "3.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_REGULATORY", "4.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_MANAGEMENT_CHANGE", "5.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_ANALYST_RATING", "6.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_DIVIDEND", "7.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_GENERAL", "8.5")
 
     config = config_module.load_config()
 
@@ -117,6 +137,16 @@ def load_config_overrides(monkeypatch):
     assert config.aggregation.group_idle_timeout_s == 30
     assert config.aggregation.db_flush_interval_s == 120
     assert config.aggregation.consumer_name == "sapi-pod-7"
+    assert config.scoring.event_type_score == [
+        EventTypeScore(EventTypeEnum.EARNINGS, 1.5),
+        EventTypeScore(EventTypeEnum.BUYBACK, 2.5),
+        EventTypeScore(EventTypeEnum.MA, 3.5),
+        EventTypeScore(EventTypeEnum.REGULATORY, 4.5),
+        EventTypeScore(EventTypeEnum.MANAGEMENT_CHANGE, 5.5),
+        EventTypeScore(EventTypeEnum.ANALYST_RATING, 6.5),
+        EventTypeScore(EventTypeEnum.DIVIDEND, 7.5),
+        EventTypeScore(EventTypeEnum.GENERAL_ANNOUNCEMENT, 8.5),
+    ]
 
 
 @pytest.mark.parametrize("missing", list(REQUIRED_ENV))

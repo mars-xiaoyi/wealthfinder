@@ -27,6 +27,7 @@ from app.config import (
     HttpConfig,
     LLMConfig,
     RedisConfig,
+    ScoringConfig,
 )
 from app.db.connection import DatabaseClient
 from app.redis.state_client import RedisStateClient
@@ -95,6 +96,7 @@ def config():
             event_max_timespan_hours=24,
             consumer_name="sapi-aggregation-1",
         ),
+        scoring=ScoringConfig(event_type_score=[]),
     )
 
 

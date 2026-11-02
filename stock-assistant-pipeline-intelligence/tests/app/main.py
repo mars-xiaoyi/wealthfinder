@@ -20,6 +20,7 @@ from app.config import (
     HttpConfig,
     LLMConfig,
     RedisConfig,
+    ScoringConfig,
 )
 
 CONFIG = AppConfig(
@@ -63,6 +64,7 @@ CONFIG = AppConfig(
         event_max_timespan_hours=24,
         consumer_name="sapi-aggregation-1",
     ),
+    scoring=ScoringConfig(event_type_score=[]),
 )
 
 
