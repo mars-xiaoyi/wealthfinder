@@ -25,9 +25,12 @@ class HttpConfig:
 @dataclass
 class HealthConfig:
     """Per-check bound for GET /v1/health's DB/Redis checks. Keep it below the orchestrator
-    readiness probe's own timeout, so SAPI's 503 arrives before the probe gives up."""
+    readiness probe's own timeout, so SAPI's 503 arrives before the probe gives up. A crashed
+    layer Task is restarted after layer_restart_delay_s, so a crash that recurs on every start
+    can't spin."""
 
     check_timeout_s: int  # env: HEALTH_CHECK_TIMEOUT_S (default 2)
+    layer_restart_delay_s: int  # env: LAYER_RESTART_DELAY_S (default 1)
 
 
 @dataclass
@@ -106,6 +109,7 @@ def load_config() -> AppConfig:
         ),
         health=HealthConfig(
             check_timeout_s=int(os.environ.get("HEALTH_CHECK_TIMEOUT_S", "2")),
+            layer_restart_delay_s=int(os.environ.get("LAYER_RESTART_DELAY_S", "1")),
         ),
         redis=RedisConfig(
             stream_url=_require("REDIS_STREAM_URL"),
