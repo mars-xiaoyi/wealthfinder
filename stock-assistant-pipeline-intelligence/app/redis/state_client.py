@@ -1,4 +1,8 @@
+import inspect
+from collections.abc import Callable
+
 import redis.asyncio
+import redis.asyncio.client
 
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
@@ -9,6 +13,20 @@ class RedisStateClient:
 
     def __init__(self, client: redis.asyncio.Redis) -> None:
         self._client = client
+
+    async def hgetall(self, key: str) -> dict[str, str] | None:
+        """Return every field of the hash at key, or None if the key does not exist."""
+        response = self._client.hgetall(key)
+        # redis-py types its hash commands for its sync and async clients alike.
+        assert inspect.isawaitable(response)
+        fields: dict[str, str] = await response
+        return fields or None
+
+    async def multi_exec(self, build: Callable[[redis.asyncio.client.Pipeline], None]) -> None:
+        """Apply the commands build queues on the pipeline as one transaction."""
+        async with self._client.pipeline(transaction=True) as pipe:
+            build(pipe)
+            await pipe.execute()
 
     async def ping(self) -> None:
         """

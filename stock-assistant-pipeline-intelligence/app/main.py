@@ -4,6 +4,9 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.aggregation.aggregation_consumer import AggregationConsumer
+from app.aggregation.aggregation_service import create_aggregation_service
+from app.aggregation.event_aggregation_store import create_event_aggregation_store
 from app.api.main import create_app
 from app.clients.news_client import create_news_client
 from app.common.hk_stock_list import refresh_hk_stock_list
@@ -45,6 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resources.push_async_callback(llm_adapter.close)
         create_news_client(http_client, config.entity_analysis.sadi_api_url)
         create_entity_event_repository()
+        create_event_aggregation_store()
 
         # Eager, blocking HK Stock List load. Unlike the infra above, a failure must not abort
         # startup: refresh_hk_stock_list() leaves an empty fallback cache, and GET /v1/health
@@ -63,6 +67,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cleaned_news_consumer = CleanedNewsConsumer(
             entity_analysis_worker_pool, config.entity_analysis, config.redis
         )
+        aggregation_service = create_aggregation_service(config.aggregation)
+        # Its groups run outside the layer's Task, so they are stopped on their own, once the
+        # layers have stopped and before the clients they use close.
+        resources.push_async_callback(aggregation_service.close)
+        aggregation_consumer = AggregationConsumer(config.aggregation, config.redis)
 
         layer_tasks: dict[Layer, asyncio.Task[None]] = {}
         shutting_down = False
@@ -105,6 +114,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         layer_tasks[Layer.ENTITY_ANALYSIS] = _make_monitored(
             Layer.ENTITY_ANALYSIS, cleaned_news_consumer.start
         )
+        layer_tasks[Layer.AGGREGATION] = asyncio.create_task(aggregation_consumer.start())
         register_layer_tasks(layer_tasks)
 
         async def _cancel_layer_tasks() -> None:

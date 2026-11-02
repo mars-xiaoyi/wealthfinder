@@ -21,7 +21,7 @@ NOT_READY_BODY = {
     "hk_stock_list": "not_ready",
     "layers": {
         "entity_analysis": "ok",
-        "aggregation": "error",
+        "aggregation": "ok",
         "scoring": "error",
         "cache": "error",
     },

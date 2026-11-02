@@ -342,7 +342,7 @@ async def start_crash_restarted(start_consumer, streams, stub_sadi):
         assert log["log_level"] == "critical"
         assert log["layer"] == "entity_analysis"
         assert isinstance(log["exc_info"], redis.exceptions.ResponseError)
-    layers_down = {"aggregation": "error", "scoring": "error", "cache": "error"}
+    other_layers = {"aggregation": "ok", "scoring": "error", "cache": "error"}
     assert while_crashed.status_code == 200
     assert while_crashed.json() == {
         "status": "degraded",
@@ -350,12 +350,12 @@ async def start_crash_restarted(start_consumer, streams, stub_sadi):
         "redis_stream": "ok",
         "redis_state": "ok",
         "hk_stock_list": "ok",
-        "layers": {"entity_analysis": "error", **layers_down},
+        "layers": {"entity_analysis": "error", **other_layers},
     }
     assert restarted.status_code == 200
     assert restarted.json() == {
         **while_crashed.json(),
-        "layers": {"entity_analysis": "ok", **layers_down},
+        "layers": {"entity_analysis": "ok", **other_layers},
     }
     assert restarted_task is not crashed_task
 

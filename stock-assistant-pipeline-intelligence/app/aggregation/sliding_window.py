@@ -67,5 +67,30 @@ def merge_or_create(active_event: Event | None, entity_event: EntityEvent) -> Ev
     )
 
 
+def is_late(active_event: Event, entity_event: EntityEvent) -> bool:
+    """Return whether the entity_event is dated before the active Event's latest EntityEvent
+    by more than the sliding window, too late to merge into it."""
+    published_at = entity_event.get_published_at()
+    # Set on a persisted EntityEvent, the only kind read back from storage.
+    assert published_at is not None
+    config = get_config().aggregation
+    return _get_hours(active_event.last_seen_at - published_at) > config.sliding_window_hours
+
+
+def ttl_for(active_event: Event) -> int:
+    """Return how many seconds the active Event's merge state is kept: until its sliding window
+    or maximum timespan ends, whichever is sooner, plus a grace period of two flush
+    intervals."""
+    config = get_config().aggregation
+    span_hours = _get_hours(active_event.last_seen_at - active_event.first_seen_at)
+    remaining_lifespan_hours = config.event_max_timespan_hours - span_hours
+    # Every key outlives at least one flush, even at the maximum timespan.
+    grace_s = 2 * config.db_flush_interval_s
+    return (
+        int(min(config.sliding_window_hours, remaining_lifespan_hours) * _SECONDS_PER_HOUR)
+        + grace_s
+    )
+
+
 def _get_hours(delta: timedelta) -> float:
     return delta.total_seconds() / _SECONDS_PER_HOUR

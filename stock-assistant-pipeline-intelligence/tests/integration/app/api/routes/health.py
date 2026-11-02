@@ -20,7 +20,7 @@ COMPONENTS = ("database", "redis_stream", "redis_state")
 REQUEST_TIMEOUT_S = 10
 
 # Everything up and the real HK Stock List loaded: degraded, because only the Entity Analysis
-# layer exists yet.
+# and Aggregation layers exist yet.
 ALL_UP_BODY = {
     "status": "degraded",
     "database": "ok",
@@ -29,7 +29,7 @@ ALL_UP_BODY = {
     "hk_stock_list": "ok",
     "layers": {
         "entity_analysis": "ok",
-        "aggregation": "error",
+        "aggregation": "ok",
         "scoring": "error",
         "cache": "error",
     },
@@ -59,16 +59,17 @@ async def stream_redis(infra: Infra) -> AsyncIterator[redis.asyncio.Redis]:
 
 
 async def _wait_consumer_reading(stream_redis: redis.asyncio.Redis) -> None:
-    """Wait until the consumer has created its group, so a failure injected next hits the
-    running consumer rather than its startup."""
+    """Wait until every consumer has created its group, so a failure injected next hits the
+    running consumers rather than their startup."""
     async with asyncio.timeout(3):
-        while True:
-            try:
-                if await stream_redis.xinfo_groups("stream:raw_news_cleaned"):
-                    return
-            except redis.exceptions.ResponseError:  # the stream does not exist yet
-                pass
-            await asyncio.sleep(0.05)
+        for stream in ("stream:raw_news_cleaned", "stream:entity_event_completed"):
+            while True:
+                try:
+                    if await stream_redis.xinfo_groups(stream):
+                        break
+                except redis.exceptions.ResponseError:  # the stream does not exist yet
+                    pass
+                await asyncio.sleep(0.05)
 
 
 def _failed_check_warnings(logs: list[MutableMapping[str, Any]]) -> list[str]:

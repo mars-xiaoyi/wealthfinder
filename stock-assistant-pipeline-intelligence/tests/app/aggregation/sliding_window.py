@@ -14,7 +14,16 @@ from app.models.entity_event import AnalysisOutcome, EntityEvent, EventTypeEnum,
 from app.models.event import Event
 from app.models.versioned_metadata import VersionedMetadata
 
-CONFIG = AggregationConfig(sliding_window_hours=4, event_max_timespan_hours=24)
+CONFIG = AggregationConfig(
+    batch_size=10,
+    batch_timeout_ms=5000,
+    max_concurrent=100,
+    group_idle_timeout_s=60,
+    db_flush_interval_s=300,
+    sliding_window_hours=4,
+    event_max_timespan_hours=24,
+    consumer_name="sapi-aggregation-1",
+)
 T0 = datetime(2026, 9, 8, 1, 0, tzinfo=UTC)
 CREATED_AT = datetime(2026, 9, 9, 1, 0, tzinfo=UTC)
 TENCENT = Stock("00700", "HKEX", "騰訊控股", "TENCENT")
@@ -194,7 +203,7 @@ def merge_or_create_max_timespan_out_of_order(monkeypatch):
     reachable when the maximum timespan is no longer than the sliding window."""
     _set_config(
         monkeypatch,
-        AggregationConfig(sliding_window_hours=4, event_max_timespan_hours=3),
+        dataclasses.replace(CONFIG, event_max_timespan_hours=3),
     )
     published_at = T0 - timedelta(hours=1, minutes=30)
     before = datetime.now(UTC)
@@ -252,3 +261,42 @@ def merge_or_create_invalid_event(active_event, entity_event):
     assert type(exc_info.value) is SAPIError
     assert exc_info.value.error_code == "COMMON-5000"
     assert exc_info.value.category is ErrorCategory.AGGREGATION
+
+
+@pytest.mark.parametrize(
+    ("published_at", "created_at", "late"),
+    [
+        pytest.param(T0, CREATED_AT, True, id="more_than_window_before"),
+        pytest.param(T0 + timedelta(hours=1), CREATED_AT, False, id="exactly_window_before"),
+        pytest.param(T0 + timedelta(hours=6), CREATED_AT, False, id="after_last_seen"),
+        pytest.param(None, T0, True, id="no_publication_time_stored_before"),
+        pytest.param(None, T0 + timedelta(hours=1), False, id="no_publication_time_in_window"),
+    ],
+)
+def is_late_success(published_at, created_at, late):
+    """An EntityEvent is late when dated more than the sliding window before the active Event's
+    latest one, dated by when it was stored if it has no publication time."""
+    active_event = _active_event(T0 + timedelta(hours=5), T0 + timedelta(hours=5))
+
+    result = sliding_window.is_late(
+        active_event, _entity_event(published_at, created_at=created_at)
+    )
+
+    assert result is late
+
+
+@pytest.mark.parametrize(
+    ("span", "ttl_s"),
+    [
+        pytest.param(timedelta(0), 4 * 3600 + 600, id="sliding_window"),
+        pytest.param(timedelta(hours=20), 4 * 3600 + 600, id="window_ends_first"),
+        pytest.param(timedelta(hours=23, minutes=30), 30 * 60 + 600, id="lifespan_ends_first"),
+        pytest.param(timedelta(hours=24), 600, id="max_timespan_reached"),
+    ],
+)
+def ttl_for_success(span, ttl_s):
+    """The merge state is kept until the sliding window or the maximum timespan ends, whichever
+    is sooner, plus two flush intervals, so it is never 0."""
+    result = sliding_window.ttl_for(_active_event(T0, T0 + span))
+
+    assert result == ttl_s

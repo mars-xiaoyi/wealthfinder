@@ -85,7 +85,16 @@ def config():
             sadi_api_url="http://sadi:8000",
             consumer_name="sapi-entity-analysis-1",
         ),
-        aggregation=AggregationConfig(sliding_window_hours=4, event_max_timespan_hours=24),
+        aggregation=AggregationConfig(
+            batch_size=10,
+            batch_timeout_ms=5000,
+            max_concurrent=100,
+            group_idle_timeout_s=60,
+            db_flush_interval_s=300,
+            sliding_window_hours=4,
+            event_max_timespan_hours=24,
+            consumer_name="sapi-aggregation-1",
+        ),
     )
 
 

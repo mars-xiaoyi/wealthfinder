@@ -323,7 +323,7 @@ async def run_input_truncated(adapter):
         pytest.param(LLMRateLimitError, id="rate_limited"),
         pytest.param(LLMProviderError, id="provider_error"),
         pytest.param(LLMRequestError, id="request_rejected"),
-        pytest.param(LLMAuthenticationError, id="authentication_failed"),
+        pytest.param(LLMAuthenticationError, id="authentication_failure"),
         pytest.param(LLMSchemaViolationError, id="schema_violation"),
     ],
 )
