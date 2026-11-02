@@ -1,22 +1,26 @@
 import asyncio
 import time
-from collections.abc import MutableMapping
+from collections.abc import AsyncIterator, MutableMapping
 from typing import Any
 
 import httpx
 import pytest
+import redis.asyncio
+import redis.exceptions
 import structlog.testing
 from httpx import AsyncClient
 
+from app import layer_tasks
 from app.api.schemas import HealthResponse
+from tests.integration.conftest import Infra
 
 pytestmark = [pytest.mark.live, pytest.mark.timeout(120)]
 
 COMPONENTS = ("database", "redis_stream", "redis_state")
 REQUEST_TIMEOUT_S = 10
 
-# Everything up and the real HK Stock List loaded: degraded, because layers.* is still
-# hardcoded to error.
+# Everything up and the real HK Stock List loaded: degraded, because only the Entity Analysis
+# layer exists yet.
 ALL_UP_BODY = {
     "status": "degraded",
     "database": "ok",
@@ -24,7 +28,7 @@ ALL_UP_BODY = {
     "redis_state": "ok",
     "hk_stock_list": "ok",
     "layers": {
-        "entity_analysis": "error",
+        "entity_analysis": "ok",
         "aggregation": "error",
         "scoring": "error",
         "cache": "error",
@@ -41,6 +45,30 @@ async def _get_health(client: AsyncClient) -> tuple[httpx.Response, float]:
 def _body_with_errors(*failed: str) -> dict[str, object]:
     """A failed DB/Redis check makes the response unhealthy; the in-process list stays ok."""
     return {**ALL_UP_BODY, "status": "unhealthy", **{component: "error" for component in failed}}
+
+
+@pytest.fixture
+async def stream_redis(infra: Infra) -> AsyncIterator[redis.asyncio.Redis]:
+    """The test's own client of the stream Redis, starting it empty."""
+    client = redis.asyncio.Redis.from_url(
+        f"redis://127.0.0.1:{infra.redis_stream.port}/0", decode_responses=True
+    )
+    await client.flushall()
+    yield client
+    await client.aclose()
+
+
+async def _wait_consumer_reading(stream_redis: redis.asyncio.Redis) -> None:
+    """Wait until the consumer has created its group, so a failure injected next hits the
+    running consumer rather than its startup."""
+    async with asyncio.timeout(3):
+        while True:
+            try:
+                if await stream_redis.xinfo_groups("stream:raw_news_cleaned"):
+                    return
+            except redis.exceptions.ResponseError:  # the stream does not exist yet
+                pass
+            await asyncio.sleep(0.05)
 
 
 def _failed_check_warnings(logs: list[MutableMapping[str, Any]]) -> list[str]:
@@ -69,12 +97,17 @@ async def get_health_all_up(start_app):
         for mode in ("stop", "pause")
     ],
 )
-async def get_health_dependency_down_then_recovered(infra, start_app, component, mode):
+async def get_health_dependency_down_then_recovered(
+    infra, start_app, stream_redis, component, mode
+):
     """A stopped container refuses connections at once; a paused one never answers, so its
-    check ends at HEALTH_CHECK_TIMEOUT_S (default 2s)."""
+    check ends at HEALTH_CHECK_TIMEOUT_S (default 2s). The Entity Analysis layer rides out
+    the outage without crashing."""
     container = infra.for_component(component)
 
     async with start_app() as client:
+        await _wait_consumer_reading(stream_redis)
+        layer_task = layer_tasks.get_layer_tasks()["entity_analysis"]
         getattr(container, mode)()
         with structlog.testing.capture_logs() as logs:
             response, elapsed = await _get_health(client)
@@ -92,6 +125,8 @@ async def get_health_dependency_down_then_recovered(infra, start_app, component,
 
         assert response.status_code == 200
         assert response.json() == ALL_UP_BODY
+        assert layer_tasks.get_layer_tasks()["entity_analysis"] is layer_task
+        assert not layer_task.done()
 
 
 async def get_health_repeated_db_timeouts(infra, start_app):

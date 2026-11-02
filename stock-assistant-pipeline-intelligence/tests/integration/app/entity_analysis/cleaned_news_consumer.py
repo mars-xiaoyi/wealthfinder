@@ -17,7 +17,7 @@ import redis.asyncio
 import redis.exceptions
 import structlog.testing
 
-from app import logger, main
+from app import layer_tasks, logger, main
 from app.common import error_codes, hk_stock_list
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
@@ -128,6 +128,14 @@ class StreamProbe:
         """The fields of every stream:entity_event_completed entry, oldest first."""
         entries = await self._client.xrange("stream:entity_event_completed")
         return [fields for _message_id, fields in entries]
+
+    async def occupy_with_string(self) -> None:
+        """Hold stream:raw_news_cleaned as a plain string key, so stream commands on it fail
+        with WRONGTYPE."""
+        await self._client.set("stream:raw_news_cleaned", "not a stream")
+
+    async def delete_stream(self) -> None:
+        await self._client.delete("stream:raw_news_cleaned")
 
     async def reconnect(self) -> None:
         """Drop the probe's connections, e.g. after the stream Redis restarted."""
@@ -301,6 +309,55 @@ async def start_resumes_after_restart(start_consumer, streams, stub_sadi):
         await asyncio.sleep(SETTLE_S)
 
     assert [len(stub_sadi.requests_for(cleaned_id)) for cleaned_id in [*before, after]] == [1, 1, 1]
+
+
+async def start_crash_restarted(start_consumer, streams, stub_sadi):
+    """A consumer that crashes on a real Redis error is reported by GET /v1/health until it
+    restarts on its own, and the restarted consumer handles messages."""
+    cleaned_id = uuid.uuid4()
+    stub_sadi.respond(cleaned_id, 404)  # ACKed without reaching Vertex AI
+    await streams.occupy_with_string()
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_consumer(LAYER_RESTART_DELAY_S="2") as client:
+
+            async def crashed() -> bool:
+                return any(log["event"] == "layer_task_crashed" for log in logs)
+
+            await _wait_for(crashed, 3)
+            crashed_task = layer_tasks.get_layer_tasks()["entity_analysis"]
+            while_crashed = await asyncio.wait_for(client.get("/v1/health"), 10)
+
+            await streams.delete_stream()
+            await _wait_group_created(streams)
+            restarted = await asyncio.wait_for(client.get("/v1/health"), 10)
+            message_id = await streams.add(cleaned_id)
+            await _wait_acked(streams, stub_sadi, {cleaned_id: message_id}, 10)
+            restarted_task = layer_tasks.get_layer_tasks()["entity_analysis"]
+            assert not restarted_task.done()
+
+    crash_logs = [log for log in logs if log["event"] == "layer_task_crashed"]
+    assert crash_logs
+    for log in crash_logs:
+        assert log["log_level"] == "critical"
+        assert log["layer"] == "entity_analysis"
+        assert isinstance(log["exc_info"], redis.exceptions.ResponseError)
+    layers_down = {"aggregation": "error", "scoring": "error", "cache": "error"}
+    assert while_crashed.status_code == 200
+    assert while_crashed.json() == {
+        "status": "degraded",
+        "database": "ok",
+        "redis_stream": "ok",
+        "redis_state": "ok",
+        "hk_stock_list": "ok",
+        "layers": {"entity_analysis": "error", **layers_down},
+    }
+    assert restarted.status_code == 200
+    assert restarted.json() == {
+        **while_crashed.json(),
+        "layers": {"entity_analysis": "ok", **layers_down},
+    }
+    assert restarted_task is not crashed_task
 
 
 # Hand-written, not one of the system prompt's few-shot examples. Both codes are printed, and
