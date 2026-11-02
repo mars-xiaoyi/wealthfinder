@@ -226,7 +226,7 @@ async def find_entity_events_already_persisted(news_client, adapter, repository,
         pytest.param(LLMRateLimitError, id="rate_limited"),
         pytest.param(LLMProviderError, id="provider_error"),
         pytest.param(LLMRequestError, id="request_rejected"),
-        pytest.param(LLMAuthenticationError, id="authentication_failed"),
+        pytest.param(LLMAuthenticationError, id="authentication_failure"),
         pytest.param(LLMSchemaViolationError, id="schema_violation"),
     ],
 )

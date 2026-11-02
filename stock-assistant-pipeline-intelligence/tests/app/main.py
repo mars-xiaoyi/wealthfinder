@@ -53,7 +53,16 @@ CONFIG = AppConfig(
         sadi_api_url="http://sadi:8000",
         consumer_name="sapi-entity-analysis-1",
     ),
-    aggregation=AggregationConfig(sliding_window_hours=4, event_max_timespan_hours=24),
+    aggregation=AggregationConfig(
+        batch_size=10,
+        batch_timeout_ms=5000,
+        max_concurrent=100,
+        group_idle_timeout_s=60,
+        db_flush_interval_s=300,
+        sliding_window_hours=4,
+        event_max_timespan_hours=24,
+        consumer_name="sapi-aggregation-1",
+    ),
 )
 
 
@@ -87,15 +96,26 @@ def infra():
     create_repository = MagicMock()
     create_service = MagicMock()
 
-    async def _consume_until_cancelled() -> None:
-        calls.consumer_started()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            calls.consumer_cancelled()
-            raise
+    def _consume_until_cancelled(name: str):
+        async def start() -> None:
+            getattr(calls, f"{name}_started")()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                getattr(calls, f"{name}_cancelled")()
+                raise
 
-    consumer_cls = MagicMock(return_value=MagicMock(start=_consume_until_cancelled))
+        return start
+
+    consumer_cls = MagicMock(return_value=MagicMock(start=_consume_until_cancelled("consumer")))
+    create_store = MagicMock()
+    aggregation_service = MagicMock()
+    aggregation_service.close = AsyncMock()
+    calls.attach_mock(aggregation_service.close, "aggregation_service_close")
+    create_aggregation_service = MagicMock(return_value=aggregation_service)
+    aggregation_consumer_cls = MagicMock(
+        return_value=MagicMock(start=_consume_until_cancelled("aggregation_consumer"))
+    )
     worker_pool_cls = MagicMock()
     calls.attach_mock(create_db, "create_db_client")
     calls.attach_mock(create_stream, "create_stream_client")
@@ -108,6 +128,9 @@ def infra():
     calls.attach_mock(create_service, "create_entity_analysis_service")
     calls.attach_mock(worker_pool_cls, "WorkerPool")
     calls.attach_mock(consumer_cls, "CleanedNewsConsumer")
+    calls.attach_mock(create_store, "create_event_aggregation_store")
+    calls.attach_mock(create_aggregation_service, "create_aggregation_service")
+    calls.attach_mock(aggregation_consumer_cls, "AggregationConsumer")
     with (
         mock.patch.object(main_module, "load_config", return_value=CONFIG),
         mock.patch.object(main_module, "create_db_client", create_db),
@@ -121,6 +144,9 @@ def infra():
         mock.patch.object(main_module, "create_entity_analysis_service", create_service),
         mock.patch.object(main_module, "WorkerPool", worker_pool_cls),
         mock.patch.object(main_module, "CleanedNewsConsumer", consumer_cls),
+        mock.patch.object(main_module, "create_event_aggregation_store", create_store),
+        mock.patch.object(main_module, "create_aggregation_service", create_aggregation_service),
+        mock.patch.object(main_module, "AggregationConsumer", aggregation_consumer_cls),
     ):
         yield calls
 
@@ -137,14 +163,20 @@ STARTUP_CALLS = [
     "create_llm_adapter",
     "create_news_client",
     "create_entity_event_repository",
+    "create_event_aggregation_store",
     "refresh_hk_stock_list",
     "WorkerPool",
     "create_entity_analysis_service",
     "CleanedNewsConsumer",
+    "create_aggregation_service",
+    "AggregationConsumer",
     "consumer_started",
+    "aggregation_consumer_started",
 ]
 SHUTDOWN_CALLS = [
     "consumer_cancelled",
+    "aggregation_consumer_cancelled",
+    "aggregation_service_close",
     "llm_adapter_close",
     "http_client_aclose",
     "redis_state_close",
@@ -155,7 +187,7 @@ SHUTDOWN_CALLS = [
 
 async def lifespan(infra):
     async with main_module.lifespan(FastAPI()):
-        await asyncio.sleep(0)  # let the consumer Task start
+        await asyncio.sleep(0)  # let the consumer Tasks start
         assert _call_names(infra) == STARTUP_CALLS
         infra.create_db_client.assert_awaited_once_with(CONFIG.db)
         infra.create_stream_client.assert_awaited_once_with(
@@ -174,14 +206,19 @@ async def lifespan(infra):
         infra.CleanedNewsConsumer.assert_called_once_with(
             infra.WorkerPool.return_value, CONFIG.entity_analysis, CONFIG.redis
         )
+        infra.create_event_aggregation_store.assert_called_once_with()
+        infra.create_aggregation_service.assert_called_once_with(CONFIG.aggregation)
+        infra.AggregationConsumer.assert_called_once_with(CONFIG.aggregation, CONFIG.redis)
 
         layer_tasks = layer_tasks_module.get_layer_tasks()
-        assert set(layer_tasks) == {"entity_analysis"}
+        assert set(layer_tasks) == {"entity_analysis", "aggregation"}
         assert not layer_tasks["entity_analysis"].done()
+        assert not layer_tasks["aggregation"].done()
 
     assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS
     infra.db_close.assert_awaited_once_with(CONFIG.db.close_timeout_s)
     assert layer_tasks["entity_analysis"].cancelled()
+    assert layer_tasks["aggregation"].cancelled()
 
 
 @pytest.mark.parametrize(
@@ -202,7 +239,7 @@ async def lifespan_hk_stock_list_load_failed(infra, error):
     infra.refresh_hk_stock_list.side_effect = error
 
     async with main_module.lifespan(FastAPI()):
-        await asyncio.sleep(0)  # let the consumer Task start
+        await asyncio.sleep(0)  # let the consumer Tasks start
         assert _call_names(infra) == STARTUP_CALLS
 
     assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS

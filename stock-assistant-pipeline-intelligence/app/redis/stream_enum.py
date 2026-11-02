@@ -14,6 +14,7 @@ class EntityEventCompletedStream:
 
     NAME: Final = "stream:entity_event_completed"
     VERSION: Final = "1"
+    CONSUMER_GROUP: Final = "sapi-aggregation"
 
 
 class EntityAnalysisDeadLetterStream:

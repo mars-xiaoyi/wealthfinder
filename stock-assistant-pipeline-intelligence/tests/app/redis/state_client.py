@@ -25,6 +25,45 @@ def redis_mock():
     return client
 
 
+async def hgetall_success(redis_mock):
+    redis_mock.hgetall = AsyncMock(return_value={"event_id": "e1"})
+
+    fields = await RedisStateClient(redis_mock).hgetall("agg:event:HKEX:00700:EARNINGS")
+
+    assert fields == {"event_id": "e1"}
+    redis_mock.hgetall.assert_awaited_once_with("agg:event:HKEX:00700:EARNINGS")
+
+
+async def hgetall_missing_key(redis_mock):
+    redis_mock.hgetall = AsyncMock(return_value={})
+
+    fields = await RedisStateClient(redis_mock).hgetall("agg:event:HKEX:00700:EARNINGS")
+
+    assert fields is None
+
+
+async def multi_exec_success(redis_mock):
+    pipe = MagicMock()
+    pipe.execute = AsyncMock(return_value=[1, True])
+    pipeline = MagicMock()
+    pipeline.__aenter__ = AsyncMock(return_value=pipe)
+    pipeline.__aexit__ = AsyncMock(return_value=None)
+    redis_mock.pipeline = MagicMock(return_value=pipeline)
+
+    def build(queued) -> None:
+        queued.hset("agg:event:HKEX:00700:EARNINGS", mapping={"event_id": "e1"})
+        queued.expire("agg:event:HKEX:00700:EARNINGS", 15000)
+
+    await RedisStateClient(redis_mock).multi_exec(build)
+
+    redis_mock.pipeline.assert_called_once_with(transaction=True)
+    assert pipe.mock_calls == [
+        mock.call.hset("agg:event:HKEX:00700:EARNINGS", mapping={"event_id": "e1"}),
+        mock.call.expire("agg:event:HKEX:00700:EARNINGS", 15000),
+        mock.call.execute(),
+    ]
+
+
 async def ping(redis_mock):
     await RedisStateClient(redis_mock).ping()
 

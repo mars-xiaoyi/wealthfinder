@@ -50,8 +50,14 @@ def load_config_defaults():
     assert config.entity_analysis.max_input_chars == 30000
     assert config.entity_analysis.sadi_api_url == "http://localhost:8000"
     assert config.entity_analysis.consumer_name == "sapi-entity-analysis-1"
+    assert config.aggregation.batch_size == 10
+    assert config.aggregation.batch_timeout_ms == 5000
+    assert config.aggregation.max_concurrent == 100
+    assert config.aggregation.group_idle_timeout_s == 10
+    assert config.aggregation.db_flush_interval_s == 300
     assert config.aggregation.sliding_window_hours == 4
     assert config.aggregation.event_max_timespan_hours == 24
+    assert config.aggregation.consumer_name == "sapi-aggregation-1"
 
 
 def load_config_overrides(monkeypatch):
@@ -76,6 +82,11 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("HOSTNAME", "sapi-pod-7")
     monkeypatch.setenv("SLIDING_WINDOW_HOURS", "6")
     monkeypatch.setenv("EVENT_MAX_TIMESPAN_HOURS", "48")
+    monkeypatch.setenv("AGG_BATCH_SIZE", "20")
+    monkeypatch.setenv("AGG_BATCH_TIMEOUT_MS", "1000")
+    monkeypatch.setenv("AGG_MAX_CONCURRENT", "50")
+    monkeypatch.setenv("AGG_GROUP_IDLE_TIMEOUT_S", "30")
+    monkeypatch.setenv("AGG_DB_FLUSH_INTERVAL_S", "120")
 
     config = config_module.load_config()
 
@@ -100,6 +111,12 @@ def load_config_overrides(monkeypatch):
     assert config.entity_analysis.consumer_name == "sapi-pod-7"
     assert config.aggregation.sliding_window_hours == 6
     assert config.aggregation.event_max_timespan_hours == 48
+    assert config.aggregation.batch_size == 20
+    assert config.aggregation.batch_timeout_ms == 1000
+    assert config.aggregation.max_concurrent == 50
+    assert config.aggregation.group_idle_timeout_s == 30
+    assert config.aggregation.db_flush_interval_s == 120
+    assert config.aggregation.consumer_name == "sapi-pod-7"
 
 
 @pytest.mark.parametrize("missing", list(REQUIRED_ENV))

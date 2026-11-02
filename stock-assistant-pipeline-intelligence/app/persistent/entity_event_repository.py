@@ -3,10 +3,14 @@ import uuid
 from datetime import UTC, datetime
 from uuid import UUID
 
+import asyncpg
+
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
+from app.common.stock import Stock
 from app.db.connection import DatabaseClient, get_db_client
-from app.models.entity_event import EntityEvent
+from app.models.entity_event import AnalysisOutcome, EntityEvent
+from app.models.versioned_metadata import VersionedMetadata
 
 _INSERT_ENTITY_EVENT_SQL = """
     INSERT INTO entity_events (
@@ -22,6 +26,40 @@ _INSERT_ENTITY_EVENT_SQL = """
 _SELECT_ENTITY_EVENT_IDS_BY_SOURCE_URL_SQL = (
     "SELECT entity_event_id FROM entity_events WHERE source_url = $1"
 )
+
+_SELECT_ENTITY_EVENT_SQL = "SELECT * FROM entity_events WHERE entity_event_id = $1"
+
+
+def _row_to_entity_event(row: asyncpg.Record) -> EntityEvent:
+    additional_outcome = json.loads(row["additional_outcome"])
+    output = additional_outcome["output"]
+    return EntityEvent(
+        source_id=UUID(json.loads(row["metadata"])["cleaned_id"]),
+        source_url=row["source_url"],
+        source_name=row["source_name"],
+        published_at=row["published_at"],
+        analysis_outcome=VersionedMetadata(
+            version=additional_outcome["version"],
+            output=AnalysisOutcome(
+                stock_code=row["stock_code"],
+                event_type_primary=row["event_type_primary"],
+                event_type_secondary=output["event_type_secondary"],
+                sentiment_label=row["sentiment_label"],
+                sentiment_score=row["sentiment_score"],
+                headline=row["headline"],
+                entity_summary=row["entity_summary"],
+            ),
+        ),
+        # Rebuilt from the row alone, so it reads as stored even after the HK Stock List changes.
+        stock=Stock(
+            stock_code=row["stock_code"],
+            exchange=row["exchange"],
+            company_name_zh=output["company_name_zh"],
+            company_name_en=output["company_name_en"],
+        ),
+        entity_event_id=row["entity_event_id"],
+        created_at=row["created_at"],
+    )
 
 
 class EntityEventRepository:
@@ -88,6 +126,14 @@ class EntityEventRepository:
         """
         rows = await self._db.fetch_all(_SELECT_ENTITY_EVENT_IDS_BY_SOURCE_URL_SQL, source_url)
         return [row["entity_event_id"] for row in rows]
+
+    async def fetch_entity_event(self, entity_event_id: UUID) -> EntityEvent | None:
+        """
+        Return the stored EntityEvent with this id, or None if there is none.
+        Raises ServiceUnavailableError or DatabaseError.
+        """
+        row = await self._db.fetch_one(_SELECT_ENTITY_EVENT_SQL, entity_event_id)
+        return _row_to_entity_event(row) if row is not None else None
 
 
 _entity_event_repository: EntityEventRepository | None = None
