@@ -730,98 +730,116 @@ This document does not introduce new design — every ticket below implements so
 
 ---
 
-### Cache: Recency & Merge (S)
+### Cache: Startup Full Build (M)
 
-**Status:** Created
-**Depends on:** Scoring: Rule Score & Persist (for `EventScore`); Scoring: Brief Summary (for `Event.brief_summary`)
-**Scope:** The pure half of building the Morning Brief cache — the recency formula, the ranking order, and turning scored Events into cache records merged against the current cache (impl.md §14.1 types, §14.3, §14.4, §14.5 `_to_cache_record()`; design rationale: design.md §6.3, §6.4, §6.6).
-- `app/config.py`: `CacheConfig.noise_filter_threshold`/`recency_decay_lambda`.
+**Status:** Designed
+**Depends on:** Scoring: Rule Score & Persist (for `event_scores`, `EventScoreRepository`); Scoring: Brief Summary (for `Event.brief_summary`)
+**Scope:** Build one cache version at startup from every scored Event above the noise threshold, ranked with recency applied (impl.md §14.1 `build_initial_version()`/`_build_full()`, §14.3, §14.5, §10.4, §16; design rationale: design.md §6.1, §6.3–§6.6).
+- `app/config.py`: `CacheConfig.noise_filter_threshold`/`recency_decay_lambda`/`full_fetch_page_size`.
+- `app/redis/state_client.py`: `get()`, `incr()` (§6.2) — `multi_exec()` already exists.
+- `app/persistent/cache_store.py`: `CacheStore` + `create_cache_store()`/`get_cache_store()` — the write side only: `get_current_version()`, `incr_version_counter()`, `write_cache_version()` (§10.4).
+- `app/persistent/event_score_repository.py`: `fetch_scores()` — the keyset-paginated full fetch only (`event_ids=None`) (§10.3).
+- `app/persistent/event_repository.py`: `fetch_events()`, in chunks of `CACHE_FULL_FETCH_PAGE_SIZE` (§10.2).
 - `app/cache/recency.py`: `apply_recency()`, `ranking_key()` (§14.3).
-- `app/cache/cache_service.py`: `CacheEventDetail`, `CacheLLMScoreDetail`, `CacheScoreDetail`, `CacheRecord` (with `to_dict()`/`from_dict()`), `Candidate`, `_build_candidate_records()`, `_incremental_merge()`, `_to_cache_record()` — not `CacheService` itself.
-**Acceptance criteria** (per impl.md §14.1, §14.3–§14.5):
+- `app/cache/cache_service.py`: `CacheEventDetail`, `CacheLLMScoreDetail`, `CacheScoreDetail`, `CacheRecord` with `to_dict()` only; `CacheService` + singleton — `build_initial_version()`, `_build_full()`, `_to_cache_record()`, `_write_new_version()` (UTF-8 JSON via `ensure_ascii=False`) (§14.1, §14.5).
+- `app/main.py`: `create_cache_store()`, `create_cache_service()`, and the startup call, logging CRITICAL `cache_startup_build_failed` and continuing on failure (§16).
+**Acceptance criteria** (per impl.md §10.4, §14.1, §14.3, §14.5, §16):
+- No existing version: one version holding every `event_scores` row above `NOISE_FILTER_THRESHOLD`, sorted by `ranking_key()`; zero rows still produces an empty, built version.
+- An existing version (Redis survived a restart) is left untouched.
 - `apply_recency()` matches the §14.3 formula: recency decays with hours since `aggregation_updated_at`, its 0.20 share is added to the stored base score, `direction` is applied, then fused with `stock_impact_score`.
 - `ranking_key()` orders by `abs_final_score`, then `|base_rule_score|`, then `last_seen_at`, then `first_seen_at`.
-- Merge: the four §14.4 rows (replace / insert / remove / ignore), decided on the **stored** `abs_final_score`; a cached Event not in this batch keeps its place whatever its recency.
 - `_to_cache_record()` fills the display fields and the three internal fields; `llm_score_detail` carries `adjustment_reason`, `score_version`, `scored_at`.
-- `CacheRecord.to_dict()`/`from_dict()` round-trip losslessly.
-- Unit-tested with fixed timestamps. No integration pass — pure functions with no I/O.
-**Docs:** impl.md §4.1, §14.1, §14.3, §14.4, §14.5; design.md §6.3, §6.4, §6.6.
-**Explicitly deferred:** reading and writing the cache, the build itself, the API.
+- The full fetch pages through more than one `CACHE_FULL_FETCH_PAGE_SIZE` page correctly, and the matching Events are fetched in chunks of the same size — no single query carries every scored Event's id.
+- `write_cache_version()` writes the new version, moves the pointer, deletes the old version (none on a first build), and sets `last_updated` in one `MULTI/EXEC` — a reader never sees the pointer on a missing version; `incr_version_counter()` only ever increases, across restarts.
+- The stored version is UTF-8 JSON (Chinese text not `\u`-escaped).
+- A failed build logs `cache_startup_build_failed` at CRITICAL and startup continues.
+- Unit-tested against fake repositories and mocked Redis.
+- Integration pass against real Postgres and Redis: seed `events`/`event_scores` across more than one page, start the app, check the stored version, the pointer, and the counter across a restart.
+**Docs:** impl.md §4.1, §6.2, §10.2, §10.3, §10.4, §14.1, §14.3, §14.5, §14.7, §16; design.md §6.1, §6.3–§6.6, §6.8, §11.4.
+**Explicitly deferred:** reading a version back and `from_dict()`; the score-triggered build; `scan_orphaned_versions()`.
+**PM note:** meanwhile the cache is rebuilt only at startup; nothing is released before the Cache layer is complete.
 
 ---
 
-### Cache: Versioned Cache Store (S)
+### API: `GET /v1/morning-brief` (M)
 
-**Status:** Created
-**Depends on:** Aggregation: Consume & Merge into Active Events (for `RedisStateClient`)
-**Scope:** Store Morning Brief versions in Redis and switch between them atomically (impl.md §10.4; design.md §6.5, §11.4).
-- `app/redis/state_client.py`: `get()`, `mget()`, `incr()` (§6.2) — `multi_exec()` already exists (Aggregation: Consume & Merge into Active Events).
-- `app/persistent/cache_store.py`: `CacheStore` + `create_cache_store()`/`get_cache_store()` — `CachePointer`, `get_current_version()`, `get_current_pointer()`, `incr_version_counter()`, `write_cache_version()`, `read_cache_version()`, and the Redis-error translation (`_read()`, and in `get_current_pointer()`); not `scan_orphaned_versions()`.
-- `app/main.py`: `create_cache_store()` (§16).
-**Acceptance criteria** (per impl.md §10.4):
-- `write_cache_version()` writes the new version, moves the pointer, deletes the old version (none on a first build), and sets `last_updated` in one `MULTI/EXEC` — a reader never sees the pointer on a missing version.
-- `incr_version_counter()` only ever increases, across restarts.
-- `get_current_version()`/`get_current_pointer()` return `None` before the first build.
+**Status:** Designed
+**Depends on:** Cache: Startup Full Build (for `CacheStore`, `CacheRecord`, and a built version)
+**Scope:** Serve the Morning Brief from the current cache version, as built — no re-scoring per request (impl.md §15.3, §15.4, §3.5, §10.4; api.md §3.3; design.md §6.3, §7).
+- `app/config.py`: `CacheConfig.top_k_default`.
+- `app/redis/state_client.py`: `mget()` (§6.2).
+- `app/persistent/cache_store.py`: `CachePointer`, `get_current_pointer()`, `read_cache_version()`, and the Redis-error translation (`_read()`, and in `get_current_pointer()`) (§10.4).
+- `app/cache/cache_service.py`: `from_dict()` on `CacheRecord` and its nested types (§14.1).
+- `app/api/schemas.py`: `SourceListEntry`, `EventDetail`, `RuleScoreDetail`, `LLMScoreDetail`, `ScoreDetail`, `ScoredEventRecord`, `MorningBriefResponse` (§3.5).
+- `app/common/errors.py`: `MorningBriefCacheUnavailableError` (`SAPI-5001`), and the `COMMON-4000`/`COMMON-4001`/`COMMON-5000` codes the exception handlers return (§15.1, §15.4).
+- `app/main.py`: exception handlers for `RequestValidationError` (400, `COMMON-4000`/`4001`), `MorningBriefCacheUnavailableError` (503) and the general `Exception` catch-all (500 `COMMON-5000`) (§15.1).
+- `app/api/routes/morning_brief.py`: `get_morning_brief()` (§15.3), reading and parsing the current version through `CacheStore`.
+**Acceptance criteria** (per impl.md §10.4, §15.3, api.md §3.3):
+- The same cache version always returns the same Events in the same order and with the same scores — the route reads, it never recomputes recency.
+- Watchlist Events first, then the backfill of the best non-watchlist Events up to `k` — each group in the version's stored order, and the response keeps that order rather than re-sorting it as one list.
+- `k` omitted → `TOP_K_DEFAULT`; `k` outside 1–50 or `stocks` empty → 400 `COMMON-4001`; malformed request → 400 `COMMON-4000`.
+- No version ever built → 503 `SAPI-5001`; a built cache with no matches → 200 with `events: []` and non-null `cache_version`/`last_updated`.
+- A build replacing the version between the pointer read and the data read is retried (up to 3 pointer reads), never served as an empty brief; `cache_version`/`last_updated` always belong to the version actually served.
 - `get_current_pointer()` returns the version and its `last_updated` from one `MGET` — never a version paired with another build's timestamp.
-- A Redis connection or timeout failure on any read raises `ServiceUnavailableError`, not a raw `redis` exception.
-- Unit-tested against mocked Redis.
-- Integration pass against real Redis: atomic switch, old version gone, counter persistence.
-**Docs:** impl.md §6.2, §10.4, §15.1; design.md §6.5, §11.4.
-**Explicitly deferred:** `scan_orphaned_versions()` (Cache: Orphan Cleanup).
+- Redis unreachable (connection or timeout, on any read) → 503 `COMMON-5001`, never a raw `redis` exception; an unanticipated error → 500 `COMMON-5000`.
+- `CacheRecord.to_dict()`/`from_dict()` round-trip losslessly.
+- The response never contains the three internal fields, and matches api.md §3.3 field for field.
+- Unit-tested against a fake `CacheStore`.
+- Integration pass against real Postgres and Redis: seed `events`/`event_scores`, let the startup build write the version, then call the endpoint.
+**Docs:** impl.md §3.5, §6.2, §10.4, §14.1, §15.1, §15.3, §15.4, §16; api.md §3.3; design.md §6.3, §6.6, §7.2–§7.4.
+**Explicitly deferred:** parsing each version only once; anything that builds the cache.
+**PM note:** meanwhile every request reads and parses the current version — the same responses, only slower.
 
 ---
 
-### Cache: Build Cache from Scores (M)
+### Cache: Parse Once with CacheReader (S)
 
-**Status:** Created
-**Depends on:** Cache: Recency & Merge; Cache: Versioned Cache Store; Scoring: Rule Score & Persist (for `stream:event_scored`, `event_scores`, `EventScoreRepository`)
-**Scope:** Consume `stream:event_scored` and build a new cache version per batch, incrementally (impl.md §14.1 `build_new_version()`, §14.2; design.md §6.1, §6.2).
+**Status:** Designed
+**Depends on:** API: `GET /v1/morning-brief` (for the route, `read_cache_version()`, `from_dict()`)
+**Scope:** Parse each cache version at most once, and hand a freshly written version to the API without a parse (impl.md §14.8).
+- `app/cache/cache_reader.py`: `CacheReader` + `create_cache_reader()`/`get_cache_reader()` — `prime()` and `get_records()` (§14.8); `main.py` creates it after `CacheStore` (§16).
+- `CacheService._write_new_version()`: calls `CacheReader.prime()` after a successful write (§14.5).
+- `get_morning_brief()`: reads records through `CacheReader.get_records()` (§15.3).
+**Acceptance criteria** (per impl.md §14.5, §14.8, §15.3):
+- Requests for a version already held never read Redis for its data; a version not held (e.g. after a restart) is read and parsed once, then reused.
+- After each successful write `CacheReader` holds that version's records without any parse; a failed write primes nothing.
+- Requests never change the shared records.
+- Unit-tested against a fake `CacheStore`.
+- Integration pass against real Postgres and Redis: after the startup build, repeated requests for the same version make no data read.
+**Docs:** impl.md §14.5, §14.8, §15.3, §16; design.md §7.2.
+
+---
+
+### Cache: Consume Scores & Incremental Build (M)
+
+**Status:** Designed
+**Depends on:** Cache: Parse Once with CacheReader (for `prime()`, and through it `read_cache_version()`/`from_dict()`); Scoring: Rule Score & Persist (for `stream:event_scored`)
+**Scope:** Consume `stream:event_scored` and build a new cache version per batch, incrementally (impl.md §14.1 `build_new_version()`, §14.2, §14.4; design.md §6.1, §6.2, §6.4).
 - `app/config.py`: `CacheConfig.batch_timeout_ms`/`consumer_name` — no batch-size setting (§14.2).
-- `app/persistent/event_score_repository.py`: `fetch_scores(event_ids)` — the by-id branch only (§10.3).
-- `app/persistent/event_repository.py`: `fetch_events()` (§10.2).
-- `app/cache/cache_service.py`: `CacheService` + singleton — `build_new_version()`, `_refresh_cached_records()`, `_write_new_version()` (UTF-8 JSON via `ensure_ascii=False`; calls `CacheReader.prime()` after a successful write) (§14.1, §14.5).
-- `app/cache/cache_reader.py`: `CacheReader` + `create_cache_reader()`/`get_cache_reader()` — `prime()` and `get_records()` (§14.8); `main.py` creates it after `CacheStore`.
+- `app/persistent/event_score_repository.py`: `fetch_scores(event_ids)` — the by-id branch (§10.3).
+- `app/cache/cache_service.py`: `build_new_version()` with step 1's fallback to `_build_full()`, `_refresh_cached_records()`, `Candidate`, `_build_candidate_records()`, `_incremental_merge()` (§14.1, §14.4).
 - `app/cache/cache_consumer.py`: `CacheConsumer` with a single serial loop — `read_from()` reading everything pending (no `COUNT`), coalesced until `CACHE_BATCH_TIMEOUT_MS` after the first message, `build_new_version()` in `try`/`except` (`cache_build_failed`), batch ACK; no reclaim yet (§14.2).
-- `app/main.py`: `create_cache_service()`, the consumer started as a plain Task in `layer_tasks` (§16).
-**Acceptance criteria** (per impl.md §14.1, §14.2, §14.7):
-- A batch of new scores produces exactly one new version, sorted by `ranking_key()`, with the batch merged per §14.4 and every other cached Event's recency refreshed from its stored inputs — no DB read beyond the batch.
+- `app/main.py`: the consumer started as a plain Task in `layer_tasks`, after the startup build (§16).
+**Acceptance criteria** (per impl.md §14.1, §14.2, §14.4, §14.7):
+- A batch of new scores produces exactly one new version, sorted by `ranking_key()`, with every other cached Event's recency refreshed from its stored inputs — no DB read beyond the batch.
+- Merge: the four §14.4 rows (replace / insert / remove / ignore), decided on the **stored** `abs_final_score`; a cached Event not in this batch keeps its place whatever its recency.
 - The batch is ACKed only after the version write succeeds.
 - A failed build (DB or Redis) logs `cache_build_failed`, leaves the batch un-ACKed, writes no version, and the loop continues; the layer Task doesn't crash.
 - Builds never run concurrently.
-- The stored version is UTF-8 JSON (Chinese text not `\u`-escaped), and after each successful write `CacheReader` holds that version's records, so the API needs no parse; a failed write primes nothing.
 - A trickle of single messages is coalesced: one build per `CACHE_BATCH_TIMEOUT_MS` since the first message, however many messages arrived — not one build per message.
+- After a failed startup build, the first batch finds no version and does the full build instead — every scored Event above the threshold is in the cache, not just that batch; if that full build fails too, the batch stays un-ACKed and the next one tries again.
 - Unit-tested against fake repositories and `CacheStore`.
 - Integration pass against real Postgres and Redis: seed `events`/`event_scores`, publish `stream:event_scored` directly, check the stored version and pointer across several batches, including one above and one below `NOISE_FILTER_THRESHOLD`.
 - Each successful build logs INFO `cache_build_completed` with `cache_version`, `records` and `latency_ms` (impl.md §14.5).
-**Docs:** impl.md §4.1, §10.2, §10.3, §14.1, §14.2, §14.5, §14.7, §16; design.md §6.1, §6.2, §6.8.
-**Explicitly deferred:** the startup build (Cache: Startup Initial Build); inline reclaim, dead-letter and the `v` check; orphan cleanup; layer monitoring.
-
----
-
-### Cache: Startup Initial Build (S)
-
-**Status:** Created
-**Depends on:** Cache: Build Cache from Scores
-**Scope:** Build the first cache version from everything already scored, once at startup, before the Cache consumer starts (impl.md §14.1 `build_initial_version()`, §16; design.md §6.1).
-- `app/config.py`: `CacheConfig.full_fetch_page_size`.
-- `EventScoreRepository.fetch_scores()`: the keyset-paginated full fetch (`event_ids=None`) (§10.3).
-- `CacheService.build_initial_version()` and `_build_full()` (§14.1), and `build_new_version()`'s fallback to `_build_full()` when no version exists (§14.1 step 1).
-- `app/main.py`: the startup call before the Cache consumer's Task starts, logging CRITICAL `cache_startup_build_failed` and continuing on failure (§16).
-**Acceptance criteria** (per impl.md §14.1, §16):
-- No existing version: one full build from every `event_scores` row above `NOISE_FILTER_THRESHOLD`; zero rows still produces an empty, built version (so `GET /v1/morning-brief` returns 200, not 503).
-- An existing version (Redis survived a restart) is left untouched.
-- The full fetch pages through more than one `CACHE_FULL_FETCH_PAGE_SIZE` page correctly, and the matching Events are fetched in chunks of the same size — no single query carries every scored Event's id.
-- A failure logs `cache_startup_build_failed` at CRITICAL and startup continues; the consumer's first batch then finds no version and does the full build instead — every scored Event above the threshold is in the cache, not just that batch. If that full build fails too, the batch stays un-ACKed and the next one tries again.
-- Unit-tested against fake repositories.
-- Integration pass against real Postgres and Redis.
-**Docs:** impl.md §10.3, §14.1, §14.7, §16; design.md §6.1, §6.8.
+**Docs:** impl.md §4.1, §10.3, §14.1, §14.2, §14.4, §14.5, §14.7, §16; design.md §6.1, §6.2, §6.4, §6.8.
+**Explicitly deferred:** inline reclaim, dead-letter and the `v` check; orphan cleanup; layer monitoring.
 
 ---
 
 ### Cache: Inline Reclaim, Dead Letter & Schema-Version Check (S)
 
 **Status:** Created
-**Depends on:** Cache: Build Cache from Scores; Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
+**Depends on:** Cache: Consume Scores & Incremental Build; Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
 **Scope:** Recover batches the Cache layer leaves un-ACKed, inside the single serial loop rather than a second coroutine, and dead-letter messages that keep failing or are malformed (missing or unrecognised `v`, missing or invalid `event_id`) (impl.md §14.2; §6.1's pattern, adapted).
 - `app/config.py`: `CacheConfig.max_retry`.
 - `CacheConsumer._consumer_loop()`: every `STREAM_CLAIM_TIMEOUT_MS`, `autoclaim()` inline; dead-letter at `CACHE_MAX_RETRY` to `stream:cache_dead_letter`; merge the remaining reclaimed ids into the same batch as `read_from()`; the message shape check (`v` and `event_id`) on both paths.
@@ -840,7 +858,7 @@ This document does not introduce new design — every ticket below implements so
 ### Cache: Orphan Cleanup (S)
 
 **Status:** Created
-**Depends on:** Cache: Build Cache from Scores
+**Depends on:** Cache: Consume Scores & Incremental Build
 **Scope:** Periodically delete cache versions left behind by a crash or a failed delete (impl.md §14.6; design.md §12.1 Orphaned Cache Cleanup).
 - `app/config.py`: `CacheConfig.orphan_cleanup_interval_s`.
 - `app/redis/state_client.py`: `delete()` (§6.2) — `scan()` already exists (Aggregation: Flush Active Events & Publish).
@@ -875,56 +893,10 @@ This document does not introduce new design — every ticket below implements so
 
 ---
 
-### Cache: Post-Release Tuning Validation (S)
-
-**Status:** Created
-**Depends on:** every Cache ticket above and API: `GET /v1/morning-brief` (below); Deployment: SAPI Container, Compose & Production-like Run (below — the real-traffic run), run for an agreed length.
-**Scope:** Answer the Cache and Morning Brief tuning questions that need real volume, from production logs, Redis, and request metrics — no new instrumentation.
-- **`NOISE_FILTER_THRESHOLD`:** share of scored Events that make the cache, and whether low-impact noise gets through.
-- **`RECENCY_DECAY_LAMBDA`:** whether ranking favours fresh Events the way analysts expect, on a hand-checked sample of Morning Briefs.
-- **`TOP_K_DEFAULT`:** whether the default result size fits the client.
-- **Q-1 (Cache's share):** `CACHE_BATCH_TIMEOUT_MS`, from build frequency and duration.
-- **Cache growth (Q-17):** cache size and `GET /v1/morning-brief` latency over the run — checks the retention policy decided before go-live (design.md §14 Q-17), or, if none was adopted, how fast the cache grows and how often old Events appear in the backfill.
-**Acceptance criteria:**
-- Each tuning item has measured numbers and a decision: keep the default, or change it with the reason.
-- Changed defaults are applied in `app/config.py` and impl.md §4.1.
-- Q-17's growth, latency and old-Event-in-backfill numbers are recorded against whatever retention decision was made before go-live.
-- Q-1 is marked resolved in impl.md §18 and design.md §14 once every layer's share is answered.
-**Docs:** impl.md §4.1, §14, §15.3, §18; design.md §6, §14 (Q-1, Q-17).
-**PM note:** run length to be set; can share the production run with the other layers' validation tickets.
-
----
-
-### API: `GET /v1/morning-brief` (M)
-
-**Status:** Created
-**Depends on:** Cache: Recency & Merge (for `CacheRecord`); Cache: Versioned Cache Store (for `CacheStore`); Cache: Build Cache from Scores (for `CacheReader`)
-**Scope:** Serve the Morning Brief from the current cache version, as built — no re-scoring per request (impl.md §15.3, §15.4, §3.5; api.md §3.3; design.md §6.3, §7).
-- `app/config.py`: `CacheConfig.top_k_default`.
-- `app/api/schemas.py`: `SourceListEntry`, `EventDetail`, `RuleScoreDetail`, `LLMScoreDetail`, `ScoreDetail`, `ScoredEventRecord`, `MorningBriefResponse` (§3.5).
-- `app/common/errors.py`: `MorningBriefCacheUnavailableError` (`SAPI-5001`), and the `COMMON-4000`/`COMMON-4001`/`COMMON-5000` codes the exception handlers return (§15.1, §15.4).
-- `app/main.py`: exception handlers for `RequestValidationError` (400, `COMMON-4000`/`4001`), `MorningBriefCacheUnavailableError` (503) and the general `Exception` catch-all (500 `COMMON-5000`) (§15.1).
-- `app/api/routes/morning_brief.py`: `get_morning_brief()` (§15.3), reading records through `CacheReader.get_records()`.
-**Acceptance criteria** (per impl.md §15.3, api.md §3.3):
-- The same cache version always returns the same Events in the same order and with the same scores — the route reads, it never recomputes recency.
-- A version is parsed at most once: requests for a version already held never read Redis for its data; a version not held (e.g. after a restart) is read and parsed once, then reused; `prime()` makes a version held without any parse. Requests never change the shared records.
-- Watchlist Events first, then the backfill of the best non-watchlist Events up to `k` — each group in the version's stored order, and the response keeps that order rather than re-sorting it as one list.
-- `k` omitted → `TOP_K_DEFAULT`; `k` outside 1–50 or `stocks` empty → 400 `COMMON-4001`; malformed request → 400 `COMMON-4000`.
-- No version ever built → 503 `SAPI-5001`; a built cache with no matches → 200 with `events: []` and non-null `cache_version`/`last_updated`.
-- A build replacing the version between the pointer read and the data read is retried (up to 3 pointer reads), never served as an empty brief; `cache_version`/`last_updated` always belong to the version actually served.
-- Redis unreachable → 503 `COMMON-5001`; an unanticipated error → 500 `COMMON-5000`.
-- The response never contains the three internal fields, and matches api.md §3.3 field for field.
-- Unit-tested against a fake `CacheStore`.
-- Integration pass against real Redis with a hand-written cache version.
-**Docs:** impl.md §3.5, §14.8, §15.1, §15.3, §15.4, §16; api.md §3.3; design.md §6.3, §6.6, §7.2–§7.4.
-**Explicitly deferred:** anything that builds the cache, including the daily refresh (the Cache tickets).
-
----
-
 ### Cache: Daily Refresh Trigger (S)
 
 **Status:** Created
-**Depends on:** Cache: Startup Initial Build (for `_build_full()` and `build_new_version()`'s no-version fallback)
+**Depends on:** Cache: Consume Scores & Incremental Build (for `build_new_version()` and its no-version fallback)
 **Scope:** Let Admin rebuild the Morning Brief cache once a day so recency moves forward even with no new scores — `POST /v1/admin/morning-brief-refresh`, synchronous, with every cache build serialised by one lock (impl.md §14.9, §15.7; api.md §3.5; design.md §6.9).
 - `app/cache/cache_service.py`: `CacheService._build_lock` around `build_new_version()` and `build_initial_version()`; `build_new_version()`/`_build_full()`/`_write_new_version()` return the version written; an empty `event_ids` skips the DB reads (§14.1, §14.9).
 - `app/api/schemas.py`: `MorningBriefRefreshResponse` (§3.5).
@@ -938,6 +910,26 @@ This document does not introduce new design — every ticket below implements so
 - Integration pass against real Redis/Postgres: call the endpoint directly (Admin is not involved), check the new version, its recency, and the pointer.
 **Docs:** impl.md §3.5, §14.1, §14.9, §15.1, §15.7; api.md §3.5; design.md §6.9, §13.2.
 **Explicitly deferred:** Admin's `MORNING_BRIEF_REFRESH` job (`admin-tad.md` §3.6 — Admin's own implementation).
+
+---
+
+### Cache: Post-Release Tuning Validation (S)
+
+**Status:** Created
+**Depends on:** every Cache ticket above, including API: `GET /v1/morning-brief`; Deployment: SAPI Container, Compose & Production-like Run (below — the real-traffic run), run for an agreed length.
+**Scope:** Answer the Cache and Morning Brief tuning questions that need real volume, from production logs, Redis, and request metrics — no new instrumentation.
+- **`NOISE_FILTER_THRESHOLD`:** share of scored Events that make the cache, and whether low-impact noise gets through.
+- **`RECENCY_DECAY_LAMBDA`:** whether ranking favours fresh Events the way analysts expect, on a hand-checked sample of Morning Briefs.
+- **`TOP_K_DEFAULT`:** whether the default result size fits the client.
+- **Q-1 (Cache's share):** `CACHE_BATCH_TIMEOUT_MS`, from build frequency and duration.
+- **Cache growth (Q-17):** cache size and `GET /v1/morning-brief` latency over the run — checks the retention policy decided before go-live (design.md §14 Q-17), or, if none was adopted, how fast the cache grows and how often old Events appear in the backfill.
+**Acceptance criteria:**
+- Each tuning item has measured numbers and a decision: keep the default, or change it with the reason.
+- Changed defaults are applied in `app/config.py` and impl.md §4.1.
+- Q-17's growth, latency and old-Event-in-backfill numbers are recorded against whatever retention decision was made before go-live.
+- Q-1 is marked resolved in impl.md §18 and design.md §14 once every layer's share is answered.
+**Docs:** impl.md §4.1, §14, §15.3, §18; design.md §6, §14 (Q-1, Q-17).
+**PM note:** run length to be set; can share the production run with the other layers' validation tickets.
 
 ---
 
