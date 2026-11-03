@@ -523,7 +523,7 @@ class AggregationConfig:
     max_concurrent: int             # env: AGG_MAX_CONCURRENT (default 100) — live groups, see §12.1
     group_idle_timeout_s: int       # env: AGG_GROUP_IDLE_TIMEOUT_S (default 10)
     db_flush_interval_s: int        # env: AGG_DB_FLUSH_INTERVAL_S (default 300)
-    max_retry: int                  # env: AGG_MAX_RETRY
+    max_retry: int                  # env: AGG_MAX_RETRY (default 3)
     sliding_window_hours: int       # env: SLIDING_WINDOW_HOURS (default 4)
     event_max_timespan_hours: int   # env: EVENT_MAX_TIMESPAN_HOURS (default 24)
     consumer_name: str               # env: HOSTNAME, fallback "sapi-aggregation-1" — see §6.1's Reclaim pattern
@@ -1325,9 +1325,9 @@ class RedisStreamClient:
 
 **Constructor:** accepts an already-connected `redis.asyncio.Redis` instance and `REDIS_RECONNECT_INTERVAL_S` (`publish()`'s retry interval, below). Use `create_stream_client()` instead of calling this directly.
 
-#### Data Structures: `StreamMessage`, `ReclaimedMessage`
+#### Data Structures: `StreamMessage`, `ReclaimedMessage`, `DeadLetterReason`
 
-`read_from()`/`autoclaim()` return these for attribute access (`message.id`, `message.fields`). `fields` stays `dict[str, str]` because its keys depend on the stream's producer.
+`read_from()`/`autoclaim()` return these for attribute access (`message.id`, `message.fields`). `fields` stays `dict[str, str]` because its keys depend on the stream's producer. `DeadLetterReason` is `dead_letter()`'s `reason` (below).
 
 ```python
 @dataclass
@@ -1338,6 +1338,10 @@ class StreamMessage:
 @dataclass
 class ReclaimedMessage(StreamMessage):
     delivery_count: int   # deliveries so far, this claim included — system-design.md §12.1's "Retry Count via delivery_count"
+
+class DeadLetterReason(StrEnum):
+    RETRIES_EXHAUSTED = "retries_exhausted"
+    MALFORMED = "malformed"
 ```
 
 #### Function: `get_redis_stream_client() -> RedisStreamClient`
@@ -1406,6 +1410,24 @@ Returns : List of ReclaimedMessage. delivery_count is the pending entry's times_
 Raises  : redis.ConnectionError / redis.TimeoutError, untranslated (Reconnect behaviour, below).
 ```
 
+#### Method: `dead_letter(message, stream, group, dead_letter_stream, dead_letter_version, reason, log_event) -> None`
+
+```python
+async def dead_letter(self, message: StreamMessage, stream: str, group: str,
+                      dead_letter_stream: str, dead_letter_version: str,
+                      reason: DeadLetterReason, log_event: str) -> None:
+    delivery_count = message.delivery_count if isinstance(message, ReclaimedMessage) else 1
+    await self.publish(dead_letter_stream, {
+        "message_id": message.id, "fields": json.dumps(message.fields),
+        "delivery_count": str(delivery_count), "failed_at": datetime.now(UTC).isoformat(),
+        "v": dead_letter_version,
+    })
+    await self.ack(stream, group, message.id)
+    logger.warning(log_event, message_id=message.id, delivery_count=delivery_count, reason=reason)
+```
+
+The one dead-letter write every layer uses (Reclaim and Dead Letter pattern, below). A message from `read_from()` is a first delivery, so its `delivery_count` is `1`. `ack()` raises `redis.ConnectionError` / `redis.TimeoutError` untranslated, like the layer's other calls.
+
 #### Method: `create_group_if_not_exists(stream: str, group: str) -> None`
 
 ```
@@ -1454,17 +1476,14 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`
 - **Retry-exhaustion check, per reclaimed message, before anything else:**
   ```python
   if reclaimed.delivery_count >= config.max_retry:   # ENTITY_ANALYSIS_MAX_RETRY / AGG_MAX_RETRY / SCORING_MAX_RETRY / CACHE_MAX_RETRY
-      await redis_stream.publish(<Layer>DeadLetterStream.NAME, {
-          "message_id": reclaimed.id, "fields": json.dumps(reclaimed.fields),
-          "delivery_count": str(reclaimed.delivery_count), "failed_at": datetime.now(timezone.utc).isoformat(),
-          "v": <Layer>DeadLetterStream.VERSION,
-      })
-      await redis_stream.ack(stream, group, reclaimed.id)
-      logger.warning("<layer>_message_dead_lettered", message_id=reclaimed.id,
-                     delivery_count=reclaimed.delivery_count, reason="retries_exhausted")
+      await redis_stream.dead_letter(
+          reclaimed, <Layer stream>.NAME, <Layer stream>.CONSUMER_GROUP,
+          <Layer>DeadLetterStream.NAME, <Layer>DeadLetterStream.VERSION,
+          DeadLetterReason.RETRIES_EXHAUSTED, "<layer>_message_dead_lettered",
+      )
       continue   # never enters the layer's normal processing path
   ```
-  A message failing the shape check (above) is dead-lettered the same way, with `reason="malformed"`.
+  A message failing the shape check (above) is dead-lettered the same way, with `DeadLetterReason.MALFORMED`.
   This is system-design.md §12.1's "Retry Count via delivery_count" policy — `delivery_count` comes from `autoclaim()` natively, so no separate Redis state tracks attempt counts.
 - **Below the retry-exhaustion check, a reclaimed message that still has budget left is routed through *the exact same synchronous check-then-insert entry point* as a freshly `read_from()`'d message** — never a second, separately-written processing path. This is not a style preference: the in-memory Set each layer uses to detect an already-in-flight duplicate (§11.2's `processing_cleaned_ids`, §12.2's `_enqueued`, §13.2's `_in_process`) is only a correctness guarantee if there is exactly one code path where a message can be marked "in progress," with no `await` between checking and marking it. A reclaimed message calling into a *different* function — even one that "does the same thing" — reopens exactly the race the guard exists to close. See each layer's own section for its specific entry-point method and why a duplicate delivery is safe.
 
@@ -3630,7 +3649,7 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           group=RawNewsCleanedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=ENTITY_ANALYSIS_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= ENTITY_ANALYSIS_MAX_RETRY,
-          publish to EntityAnalysisDeadLetterStream.NAME, ACK and log WARNING
+          dead_letter() to EntityAnalysisDeadLetterStream, logged as
           entity_analysis_message_dead_lettered (never reaches _process_one()).
           Otherwise, run the shape check (§6.1), then extract cleaned_id from fields and
           call _process_one(cleaned_id, message_id) — the claimed messages gathered as one
@@ -3896,6 +3915,7 @@ class AggregationConsumer:
         self._redis_stream = get_redis_stream_client()    # §6.1 — consumes, reclaims, ACKs
         self._config = config
         self._reconnect_interval_s = redis_config.reconnect_interval_s   # §6.1's reconnect behaviour
+        self._claim_timeout_ms = redis_config.stream_claim_timeout_ms     # _reclaim_loop()'s sweep interval and min idle
         self._final_flush_timeout_s = db_config.close_timeout_s           # bounds the final flush, below
         self._enqueued: set[UUID] = set()
 
@@ -3924,11 +3944,11 @@ class AggregationConsumer:
 
 #### `_consumer_loop()` (see Flowchart, below)
 
-Reads batches from `stream:entity_event_completed` (`read_from()`) and calls `_route_one()` for each message, plus the queue-empty/interval flush triggers — nodes `A`–`D` and `FLUSH` of the Flowchart below are this loop's entire body. Each trigger calls `_flush()`, which runs `self._service.flush()` and catches a failure without re-raising: a `SAPIError` is logged as `logger.log(exc.log_level, exc.dev_message, exc_info=exc)`, anything else as ERROR `"Unhandled exception"` — the next trigger retries from the same Redis state (§12.6), and the layer Task never crashes over a DB/Redis outage. `except Exception`, not bare `except:`, for the same `CancelledError` reason as `_reclaim_loop()` below. The interval trigger's clock restarts on every flush attempt, failed or not; a read that fails on the stream Redis triggers no flush.
+Reads batches from `stream:entity_event_completed` (`read_from()`) and passes each message, one at a time, to `_route()`, plus the queue-empty/interval flush triggers — nodes `A`–`D`, `DL`/`DLW` and `FLUSH` of the Flowchart below are this loop's entire body. Each trigger calls `_flush()`, which runs `self._service.flush()` and catches a failure without re-raising: a `SAPIError` is logged as `logger.log(exc.log_level, exc.dev_message, exc_info=exc)`, anything else as ERROR `"Unhandled exception"` — the next trigger retries from the same Redis state (§12.6), and the layer Task never crashes over a DB/Redis outage. `except Exception`, not bare `except:`, for the same `CancelledError` reason as `_reclaim_loop()` below. The interval trigger's clock restarts on every flush attempt, failed or not; a read that fails on the stream Redis triggers no flush.
 
 #### Flowchart (system-design.md §4.2 + §4.5, with the Coroutine Manager and flush triggers made explicit) — `AggregationConsumer._route_one()`
 
-`_consumer_loop()` (above) and `_reclaim_loop()` (below) call `_route_one(entity_event_id, message_id)` — the diagram below is that shared method's body (steps `RTE` onward); the two loops differ only in how they obtain `(entity_event_id, message_id)` pairs to feed it. Node `D` is the call into `AggregationService.process_entity_event()`, described above — its own internal steps (fetch, route, enqueue) aren't redrawn here.
+`_consumer_loop()` (above) and `_reclaim_loop()` (below) pass every message to `_route(message)`, which applies §6.1's per-message isolation, retry-exhaustion check and shape check (node `DL` below; outcome in §12.6) and otherwise calls `_route_one(entity_event_id, message_id)`. The rest of the diagram is `_route_one()`'s body (steps `RTE` onward); the two loops differ only in how they obtain messages. Node `D` is the call into `AggregationService.process_entity_event()`, described above — its own internal steps (fetch, route, enqueue) aren't redrawn here.
 
 ```mermaid
 flowchart TD
@@ -3936,7 +3956,10 @@ flowchart TD
     B --> C[read_from COUNT=AGG_BATCH_SIZE BLOCK=AGG_BATCH_TIMEOUT_MS\nconsumer=config.consumer_name]
     C -->|Empty - queue-empty trigger| FLUSH[service.flush]
     C -->|AGG_DB_FLUSH_INTERVAL_S elapsed\nsince last flush, checked each iteration| FLUSH
-    C -->|Messages| RTE{entity_event_id in\n_enqueued Set?}
+    C -->|Messages| DL{_route: out of retries\nor malformed?}
+    DL -->|Yes| DLW[dead_letter to AggregationDeadLetterStream]
+    DLW --> C
+    DL -->|No| RTE{entity_event_id in\n_enqueued Set?}
     RTE -->|Yes| SKIP[Skip - already in flight\nleave unACKed for this delivery]
     RTE -->|No| ADD[Add to _enqueued Set — no await\nbetween this check and this insert]
     ADD --> D[service.process_entity_event entity_event_id, on_success\nAggregationService — see above]
@@ -3996,11 +4019,14 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           try: autoclaim(stream=EntityEventCompletedStream.NAME,
           group=EntityEventCompletedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=AGG_BATCH_SIZE).
-          For each reclaimed message: if delivery_count >= AGG_MAX_RETRY,
-          publish to AggregationDeadLetterStream.NAME and ACK (never reaches
-          _route_one()). Otherwise, extract entity_event_id from fields and
+          For each reclaimed message, one at a time: if delivery_count >= AGG_MAX_RETRY,
+          dead_letter() to AggregationDeadLetterStream, logged as
+          aggregation_message_dead_lettered (never reaches _route_one()). Otherwise,
+          run the shape check (§6.1), then extract entity_event_id from fields and
           call _route_one(entity_event_id, message_id) — identical call as
           _consumer_loop() uses.
+          except redis.ConnectionError / redis.TimeoutError: log warning
+          aggregation_redis_stream_unreachable (§6.1's Reconnect behaviour).
           except Exception: log warning aggregation_reclaim_sweep_failed
           with exc_info, do not re-raise — retried next tick.
 ```
@@ -4263,6 +4289,7 @@ def create_event_aggregation_store() -> EventAggregationStore:
 | `RedisStateClient` unreachable, or any other failure inside the unit of work (duplicate-check read, replaced-Event persist, merge, upsert, ACK) | Caught by `_merge()`'s own `try`/`except` (§12.1): log with `entity_event_id`/`group_key` at the error's own level (a `SAPIError`'s `log_level`; ERROR for anything else, including untranslated Redis errors), call `on_failure()` (discard from `_enqueued`, no ACK), don't re-raise — the group keeps running and the reclaim loop retries |
 | DB Flush failure | `EventRepository.persist_events()` (§10.2) rolls back and re-raises after `_db_write_with_retry()`'s retries are exhausted (§5.2); `AggregationService.flush()` propagates; `_consumer_loop()` (§12.2) logs it at the error's own level and continues — the next trigger retries the same still-active Redis state, nothing is lost |
 | `GroupCoroutine` failure | Only reachable by a bug in `_merge()`'s own failure handling (§12.3's backstop): `_run()` logs CRITICAL `aggregation_group_work_failed` and continues with the group's next item — the group, the consumer loop, and the layer Task all keep running. Each group runs in its own never-awaited Task, so this never reaches Coroutine Monitoring (§16) or `layers.aggregation`. Only the failing item is lost: its `_enqueued` entry stays set, so redeliveries are skipped until it's dead-lettered at `AGG_MAX_RETRY` — acceptable for a genuine bug, which redelivery couldn't fix anyway |
+| Malformed message (`v` missing or unrecognised, `entity_event_id` missing or not a UUID), or `delivery_count >= AGG_MAX_RETRY` | Dead-lettered to `stream:aggregation_dead_letter`, ACKed and logged WARNING `aggregation_message_dead_lettered` with `reason` `malformed` / `retries_exhausted`; never reaches `_route_one()` (§6.1) |
 | `RedisStreamClient` unreachable | Per §6.1's reconnect behaviour |
 
 ---
@@ -4536,7 +4563,7 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           group=EventAggregatedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=SCORING_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= SCORING_MAX_RETRY,
-          publish to ScoringDeadLetterStream.NAME and ACK (never reaches
+          dead_letter() to ScoringDeadLetterStream (never reaches
           _process_one()). Otherwise, extract event_id from fields and call
           _process_one(event_id, message_id) — identical call as
           _consumer_loop() uses.
@@ -5002,7 +5029,7 @@ flowchart TD
     RC -->|Yes| AC[autoclaim consumer=config.consumer_name\nmin_idle_ms=STREAM_CLAIM_TIMEOUT_MS\ncount=_RECLAIM_COUNT]
     RC -->|No| RG
     AC --> DL{Any reclaimed message with\ndelivery_count >= CACHE_MAX_RETRY?}
-    DL -->|Yes| DLW[publish to CacheDeadLetterStream.NAME\nACK those; drop from this batch]
+    DL -->|Yes| DLW[dead_letter to CacheDeadLetterStream\ndrop those from this batch]
     DL -->|No| RG[read_from COUNT=None - everything pending\nBLOCK=CACHE_BATCH_TIMEOUT_MS\nconsumer=config.consumer_name\nthen coalesce: keep reading until\nCACHE_BATCH_TIMEOUT_MS since the first message]
     DLW --> RG
     RG -->|Empty and no reclaimed messages| A
