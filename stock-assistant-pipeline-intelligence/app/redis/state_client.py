@@ -22,6 +22,11 @@ class RedisStateClient:
         fields: dict[str, str] = await response
         return fields or None
 
+    async def scan(self, pattern: str) -> list[str]:
+        """Return every key matching the glob-style pattern, each once."""
+        # SCAN may return a key more than once.
+        return list(dict.fromkeys([key async for key in self._client.scan_iter(match=pattern)]))
+
     async def multi_exec(self, build: Callable[[redis.asyncio.client.Pipeline], None]) -> None:
         """Apply the commands build queues on the pipeline as one transaction."""
         async with self._client.pipeline(transaction=True) as pipe:

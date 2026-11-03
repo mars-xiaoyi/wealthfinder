@@ -85,6 +85,42 @@ async def upsert_active_event_success(state_client):
     ]
 
 
+async def scan_all_success(state_client):
+    """Every group's active Event is returned, skipping a key that expired after the scan."""
+    other_key = "agg:event:HKEX:00005:MA"
+    state_client.scan.return_value = [KEY, "agg:event:HKEX:00388:DIVIDEND", other_key]
+    other_fields = {**FIELDS, "event_id": "00000000-0000-0000-0000-0000000000e2"}
+    state_client.hgetall.side_effect = [FIELDS, None, other_fields]
+
+    result = await EventAggregationStore().scan_all()
+
+    other_event = Event(
+        event_id=UUID("00000000-0000-0000-0000-0000000000e2"),
+        exchange="HKEX",
+        stock_code="00005",
+        event_type_primary=EventTypeEnum.MA,
+        first_seen_at=FIRST_SEEN_AT,
+        last_seen_at=LAST_SEEN_AT,
+        aggregation_updated_at=UPDATED_AT,
+        entity_event_ids=ENTITY_EVENT_IDS,
+    )
+    assert result == [ACTIVE_EVENT, other_event]
+    assert result[1].event_type_primary is EventTypeEnum.MA
+    state_client.scan.assert_awaited_once_with("agg:event:*")
+    assert state_client.hgetall.await_args_list == [
+        mock.call(KEY),
+        mock.call("agg:event:HKEX:00388:DIVIDEND"),
+        mock.call(other_key),
+    ]
+
+
+async def scan_all_none(state_client):
+    state_client.scan.return_value = []
+
+    assert await EventAggregationStore().scan_all() == []
+    state_client.hgetall.assert_not_awaited()
+
+
 def get_event_aggregation_store_not_initialized():
     with pytest.raises(ServiceUnavailableError):
         store_module.get_event_aggregation_store()

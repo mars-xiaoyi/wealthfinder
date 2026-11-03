@@ -17,6 +17,13 @@ class EntityEventCompletedStream:
     CONSUMER_GROUP: Final = "sapi-aggregation"
 
 
+class EventAggregatedStream:
+    """The stream of persisted Events whose merge state changed."""
+
+    NAME: Final = "stream:event_aggregated"
+    VERSION: Final = "1"
+
+
 class EntityAnalysisDeadLetterStream:
     """The stream of messages the Entity Analysis layer could not process."""
 

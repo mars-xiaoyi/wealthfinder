@@ -1,11 +1,12 @@
 import asyncio
+import time
 from uuid import UUID
 
 import redis.exceptions
 
 from app.aggregation.aggregation_service import get_aggregation_service
 from app.common.errors import SAPIError
-from app.config import AggregationConfig, RedisConfig
+from app.config import AggregationConfig, DatabaseConfig, RedisConfig
 from app.logger import get_logger
 from app.redis.stream_client import StreamMessage, get_redis_stream_client
 from app.redis.stream_enum import EntityEventCompletedStream
@@ -19,22 +20,30 @@ class AggregationConsumer:
     """Consumes stream:entity_event_completed and merges each EntityEvent into its group's
     active Event."""
 
-    def __init__(self, config: AggregationConfig, redis_config: RedisConfig) -> None:
+    def __init__(
+        self, config: AggregationConfig, redis_config: RedisConfig, db_config: DatabaseConfig
+    ) -> None:
         self._service = get_aggregation_service()
         self._redis_stream = get_redis_stream_client()
         self._config = config
         self._reconnect_interval_s = redis_config.reconnect_interval_s
+        self._final_flush_timeout_s = db_config.close_timeout_s
         self._enqueued: set[UUID] = set()
 
     async def start(self) -> None:
-        """Consume stream:entity_event_completed until cancelled."""
+        """Consume stream:entity_event_completed until cancelled, persisting the active Events
+        once more when it stops."""
         await self._redis_stream.create_group_if_not_exists(
             EntityEventCompletedStream.NAME, EntityEventCompletedStream.CONSUMER_GROUP
         )
-        await self._consumer_loop()
+        try:
+            await self._consumer_loop()
+        finally:
+            await self._flush_final()
 
     async def _consumer_loop(self) -> None:
-        """Route every message of the stream until cancelled."""
+        """Route every message of the stream and flush the active Events, until cancelled."""
+        last_flush = time.monotonic()
         while True:
             try:
                 messages = await self._redis_stream.read_from(
@@ -55,6 +64,33 @@ class AggregationConsumer:
                     exc_info=True,
                 )
                 await asyncio.sleep(self._reconnect_interval_s)
+                continue
+            # The interval bounds how long a flush waits under steady input.
+            if not messages or time.monotonic() - last_flush >= self._config.db_flush_interval_s:
+                last_flush = time.monotonic()
+                await self._flush()
+
+    async def _flush_final(self) -> None:
+        """Flush the active Events one last time."""
+        # Bounded, since announcing retries for as long as the stream Redis is unreachable. An
+        # Event left unannounced is announced by the first flush after the next start.
+        try:
+            async with asyncio.timeout(self._final_flush_timeout_s):
+                await self._flush()
+        except TimeoutError:
+            logger.warning(
+                "aggregation_final_flush_timed_out", timeout_s=self._final_flush_timeout_s
+            )
+
+    async def _flush(self) -> None:
+        """Flush the active Events."""
+        # The next flush retries from the same active Events.
+        try:
+            await self._service.flush()
+        except SAPIError as exc:
+            logger.log(exc.log_level, exc.dev_message, exc_info=exc)
+        except Exception as exc:
+            logger.error(f"Unhandled exception: {exc!r}", exc_info=exc)
 
     async def _route(self, message: StreamMessage) -> None:
         """Route the message's EntityEvent, skipping a message without a valid

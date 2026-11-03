@@ -20,6 +20,7 @@ from app.layer_tasks import Layer, register_layer_tasks
 from app.llm.vertex_adapter import create_llm_adapter
 from app.logger import configure_logging, get_logger
 from app.persistent.entity_event_repository import create_entity_event_repository
+from app.persistent.event_repository import create_event_repository
 from app.redis.state_client import create_state_client
 from app.redis.stream_client import create_stream_client
 
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resources.push_async_callback(llm_adapter.close)
         create_news_client(http_client, config.entity_analysis.sadi_api_url)
         create_entity_event_repository()
+        create_event_repository()
         create_event_aggregation_store()
 
         # Eager, blocking HK Stock List load. Unlike the infra above, a failure must not abort
@@ -71,7 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Its groups run outside the layer's Task, so they are stopped on their own, once the
         # layers have stopped and before the clients they use close.
         resources.push_async_callback(aggregation_service.close)
-        aggregation_consumer = AggregationConsumer(config.aggregation, config.redis)
+        aggregation_consumer = AggregationConsumer(config.aggregation, config.redis, config.db)
 
         layer_tasks: dict[Layer, asyncio.Task[None]] = {}
         shutting_down = False
