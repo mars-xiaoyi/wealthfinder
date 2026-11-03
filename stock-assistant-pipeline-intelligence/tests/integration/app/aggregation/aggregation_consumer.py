@@ -13,6 +13,9 @@ import redis.exceptions
 import structlog.testing
 
 from app import layer_tasks
+from app.models.entity_event import EventTypeEnum
+from app.models.event import Event
+from app.persistent import event_repository as event_repository_module
 from tests.integration.conftest import REFUSED_URL, Infra
 
 pytestmark = [pytest.mark.live, pytest.mark.timeout(120)]
@@ -33,7 +36,7 @@ _INSERT_SQL = """
         event_type_primary, sentiment_label, sentiment_score, headline, entity_summary,
         additional_outcome, metadata, created_at, updated_at
     )
-    VALUES ($1, 'HKEX', $2, 'MINGPAO', $3, $4, 'EARNINGS', 'POSITIVE', 0.8, '業績超預期',
+    VALUES ($1, 'HKEX', $2, $8, $3, $4, 'EARNINGS', 'POSITIVE', 0.8, '業績超預期',
             '季度收入按年增長。', $5, $6, $7, $7)
 """
 _COMPANY_NAMES = {"00700": ("騰訊控股", "TENCENT"), "00005": ("匯豐控股", "HSBC HOLDINGS")}
@@ -49,8 +52,16 @@ class AggregationProbe:
         self._stream = stream
         self._state = state
 
-    async def seed(self, stock_code: str, published_at: datetime) -> uuid.UUID:
-        """Store an entity_events row for an EARNINGS event of stock_code; returns its id."""
+    async def seed(
+        self,
+        stock_code: str,
+        published_at: datetime | None,
+        source_name: str = "MINGPAO",
+        event_type_secondary: str | None = None,
+        created_at: datetime | None = None,
+    ) -> uuid.UUID:
+        """Store an entity_events row for an EARNINGS event of stock_code; returns its id. Its
+        source_url is _url(id)."""
         entity_event_id = uuid.uuid4()
         zh, en = _COMPANY_NAMES[stock_code]
         additional_outcome = {
@@ -58,7 +69,7 @@ class AggregationProbe:
             "output": {
                 "company_name_zh": zh,
                 "company_name_en": en,
-                "event_type_secondary": None,
+                "event_type_secondary": event_type_secondary,
                 "headline": "業績超預期",
                 "entity_summary": "季度收入按年增長。",
             },
@@ -68,12 +79,13 @@ class AggregationProbe:
             await conn.execute(
                 _INSERT_SQL,
                 entity_event_id,
-                f"https://example.com/{entity_event_id}",
+                _url(entity_event_id),
                 published_at,
                 stock_code,
                 json.dumps(additional_outcome, ensure_ascii=False),
                 json.dumps({"cleaned_id": str(uuid.uuid4())}),
-                datetime.now(UTC),
+                created_at or datetime.now(UTC),
+                source_name,
             )
         finally:
             await conn.close()
@@ -82,7 +94,7 @@ class AggregationProbe:
     async def truncate(self) -> None:
         conn = await asyncpg.connect(self._database_url)
         try:
-            await conn.execute("TRUNCATE entity_events")
+            await conn.execute("TRUNCATE event_entity_map, events, entity_events")
         finally:
             await conn.close()
 
@@ -119,10 +131,58 @@ class AggregationProbe:
         ttl_s: int = await self._state.ttl(_key(stock_code))
         return ttl_s
 
+    async def execute(self, query: str, *args: object) -> None:
+        conn = await asyncpg.connect(self._database_url)
+        try:
+            await conn.execute(query, *args)
+        finally:
+            await conn.close()
+
+    async def events(self) -> dict[str, dict[str, object]]:
+        """Every events row by event_id, JSONB columns decoded."""
+        conn = await asyncpg.connect(self._database_url)
+        try:
+            rows = await conn.fetch("SELECT * FROM events")
+        finally:
+            await conn.close()
+        decoded = {}
+        for row in rows:
+            fields = dict(row)
+            for column in ("event_type_secondary", "source_list", "brief_summary"):
+                if fields[column] is not None:
+                    fields[column] = json.loads(fields[column])
+            decoded[str(row["event_id"])] = fields
+        return decoded
+
+    async def memberships(self) -> dict[str, list[str]]:
+        """{event_id: its entity_event_ids, sorted} from event_entity_map."""
+        conn = await asyncpg.connect(self._database_url)
+        try:
+            rows = await conn.fetch("SELECT event_id, entity_event_id FROM event_entity_map")
+        finally:
+            await conn.close()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(str(row["event_id"]), []).append(str(row["entity_event_id"]))
+        return {event_id: sorted(ids) for event_id, ids in result.items()}
+
+    async def announced(self) -> list[dict[str, str]]:
+        """The fields of every stream:event_aggregated message, oldest first."""
+        entries = await self._stream.xrange("stream:event_aggregated")
+        return [fields for _id, fields in entries]
+
+    async def set_active_event(self, stock_code: str, fields: dict[str, str]) -> None:
+        await self._state.hset(_key(stock_code), mapping=fields)
+        await self._state.expire(_key(stock_code), 3600)
+
     async def reconnect(self) -> None:
         """Drop the probe's Redis connections, e.g. after a Redis restart."""
         await self._stream.connection_pool.disconnect()
         await self._state.connection_pool.disconnect()
+
+
+def _url(entity_event_id: uuid.UUID) -> str:
+    return f"https://example.com/{entity_event_id}"
 
 
 def _key(stock_code: str) -> str:
@@ -347,3 +407,288 @@ async def shutdown_stops_layer_and_groups(start_aggregation, probe):
         if log["log_level"] in ("error", "critical")
         and log["event"] != "hk_stock_list_startup_load_failed"
     ]
+
+
+async def _wait_announced(probe: AggregationProbe, count: int, timeout_s: float = 10) -> None:
+    """Wait until stream:event_aggregated holds count messages."""
+
+    async def announced() -> bool:
+        return len(await probe.announced()) == count
+
+    await _wait_for(announced, timeout_s)
+
+
+def _sources(row: dict[str, object]) -> list[tuple[str, str, datetime]]:
+    source_list = row["source_list"]
+    assert isinstance(source_list, list)
+    return [
+        (source["source_name"], source["url"], datetime.fromisoformat(source["published_at"]))
+        for source in source_list
+    ]
+
+
+async def start_flush_persists_and_announces(start_aggregation, probe):
+    """The drained stream's flush persists the active Event with its memberships, secondary
+    types and one source entry per source from its freshest report, and announces it once. A
+    row without a publication time is dated by when it was stored."""
+    base = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=2)
+    e1 = await probe.seed("00700", base, "HKEX", "DIVIDEND")
+    e2 = await probe.seed("00700", base + timedelta(minutes=10), "HKEX", "DIVIDEND")
+    e3 = await probe.seed("00700", base + timedelta(minutes=20), "MINGPAO", "BUYBACK")
+    e4 = await probe.seed("00700", base + timedelta(minutes=30), "AASTOCKS", "MA")
+    e5 = await probe.seed("00700", None, "MINGPAO", None, created_at=base + timedelta(minutes=40))
+    for entity_event_id in (e1, e2, e3, e4, e5):
+        await probe.add(entity_event_id)
+
+    async with start_aggregation():
+        await _wait_announced(probe, 1)
+        await asyncio.sleep(SETTLE_S * 2)
+        fields = await probe.active_event("00700")
+        events = await probe.events()
+        memberships = await probe.memberships()
+        announced = await probe.announced()
+
+    event_id = fields["event_id"]
+    assert list(events) == [event_id]
+    row = events[event_id]
+    assert (row["exchange"], row["stock_code"], row["event_type_primary"]) == (
+        "HKEX",
+        "00700",
+        "EARNINGS",
+    )
+    assert row["first_seen_at"] == base
+    assert row["last_seen_at"] == base + timedelta(minutes=40)
+    assert row["aggregation_updated_at"] == datetime.fromisoformat(fields["aggregation_updated_at"])
+    assert row["published_aggregation_updated_at"] == row["aggregation_updated_at"]
+    # DIVIDEND is reported twice; BUYBACK and MA once each, and MA more recently.
+    assert row["event_type_secondary"] == ["DIVIDEND", "MA"]
+    assert _sources(row) == [
+        ("AASTOCKS", _url(e4), base + timedelta(minutes=30)),
+        ("HKEX", _url(e2), base + timedelta(minutes=10)),
+        ("MINGPAO", _url(e5), base + timedelta(minutes=40)),
+    ]
+    assert row["brief_summary"] is None
+    assert isinstance(row["created_at"], datetime)
+    assert isinstance(row["updated_at"], datetime)
+    assert memberships == {event_id: sorted(str(i) for i in (e1, e2, e3, e4, e5))}
+    assert announced == [{"event_id": event_id, "v": "1"}]
+
+
+async def start_flush_only_changed(start_aggregation, probe):
+    """Later flushes leave unchanged Events as stored and unannounced. A merge into one Event
+    rewrites only that Event, keeping its created_at, and announces it again."""
+    tencent = await probe.seed("00700", P)
+    hsbc = await probe.seed("00005", P)
+    await probe.add(tencent)
+    await probe.add(hsbc)
+
+    async with start_aggregation():
+        await _wait_announced(probe, 2)
+        before = await probe.events()
+        await asyncio.sleep(SETTLE_S * 2)
+        settled = await probe.events()
+        settled_announced = await probe.announced()
+        tencent_id = (await probe.active_event("00700"))["event_id"]
+        hsbc_id = (await probe.active_event("00005"))["event_id"]
+
+        merged = await probe.seed("00700", P + timedelta(hours=1))
+        await probe.add(merged)
+        await _wait_announced(probe, 3)
+        await asyncio.sleep(SETTLE_S * 2)
+        after = await probe.events()
+        memberships = await probe.memberships()
+        announced = await probe.announced()
+
+    assert settled == before
+    assert len(settled_announced) == 2
+    tencent_before, tencent_after = before[tencent_id], after[tencent_id]
+    assert tencent_after["aggregation_updated_at"] > tencent_before["aggregation_updated_at"]
+    assert tencent_after["updated_at"] > tencent_before["updated_at"]
+    assert tencent_after["created_at"] == tencent_before["created_at"]
+    assert tencent_after["last_seen_at"] == P + timedelta(hours=1)
+    assert (
+        tencent_after["published_aggregation_updated_at"]
+        == (tencent_after["aggregation_updated_at"])
+    )
+    assert after[hsbc_id] == before[hsbc_id]
+    assert memberships == {
+        tencent_id: sorted([str(tencent), str(merged)]),
+        hsbc_id: [str(hsbc)],
+    }
+    assert announced[2] == {"event_id": tencent_id, "v": "1"}
+    assert [message["event_id"] for message in announced].count(hsbc_id) == 1
+
+
+async def start_replaced_event_persisted_first(start_aggregation, probe):
+    """A replaced Event is persisted and announced before the new Event takes its place,
+    without waiting for a flush; stopping the layer then flushes the new one."""
+    first = await probe.seed("00700", P)
+    # Outside the 4 h sliding window.
+    second = await probe.seed("00700", P + timedelta(hours=5))
+    await probe.add(first)
+    await probe.add(second)
+
+    # Long enough that no drained-stream or interval flush runs during the test.
+    async with start_aggregation(AGG_BATCH_TIMEOUT_MS="5000", AGG_DB_FLUSH_INTERVAL_S="60"):
+        await _wait_announced(probe, 1, timeout_s=3)
+        await _wait_merged(probe, "00700", [second])
+        events = await probe.events()
+        memberships = await probe.memberships()
+        fields = await probe.active_event("00700")
+
+    replaced_id = next(iter(events))
+    assert list(events) == [replaced_id]
+    assert events[replaced_id]["first_seen_at"] == events[replaced_id]["last_seen_at"] == P
+    assert (
+        events[replaced_id]["published_aggregation_updated_at"]
+        == (events[replaced_id]["aggregation_updated_at"])
+    )
+    assert memberships == {replaced_id: [str(first)]}
+    assert fields["event_id"] != replaced_id
+    assert _ids(fields) == [str(second)]
+    after_stop = await probe.events()
+    assert set(after_stop) == {replaced_id, fields["event_id"]}
+    assert await probe.memberships() == {
+        replaced_id: [str(first)],
+        fields["event_id"]: [str(second)],
+    }
+    assert await probe.announced() == [
+        {"event_id": replaced_id, "v": "1"},
+        {"event_id": fields["event_id"], "v": "1"},
+    ]
+
+
+_INSERT_EVENT_SQL = """
+    INSERT INTO events (
+        event_id, exchange, stock_code, event_type_primary, event_type_secondary, source_list,
+        first_seen_at, last_seen_at, aggregation_updated_at, updated_at, created_at
+    )
+    VALUES ($1, 'HKEX', $2, 'EARNINGS', '[]', '[]', $3, $3, $4, $5, $5)
+"""
+
+
+async def start_unannounced_version_announced_after_restart(start_aggregation, probe):
+    """A version committed but never announced, as a crash between the two leaves it, is
+    announced by the first flush after startup, without rewriting it. Only the active Events'
+    versions are looked at, and a later restart announces nothing again."""
+    entity_event_id = await probe.seed("00700", P)
+    event_id, unrelated_id = uuid.uuid4(), uuid.uuid4()
+    aggregation_updated_at = datetime(2026, 9, 8, 1, 0, 5, tzinfo=UTC)
+    written_at = datetime(2026, 9, 8, 1, 0, 6, tzinfo=UTC)
+    await probe.execute(_INSERT_EVENT_SQL, event_id, "00700", P, aggregation_updated_at, written_at)
+    await probe.execute(
+        "INSERT INTO event_entity_map (event_id, entity_event_id, created_at) VALUES ($1, $2, $3)",
+        event_id,
+        entity_event_id,
+        written_at,
+    )
+    # No longer active, so no flush looks at it.
+    await probe.execute(
+        _INSERT_EVENT_SQL, unrelated_id, "00005", P, aggregation_updated_at, written_at
+    )
+    await probe.set_active_event(
+        "00700",
+        {
+            "event_id": str(event_id),
+            "first_seen_at": P.isoformat(),
+            "last_seen_at": P.isoformat(),
+            "aggregation_updated_at": aggregation_updated_at.isoformat(),
+            "entity_event_ids": json.dumps([str(entity_event_id)]),
+        },
+    )
+
+    async with start_aggregation():
+        await _wait_announced(probe, 1)
+        await asyncio.sleep(SETTLE_S * 2)
+        events = await probe.events()
+    async with start_aggregation():
+        await _wait_for(probe.group_created, 5)
+        await asyncio.sleep(SETTLE_S * 2)
+        restarted_events = await probe.events()
+
+    assert await probe.announced() == [{"event_id": str(event_id), "v": "1"}]
+    assert events[str(event_id)]["published_aggregation_updated_at"] == aggregation_updated_at
+    assert events[str(event_id)]["updated_at"] == written_at
+    assert events[str(unrelated_id)]["published_aggregation_updated_at"] is None
+    assert restarted_events == events
+
+
+async def start_flush_failed_retried(start_aggregation, probe, infra):
+    """A flush that fails with Postgres down writes and announces nothing, and the layer keeps
+    running; once Postgres is back, a later flush persists the same active Event whole."""
+    first = await probe.seed("00700", P)
+    second = await probe.seed("00700", P + timedelta(hours=1))
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_aggregation(AGG_BATCH_TIMEOUT_MS="5000", AGG_DB_FLUSH_INTERVAL_S="60"):
+            await _wait_for(probe.group_created, 5)
+            layer_task = layer_tasks.get_layer_tasks()["aggregation"]
+            await probe.add(first)
+            await probe.add(second)
+            await _wait_merged(probe, "00700", [first, second])
+            fields = await probe.active_event("00700")
+            infra.postgres.stop()
+
+            async def flush_failed() -> bool:
+                return any(log["log_level"] == "error" and "exc_info" in log for log in logs)
+
+            await _wait_for(flush_failed, 15)
+            assert not layer_task.done()
+            assert await probe.announced() == []
+
+            infra.postgres.restore()
+            await _wait_announced(probe, 1, timeout_s=30)
+            events = await probe.events()
+            memberships = await probe.memberships()
+            fields_after = await probe.active_event("00700")
+
+    assert list(events) == [fields["event_id"]]
+    assert memberships == {fields["event_id"]: sorted([str(first), str(second)])}
+    assert await probe.announced() == [{"event_id": fields["event_id"], "v": "1"}]
+    assert fields_after == fields
+    assert layer_tasks.get_layer_tasks()["aggregation"] is layer_task
+
+
+async def persist_events_only_newer_state(start_aggregation, probe):
+    """Against the stored row, an older snapshot of an Event writes nothing, an older
+    published mark never un-marks a newer one, and a version newer than the mark reads as
+    unannounced."""
+    entity_event_id = await probe.seed("00700", P)
+    await probe.add(entity_event_id)
+
+    async with start_aggregation():
+        await _wait_announced(probe, 1)
+        fields = await probe.active_event("00700")
+        event_id = uuid.UUID(fields["event_id"])
+        stored_at = datetime.fromisoformat(fields["aggregation_updated_at"])
+        before = (await probe.events())[str(event_id)]
+        repository = event_repository_module.get_event_repository()
+
+        older = Event(
+            event_id=event_id,
+            exchange="HKEX",
+            stock_code="00700",
+            event_type_primary=EventTypeEnum.EARNINGS,
+            first_seen_at=P,
+            last_seen_at=P + timedelta(hours=1),
+            aggregation_updated_at=stored_at - timedelta(seconds=1),
+            entity_event_ids=[entity_event_id],
+        )
+        written = await repository.persist_events([older])
+        after_older = (await probe.events())[str(event_id)]
+        await repository.mark_published(event_id, stored_at - timedelta(seconds=5))
+        after_older_mark = (await probe.events())[str(event_id)]
+        unannounced_before = await repository.fetch_unpublished_events([event_id])
+        await probe.execute(
+            "UPDATE events SET aggregation_updated_at = $2 WHERE event_id = $1",
+            event_id,
+            stored_at + timedelta(seconds=1),
+        )
+        unannounced_after = await repository.fetch_unpublished_events([event_id])
+
+    assert written == []
+    assert after_older == before
+    assert after_older_mark["published_aggregation_updated_at"] == stored_at
+    assert unannounced_before == []
+    assert [event.event_id for event in unannounced_after] == [event_id]
+    assert unannounced_after[0].aggregation_updated_at == stored_at + timedelta(seconds=1)
