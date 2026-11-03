@@ -501,37 +501,84 @@ This document does not introduce new design — every ticket below implements so
 
 ---
 
-### Scoring: Rule Score & Sentiment Aggregation (S)
+### Scoring: Consume Aggregated Events (S)
 
-**Status:** Created
-**Depends on:** Aggregation: Sliding-Window Merge Algorithm (for `Event`, `EntitySource`); Entity Analysis: LLM Entity Extraction (for `EntityEvent`/`AnalysisOutcome`, `VersionedMetadata`)
-**Scope:** The pure rule-based half of an Event's score (impl.md §13.3; design rationale: design.md §5.6, §5.8).
-- `app/config.py`: `EventTypeScore`, `ScoringConfig.event_type_score` (one `EVENT_TYPE_WEIGHT_*` env var per event type, assembled by `load_config()`, §4.1).
-- `app/models/event_score.py`: `RuleScore` with its `base_rule_score` property only — not `LLMScore`/`EventScore`.
-- `app/scoring/rule_score.py`: `RULE_SCORE_VERSION`, `compute_rule_score()` (taking a precomputed `SentimentAggregation`), `compute_sentiment_aggregation()`, `SentimentAggregation`.
-**Acceptance criteria** (per impl.md §13.3):
-- Each of the eight event types maps to its configured score.
-- `source_authority_score` is the MAX weight over the Event's sources; a source missing from `source_weights` counts as 0.0.
-- `sentiment_strength_score` is the source-weighted mean `sentiment_score` scaled ×10 into `[0,10]`; `weighted_signed_score` uses +1/0/−1 by label; zero total weight gives `(0.0, 0.0)`.
-- `source_heat_score` = `min(10, source_count / total_active_sources × 10)`.
-- `base_rule_score` is the unnormalised 0.30/0.25/0.15/0.10 weighted sum, in `[0,8]`.
-- The result is `VersionedMetadata(version=RULE_SCORE_VERSION, output=RuleScore)`.
-- Unit-tested with hand-built Events and EntityEvents. No integration pass — pure functions with no I/O.
-**Docs:** impl.md §4.1 (`EventTypeScore`, `event_type_score`), §13.1 (`RuleScore`), §13.3; design.md §5.6, §5.8.
-**Explicitly deferred:** fetching source weights and the active-source count (Scoring: Source Weights via Admin); Score Fusion.
+**Status:** Designed
+**Depends on:** Aggregation: Flush Active Events & Publish (for `EventRepository`, `stream:event_aggregated`, migration `002`); Entity Analysis: LLM Entity Extraction (for `EntityEvent`)
+**Scope:** Consume `stream:event_aggregated` and load each Event with its constituent EntityEvents (impl.md §13.1 step 1's fetches, §13.2).
+- `app/config.py`: `ScoringConfig.batch_size`/`batch_timeout_ms`/`consumer_name` (§4.1).
+- `app/persistent/event_repository.py`: `fetch_event()` (§10.2).
+- `app/persistent/entity_event_repository.py`: `fetch_entity_events_for_event()` (§10.1).
+- `app/scoring/scoring_service.py`: `ScoringService` + singleton — `score_event()` step 1's fetches and its missing-Event return only (§13.1).
+- `app/scoring/scoring_consumer.py`: `ScoringConsumer` with one consumer loop calling `_process_one()` directly — `_in_process` guard and the three-tier `try`/`except` (§13.2).
+- `app/main.py`: `create_scoring_service()`, the consumer started as a plain `layer_tasks` Task (§16).
+**Acceptance criteria** (per impl.md §13.1, §13.2, §13.6):
+- An Event in `events` is loaded with its constituent EntityEvents, and the message is ACKed.
+- A missing Event logs `scoring_event_missing` and ACKs.
+- An Event already in `_in_process` is skipped and left un-ACKed; any other exception logs ERROR `Unhandled exception: …` and leaves it un-ACKed.
+- Unit-tested with fake repositories.
+- Integration pass against real Postgres and Redis: seed an Event via Aggregation's tables, publish `stream:event_aggregated` directly, check the message is ACKed.
+**Docs:** impl.md §4.1, §10.1, §10.2, §13.1, §13.2, §13.6, §16; design.md §5.2.
+**Explicitly deferred:** scoring and `event_scores`; reclaim/dead-letter and the `v` check; `WorkerPool`/backoff; layer monitoring.
+**PM note:** meanwhile a message is ACKed after loading, unscored — the same as Entity Analysis: Consume Cleaned News & Fetch Article ACKing after its fetch. Nothing consumes scores yet.
+
+---
+
+### Scoring: Rule Score & Persist (M)
+
+**Status:** Designed
+**Depends on:** Scoring: Consume Aggregated Events (for `score_event()` and the consumer)
+**Scope:** Score each Event from rules alone, write `event_scores`, and publish `stream:event_scored` (impl.md §13.1 steps 3 and 10, §13.3, §13.4 `_score_fusion()`, §10.3; design.md §5.6–§5.8).
+- `app/config.py`: `EventTypeScore`, `ScoringConfig.event_type_score` (one `EVENT_TYPE_WEIGHT_*` env var per event type, assembled by `load_config()`), `ScoringConfig.total_active_sources_default` (§4.1).
+- `app/models/event.py`: `Event.source_count` (§3.3).
+- `app/models/event_score.py`: `RuleScore`, `LLMScore`, `EventScore` (§13.1).
+- `alembic/`: `003_create_event_scores.py` (§17).
+- `app/persistent/event_score_repository.py`: `EventScoreRepository` + singleton — `persist_score_if_not_stale()`, `_row_to_event_score()` (§10.3); not `fetch_scored_aggregation_updated_at()`/`fetch_scores()`.
+- `app/scoring/rule_score.py`: `RULE_SCORE_VERSION`, `SentimentAggregation`, `compute_sentiment_aggregation()`, `compute_rule_score()` (§13.3); `get_source_weights()`/`count_active_sources()` as their tier-default fallback only — `_fallback_weights()`, `_SOURCE_TIER`/`_DEFAULT_TIER_WEIGHTS`, `total_active_sources_default` (§13.5).
+- `app/scoring/scoring_service.py`: `score_event()` steps 3 and 10, `_score_fusion()` (§13.1, §13.4); the LLM score is a private placeholder, `VersionedMetadata(version="none", output=LLMScore(stock_impact_score=0.0, adjustment_reason=""))` with `llm_fallback=True`, and `scored_at` is taken at fusion.
+- `app/main.py`: `create_event_score_repository()` (§16).
+**Acceptance criteria** (per impl.md §13.1, §13.3, §13.4):
+- Each Event gets one `event_scores` row and a `stream:event_scored` message (`event_id`, `v="1"`), then the message is ACKed.
+- `rule_score_detail` is `VersionedMetadata(RULE_SCORE_VERSION, RuleScore)`: each of the eight event types maps to its configured score; `source_authority_score` is the MAX weight over the Event's sources, a source missing from `source_weights` counting as 0.0; `sentiment_strength_score` is the source-weighted mean `sentiment_score` ×10, with zero total weight giving `(0.0, 0.0)`; `source_heat_score` = `min(10, source_count / total_active_sources × 10)`; `base_rule_score` is the 0.30/0.25/0.15/0.10 weighted sum, in `[0,8]`.
+- Direction is the sign of `weighted_signed_score` (+1 at 0); `abs_final_score` per `_score_fusion()`; `SentimentAggregation` is computed once and feeds both Rule Score and Score Fusion.
+- A re-score updates the same row, keeping `score_id` — an Event never has more than one `event_scores` row.
+- Unit-tested with hand-built Events/EntityEvents and fake repositories.
+- Integration pass against real Postgres and Redis: seed an Event, publish `stream:event_aggregated`, check `event_scores` and `stream:event_scored`.
+**Docs:** impl.md §3.3, §4.1, §10.3, §13.1, §13.3, §13.4, §13.5, §16, §17 (`003`); design.md §5.6, §5.7, §5.8. Validated by: Scoring: Post-Release Tuning Validation (Q-15).
+**Explicitly deferred:** the already-scored and stale checks; the `source:config`/Admin lookup; both Skills; reclaim; `WorkerPool`; layer monitoring; `fetch_scores()`.
+**PM note:** starts from the code on branch `sapi-2882697466-rule-score` (closed PR #22). Meanwhile every Event is scored as if Admin were unreachable and EventLLMScoringSkill had fallen back — both designed states; nothing is released before the Scoring layer is complete.
+
+---
+
+### Scoring: Already-Scored & Stale Checks (S)
+
+**Status:** Designed
+**Depends on:** Scoring: Rule Score & Persist (for `EventScoreRepository` and the step-10 write)
+**Scope:** Skip work for an Event version already scored, or re-aggregated before its score is written (impl.md §13.1 step 1's already-scored check and step 9, §13.4 `_is_stale()`).
+- `app/persistent/event_score_repository.py`: `fetch_scored_aggregation_updated_at()` (§10.3).
+- `app/persistent/event_repository.py`: `fetch_aggregation_updated_at()` (§10.2).
+- `app/scoring/scoring_service.py`: `_is_stale()`, the already-scored check and step 9 (§13.1, §13.4).
+**Acceptance criteria** (per impl.md §13.1, §13.4):
+- A message for a version already scored (`scored_aggregation_updated_at` equals the Event's `aggregation_updated_at`) writes nothing: it re-publishes `stream:event_scored`, logs `scoring_already_scored`, and ACKs.
+- An Event re-aggregated before step 9 writes nothing, publishes nothing, and ACKs.
+- An Event re-aggregated between step 9 and the write: the conditional UPSERT is a no-op, nothing is published, ACKed.
+- Unit-tested with fake repositories.
+- Integration pass against real Postgres and Redis: a duplicate message re-publishes without a second write; an Event re-aggregated mid-scoring leaves its `event_scores` row unchanged.
+**Docs:** impl.md §10.2, §10.3, §13.1, §13.4; design.md §5.3, §5.4.
+**Explicitly deferred:** the step-6 checkpoint (Scoring: Event LLM Scoring).
 
 ---
 
 ### Scoring: Source Weights via Admin (M)
 
-**Status:** Created
-**Depends on:** Startup & Health: Fetch & Cache HK Stock List (for the shared `httpx` client); Aggregation: Consume & Merge into Active Events (for `RedisStateClient`)
-**Scope:** Read each source's authority weight and the active-source count from `source:config`, refreshing it from Admin on a cold key, with tier-default fallbacks (impl.md §9.2, §13.5; design.md §1.5).
-- `app/config.py`: `ScoringConfig.source_config_ttl_s`/`admin_api_url`/`total_active_sources_default`.
+**Status:** Designed
+**Depends on:** Scoring: Rule Score & Persist (for `get_source_weights()`/`count_active_sources()` and their tier-default fallback); Startup & Health: Fetch & Cache HK Stock List (for the shared `httpx` client)
+**Scope:** Read each source's authority weight and the active-source count from `source:config`, refreshing it from Admin on a cold key; the tier defaults become the Admin-failure fallback (impl.md §9.2, §13.5; design.md §1.5).
+- `app/config.py`: `ScoringConfig.source_config_ttl_s`/`admin_api_url`.
 - `app/clients/errors.py`: `AdminClientError`.
 - `app/clients/admin_client.py`: `AdminClient.fetch_sources()` + `create_admin_client()`/`get_admin_client()` (§9.2).
 - `app/redis/state_client.py`: `hmget()`/`hlen()`/`hset()`/`expire()` (§6.2) — not `exists()`, which nothing needs.
-- `app/scoring/rule_score.py`: `get_source_weights()`, `count_active_sources()`, `_fallback_weights()`, `_SOURCE_TIER`/`_DEFAULT_TIER_WEIGHTS` (§13.5).
+- `app/scoring/rule_score.py`: `get_source_weights()` and `count_active_sources()` in full (§13.5).
 - `app/main.py`: `create_admin_client()` (§16).
 **Acceptance criteria** (per impl.md §9.2, §13.5):
 - A warm `source:config` is served with a single `HMGET`, without calling Admin.
@@ -539,91 +586,78 @@ This document does not introduce new design — every ticket below implements so
 - Admin failing (`AdminClientError`) or returning an empty list falls back to P1/P2/P3 tier weights, caches nothing, and (empty list) logs `source_config_empty_from_admin`; an unrecognised `source_name` weighs 0.0.
 - Any other exception (e.g. a malformed response) propagates rather than being treated as an Admin outage.
 - `count_active_sources()` never calls Admin: `HLEN` when warm, `TOTAL_ACTIVE_SOURCES_DEFAULT` when cold.
-- A state-Redis failure propagates from `get_source_weights()` and `count_active_sources()` — no fallback weights, no Admin call — so the caller doesn't ACK and the message is retried (impl.md §13.6).
+- A state-Redis failure propagates from `get_source_weights()` and `count_active_sources()` — no fallback weights, no Admin call — so the message is left un-ACKed and retried (impl.md §13.6).
+- A scored Event's `source_authority_score`/`source_heat_score` reflect Admin's weights and the `HLEN` count.
 - `AdminClient` never leaks a raw `httpx` exception.
 - Unit-tested against mocked `httpx`/Redis.
-- Integration pass against real Redis, with Admin's `GET /v1/sources` (api.md §4.3) mocked — success, empty list, and failure.
-**Docs:** impl.md §4.1, §6.2, §9.2, §13.5, §16; api.md §4.3; design.md §1.5, §5.6.
-**Explicitly deferred:** the callers (Scoring: Score & Persist Events).
+- Integration pass against real Redis/Postgres, with Admin's `GET /v1/sources` (api.md §4.3) mocked — success, empty list, and failure — checked through the scored Event.
+**Docs:** impl.md §4.1, §6.2, §9.2, §13.5, §13.6, §16; api.md §4.3; design.md §1.5, §5.6.
 
 ---
 
-### Scoring: Brief Summary Skill (M)
+### Scoring: Brief Summary (M)
 
-**Status:** Created
-**Depends on:** Spike: Scoring LLM Skills (for the few-shot examples and any §8.3 fixes); Entity Analysis: LLM Entity Extraction (for `SkillBase`, the LLM Adapter with `GenerationConfig`); Aggregation: Sliding-Window Merge Algorithm (for `Event`)
-**Scope:** Generate an Event's Traditional Chinese summary from its constituent EntityEvents, with an extractive fallback on a schema violation (impl.md §8.3; design rationale: design.md §9.5, §5.9).
-- `app/models/event.py`: `BriefSummary` (§3.3) — not yet `Event.brief_summary` (added by its writer, Scoring: Score & Persist Events).
+**Status:** Designed
+**Depends on:** Scoring: Consume Aggregated Events (for `score_event()`); Spike: Scoring LLM Skills (for the few-shot examples and any §8.3 fixes); Entity Analysis: LLM Entity Extraction (for `SkillBase`, the LLM Adapter with `GenerationConfig`)
+**Scope:** Generate and store an Event's Traditional Chinese summary from its constituent EntityEvents, with an extractive fallback on a schema violation (impl.md §8.3, §13.1 steps 2, 4, 5; design rationale: design.md §9.5, §5.9).
+- `app/models/event.py`: `BriefSummary`, `Event.brief_summary`, `brief_summary_aggregation_updated_at`, `brief_summary_fallback`; `_row_to_event()` parses them (§3.3, §10.2).
 - `app/skills/brief_summary_skill.py`: `BriefSummaryInput` (including `source_weights`), `BriefSummaryResult`, `BriefSummarySkillLog`, `InputSummary`, `BRIEF_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0, 1024), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
-**Acceptance criteria** (per impl.md §8.3):
+- `app/persistent/event_repository.py`: `update_brief_summary()` (§10.2).
+- `app/scoring/scoring_service.py`: step 2's `brief_task` start, steps 4 and 5 (§13.1).
+**Acceptance criteria** (per impl.md §8.3, §13.1):
 - Input construction: at most 3 articles per source (latest kept); ordered by `source_weights` descending, then latest `published_at`; the user message follows §8.3's template; `input_summary` records counts and the source-cap flag.
 - Business constraints: `summary_short` ≤30, `summary_full` ≤150, `key_numbers` ≤3 — truncated and logged, not failed.
 - `LLMSchemaViolationError` → fallback (highest-weight constituent's `headline`, ties by latest `published_at`; `summary_full = summary_short`; `key_numbers = []`), `skill_log.fallback=True`, `brief_summary_fallback` logged, `failure_reason=None`.
-- Rate-limit/provider/auth failures → `failure_reason` is the caught error, `output=None`.
 - Every call passes `_GENERATION_CONFIG`.
-- Unit-tested with a fake `LLMAdapter`.
-- Integration pass against live Vertex AI with the spike's Events.
-**Docs:** impl.md §3.3 (`BriefSummary`), §7.1, §8, §8.1, §8.3, §8.5, §8.6; design.md §5.9, §9.5, §9.7, §9.8.
-**Explicitly deferred:** calling the Skill, `Event.brief_summary`, and persisting the summary (Scoring: Score & Persist Events).
+- A scored Event has `brief_summary`, the Event version it was made for, and the fallback flag stored, and `brief_summary_completed` logged.
+- A rate-limit/provider/auth failure logs `brief_summary_completed`, leaves the message un-ACKed, and the loop continues.
+- Unit-tested with a fake `LLMAdapter` and fake repositories.
+- Integration pass against live Vertex AI with the spike's Events, through `score_event()`.
+**Docs:** impl.md §3.3, §7.1, §8, §8.1, §8.3, §8.5, §8.6, §10.2, §13.1; design.md §5.4, §5.9, §9.5, §9.7, §9.8.
+**Explicitly deferred:** step 3's salvage and step 2's reuse (Scoring: Brief Summary Salvage & Reuse).
 
 ---
 
-### Scoring: Event LLM Scoring Skill (S)
+### Scoring: Brief Summary Salvage & Reuse (S)
 
-**Status:** Created
-**Depends on:** Scoring: Brief Summary Skill (for `BriefSummary`); Spike: Scoring LLM Skills (for the few-shot examples)
-**Scope:** Score an Event's directional stock impact from BriefSummarySkill's output, with a neutral fallback (impl.md §8.4; design rationale: design.md §9.6, §5.9).
-- `app/models/event_score.py`: `LLMScore` (§13.1).
+**Status:** Designed
+**Depends on:** Scoring: Brief Summary; Scoring: Rule Score & Persist (so step 3 runs while the Skill does)
+**Scope:** Keep a finished summary when a later step fails, and reuse it on the retry (impl.md §13.1 step 2's reuse check, step 3's failure handling; design.md §5.4).
+- `app/scoring/scoring_service.py`: step 2's reuse check, step 3's `try`/`except` around `brief_task`.
+**Acceptance criteria** (per impl.md §13.1):
+- If step 3 fails while BriefSummarySkill runs, the summary is still awaited and stored before the original exception is re-raised; a failed store logs `brief_summary_salvage_failed` and doesn't replace the original error.
+- On cancellation the Skill's Task is cancelled instead of awaited.
+- A retry after a failure past BriefSummarySkill reuses the stored summary for the same version: no BriefSummarySkill call, `brief_summary_reused` logged.
+- Unit-tested with fake Skills/repositories.
+- Integration pass against real Postgres and Redis with a faked Skill: a step-3 failure stores the summary, and the retry reuses it.
+**Docs:** impl.md §13.1; design.md §5.4.
+
+---
+
+### Scoring: Event LLM Scoring (M)
+
+**Status:** Designed
+**Depends on:** Scoring: Brief Summary (for `BriefSummary` and the step-4 result); Scoring: Already-Scored & Stale Checks (for `_is_stale()`); Spike: Scoring LLM Skills (for the few-shot examples)
+**Scope:** Score an Event's directional stock impact from BriefSummarySkill's output, with a neutral fallback, and fuse it into the stored score (impl.md §8.4, §13.1 steps 6–8, §13.4; design rationale: design.md §9.6, §5.7, §5.9).
 - `app/skills/event_scoring_skill.py`: `EventLLMScoringInput`, `EventLLMScoringResult`, `EventLLMScoringSkillLog`, `SCORING_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0, 512), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
-**Acceptance criteria** (per impl.md §8.4):
+- `app/scoring/scoring_service.py`: steps 6–8 — the Skill's result replaces Rule Score & Persist's placeholder LLM score, `scored_at` is taken when `run()` returns (§13.1).
+**Acceptance criteria** (per impl.md §8.4, §13.1, §13.4):
 - `stock_impact_score` clipped to `[-5, +5]` and `adjustment_reason` truncated to 80, both logged.
 - An empty `adjustment_reason`, or `LLMSchemaViolationError`, → fallback (`stock_impact_score=0`, `adjustment_reason=""`), `skill_log.fallback=True` with the right `fallback_reason`, `event_scoring_fallback` logged, `failure_reason=None`.
-- `input_from_fallback` is recorded in the skill log, not used in the prompt.
-- Rate-limit/provider/auth failures → `failure_reason` is the caught error, `output=None`.
-- Unit-tested with a fake `LLMAdapter`.
-- Integration pass against live Vertex AI with the spike's Events.
-**Docs:** impl.md §7.1, §8, §8.1, §8.4, §8.5, §8.6, §13.1 (`LLMScore`); design.md §5.9, §9.6, §9.7, §9.8.
-**Explicitly deferred:** calling the Skill and direction derivation (Scoring: Score & Persist Events).
-
----
-
-### Scoring: Score & Persist Events (L)
-
-**Status:** Created
-**Depends on:** Scoring: Rule Score & Sentiment Aggregation; Scoring: Source Weights via Admin; Scoring: Event LLM Scoring Skill (and through it Brief Summary Skill); Aggregation: Flush Active Events & Publish (for `EventRepository`, `stream:event_aggregated`, migration `002`)
-**Scope:** Consume `stream:event_aggregated`, score each Event, write `event_scores`, and publish `stream:event_scored` (impl.md §13.1, §13.2, §13.4, §10.3; design.md §5.2–§5.5, §5.7).
-- `app/config.py`: `ScoringConfig.batch_size`/`batch_timeout_ms`/`consumer_name`.
-- `app/models/event.py`: `Event.brief_summary`, `brief_summary_aggregation_updated_at`, `brief_summary_fallback`; `_row_to_event()` parses them (§3.3, §10.2).
-- `app/models/event_score.py`: `EventScore` (§13.1).
-- `alembic/`: `003_create_event_scores.py` (§17).
-- `app/persistent/event_repository.py`: `fetch_event()`, `fetch_aggregation_updated_at()`, `update_brief_summary()` (writing the summary's Event version and fallback flag into the JSONB) (§10.2).
-- `app/persistent/entity_event_repository.py`: `fetch_entity_events_for_event()` (§10.1).
-- `app/persistent/event_score_repository.py`: `EventScoreRepository` + singleton — `persist_score_if_not_stale()` (writing `scored_aggregation_updated_at`), `fetch_scored_aggregation_updated_at()`, `_row_to_event_score()` (§10.3); not `fetch_scores()`.
-- `app/scoring/scoring_service.py`: `ScoringService` + singleton — `score_event()` (steps 1–10, source weights read before the Skill starts), `_score_fusion()`, `_is_stale()` (§13.1, §13.4).
-- `app/scoring/scoring_consumer.py`: `ScoringConsumer` with one consumer loop calling `_process_one()` directly — `_in_process` guard and the three-tier `try`/`except` (§13.2).
-- `app/main.py`: `create_event_score_repository()`, `create_scoring_service()`, the consumer started as a plain Task in `layer_tasks` (§16).
-**Acceptance criteria** (per impl.md §13.1, §13.2, §13.4, §13.6):
-- A fresh Event is scored end to end: brief summary written, one `event_scores` row with the fused fields and both versioned details, `stream:event_scored` published (`event_id`, `v="1"`), message ACKed.
-- A re-score updates the same row, keeping `score_id` and moving `scored_at`/`scored_aggregation_updated_at` — an Event never has more than one `event_scores` row.
-- If step 3 fails (e.g. `count_active_sources()`'s Redis read) while BriefSummarySkill runs, the summary is still awaited and stored before the original exception is re-raised (a failed store logs `brief_summary_salvage_failed`); on cancellation the Skill's Task is cancelled instead.
-- A retry after a failure past BriefSummarySkill (e.g. EventScoringSkill's LLM call) reuses the stored summary for the same version: no BriefSummarySkill call, `brief_summary_reused` logged, and EventScoringSkill gets the stored fallback flag as `input_from_fallback`.
-- A message for a version already scored (`scored_aggregation_updated_at` equals the Event's `aggregation_updated_at`) makes no Skill call and no write: it re-publishes `stream:event_scored`, logs `scoring_already_scored`, and ACKs.
-- Direction is `sign(stock_impact_score)`, or the sign of `weighted_signed_score` whenever it's 0 (fallback or a genuine 0); `abs_final_score` per `_score_fusion()`; `SentimentAggregation` is computed once and feeds both Rule Score and Score Fusion; `llm_fallback` is persisted from the EventScoringSkill result.
-- Re-aggregation mid-scoring: each checkpoint returns early (no EventScoringSkill call after the first, no write after the second, a no-op UPSERT at the third), nothing published, ACKed.
-- A missing Event logs `scoring_event_missing` and ACKs.
-- A Skill's rate-limit/provider/auth failure logs its completion event, leaves the message un-ACKed, and the loop continues; a schema violation continues on the fallback, and the score records `llm_fallback`.
-- An Event already in `_in_process` is skipped and left un-ACKed; any other exception logs ERROR `Unhandled exception: …` and leaves it un-ACKed.
-- Unit-tested with fake Skills/repositories.
-- Integration pass against real Postgres and Redis with faked Skills: seed an Event via Aggregation's tables, publish `stream:event_aggregated` directly, check `event_scores` and `stream:event_scored`; plus one run with live Skills.
-**Docs:** impl.md §3.3, §10.1, §10.2, §10.3, §13.1, §13.2, §13.4, §13.6, §16, §17 (`003`); design.md §5.2–§5.5, §5.7, §5.8, §10.3.
-**Explicitly deferred:** reclaim/dead-letter and the `v` check; `WorkerPool`/backoff; layer monitoring; `fetch_scores()` and the Cache Layer.
+- `input_from_fallback` is the summary's fallback flag (a reused summary's too), recorded in the skill log, not used in the prompt.
+- Direction is `sign(stock_impact_score)`, or the sign of `weighted_signed_score` whenever it's 0; `llm_score_detail` carries `SCORING_SKILL_VERSION`; `llm_fallback` is persisted from the result.
+- An Event re-aggregated after its summary is stored makes no EventScoringSkill call (step 6), and ACKs.
+- A rate-limit/provider/auth failure logs `event_scoring_completed`, leaves the message un-ACKed, and the loop continues.
+- Unit-tested with a fake `LLMAdapter` and fake repositories.
+- Integration pass against live Vertex AI with the spike's Events, through `score_event()`.
+**Docs:** impl.md §7.1, §8, §8.1, §8.4, §8.5, §8.6, §13.1, §13.4; design.md §5.7, §5.9, §9.6, §9.7, §9.8.
 
 ---
 
 ### Scoring: Reclaim, Dead Letter & Schema-Version Check (S)
 
 **Status:** Created
-**Depends on:** Scoring: Score & Persist Events; Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
+**Depends on:** Scoring: Rule Score & Persist (for `ScoringConsumer` and a scored outcome to retry into); Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
 **Scope:** Recover messages Scoring leaves un-ACKed, and dead-letter the ones that keep failing or are malformed (missing or unrecognised `v`, missing or invalid `event_id`) (impl.md §6.1's Reclaim and Dead Letter pattern, §13.2).
 - `app/config.py`: `ScoringConfig.max_retry`.
 - `ScoringConsumer`: `start()` runs both loops in one `asyncio.TaskGroup`; `_reclaim_loop()` dead-letters to `stream:scoring_dead_letter` at `SCORING_MAX_RETRY` and otherwise calls the same `_process_one()`; each sweep wrapped in `except Exception` → `scoring_reclaim_sweep_failed`.
@@ -699,7 +733,7 @@ This document does not introduce new design — every ticket below implements so
 ### Cache: Recency & Merge (S)
 
 **Status:** Created
-**Depends on:** Scoring: Score & Persist Events (for `EventScore`, `Event.brief_summary`)
+**Depends on:** Scoring: Rule Score & Persist (for `EventScore`); Scoring: Brief Summary (for `Event.brief_summary`)
 **Scope:** The pure half of building the Morning Brief cache — the recency formula, the ranking order, and turning scored Events into cache records merged against the current cache (impl.md §14.1 types, §14.3, §14.4, §14.5 `_to_cache_record()`; design rationale: design.md §6.3, §6.4, §6.6).
 - `app/config.py`: `CacheConfig.noise_filter_threshold`/`recency_decay_lambda`.
 - `app/cache/recency.py`: `apply_recency()`, `ranking_key()` (§14.3).
@@ -740,7 +774,7 @@ This document does not introduce new design — every ticket below implements so
 ### Cache: Build Cache from Scores (M)
 
 **Status:** Created
-**Depends on:** Cache: Recency & Merge; Cache: Versioned Cache Store; Scoring: Score & Persist Events (for `stream:event_scored`, `event_scores`, `EventScoreRepository`)
+**Depends on:** Cache: Recency & Merge; Cache: Versioned Cache Store; Scoring: Rule Score & Persist (for `stream:event_scored`, `event_scores`, `EventScoreRepository`)
 **Scope:** Consume `stream:event_scored` and build a new cache version per batch, incrementally (impl.md §14.1 `build_new_version()`, §14.2; design.md §6.1, §6.2).
 - `app/config.py`: `CacheConfig.batch_timeout_ms`/`consumer_name` — no batch-size setting (§14.2).
 - `app/persistent/event_score_repository.py`: `fetch_scores(event_ids)` — the by-id branch only (§10.3).
