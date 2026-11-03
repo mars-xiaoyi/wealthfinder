@@ -405,7 +405,7 @@ This document does not introduce new design — every ticket below implements so
 - `app/persistent/event_repository.py`: `EventRepository` + singleton — `persist_events()` (conditional UPSERT, returns only rows written), `_row_to_event()` without `brief_summary` (`Event` has no such field yet; the column stays NULL until Scoring writes it), `fetch_unpublished_events()`, `mark_published()`, `fetch_mapped_event_id()` (§10.2).
 - `EventAggregationStore.scan_all()` (§12.5).
 - `AggregationService`: `flush()`, `_persist_and_publish()`, the DB half of the duplicate check, and flush-before-replace in `_merge()` (§12.1).
-- `AggregationConsumer`: the queue-empty and `AGG_DB_FLUSH_INTERVAL_S` flush triggers, each wrapped in `except Exception` → `aggregation_flush_failed`, and `start()`'s `finally: flush()` (§12.2).
+- `AggregationConsumer`: the queue-empty and `AGG_DB_FLUSH_INTERVAL_S` flush triggers, each logging a failure at the error's own level and carrying on, and `start()`'s final flush, logged rather than raised and bounded by `DB_CLOSE_TIMEOUT_S` (§12.2).
 - `app/main.py`: `create_event_repository()` (§16).
 **Acceptance criteria** (per impl.md §10.2, §12.1, §12.2):
 - One transaction writes each Event's `events` UPSERT and its `event_entity_map` rows; re-flushing the same state is idempotent and preserves `created_at`.
@@ -415,12 +415,12 @@ This document does not introduce new design — every ticket below implements so
 - Outbox: a crash between commit and publish leaves the Event pending, and the first flush after restart publishes it; a publish that fails while running is retried by the next flush; the outbox read covers only the Events being persisted, never the whole table; a published version is marked, and an older mark never un-marks a newer one.
 - An `entity_event_id` already in `event_entity_map` is skipped as a duplicate.
 - After the first flush following startup (which sends every active Event), a flush sends only Events whose `aggregation_updated_at` moved since this process last flushed them; a failed flush re-sends the same Events next time.
-- A flush failure rolls back and re-raises; the consumer loop logs `aggregation_flush_failed` and keeps running, and the next flush retries from the same Redis state.
-- Cancelling the consumer's Task still runs one final flush.
+- A flush failure rolls back and re-raises; the consumer loop logs it at the error's own level and keeps running, and the next flush retries from the same Redis state.
+- Cancelling the consumer's Task still runs one final flush, abandoned after `DB_CLOSE_TIMEOUT_S` (WARNING `aggregation_final_flush_timed_out`), so a stream Redis outage can't hang shutdown.
 - Unit-tested against mocked asyncpg/redis.
 - Integration pass against real Postgres and Redis: drive Events through the consumer, then check the `events`/`event_entity_map` rows and the `stream:event_aggregated` messages across repeated flushes.
-- The integration cases from Aggregation: Consume & Merge into Active Events re-run: the same Redis-side results, now with a replaced Event persisted in `events` before its key is overwritten, and a failed flush logging WARNING `aggregation_flush_failed` with the first message still pending.
-- Each flush logs INFO `aggregation_flush_completed` with `events_persisted`, `events_published` and `latency_ms` (impl.md §12.1).
+- The integration cases from Aggregation: Consume & Merge into Active Events re-run unchanged with flushing in place.
+- Each flush that sends at least one changed Event logs INFO `aggregation_flush_completed` with `events_persisted` (rows actually written), `events_published` and `latency_ms`; a flush with nothing changed skips the DB and the log (impl.md §12.1).
 **Config note:** `AGG_BATCH_TIMEOUT_MS` and `AGG_DB_FLUSH_INTERVAL_S` must stay far below `SLIDING_WINDOW_HOURS` (design.md §4.5) — an active Event must always be flushed before its Redis TTL can expire it.
 **Docs:** impl.md §5.1, §6.2, §10.2, §12.1, §12.2, §12.5, §12.6, §16, §17 (`002`); design.md §4.5, §10.2, §10.4, §13.2 (outbox long-downtime gap).
 **Explicitly deferred:** `Event.brief_summary`, `BriefSummary`, and `_row_to_event()`'s `brief_summary` parsing (added by the first Scoring ticket that writes it); reclaim/dead-letter and the `v` check; layer monitoring; Scoring's consumption of `stream:event_aggregated`.
@@ -430,7 +430,7 @@ This document does not introduce new design — every ticket below implements so
 ### Aggregation: Reclaim, Dead Letter & Schema-Version Check (S)
 
 **Status:** Created
-**Depends on:** Aggregation: Flush Active Events & Publish (for `start()`'s `finally: flush()`); Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
+**Depends on:** Aggregation: Flush Active Events & Publish (for `start()`'s final flush); Entity Analysis: Reclaim, Dead Letter & Schema-Version Check (for `autoclaim()`, `ReclaimedMessage`)
 **Scope:** Recover messages Aggregation leaves un-ACKed, and dead-letter the ones that keep failing or are malformed (missing or unrecognised `v`, missing or invalid `entity_event_id`) (impl.md §6.1's Reclaim and Dead Letter pattern, §12.2).
 - `app/config.py`: `AggregationConfig.max_retry`.
 - `AggregationConsumer`: `start()` runs `_consumer_loop()` and `_reclaim_loop()` in one `asyncio.TaskGroup`; `_reclaim_loop()` dead-letters to `stream:aggregation_dead_letter` at `AGG_MAX_RETRY` and otherwise calls the same `_route_one()`; each sweep wrapped in `except Exception` → `aggregation_reclaim_sweep_failed`.

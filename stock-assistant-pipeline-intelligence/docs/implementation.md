@@ -1146,7 +1146,7 @@ Used by : EventRepository's persist_events() (§10.2) — Upserting every active
 async with db.transaction() as tx:
     await tx.execute(_UPSERT_EVENT_SQL, ...)
     for entity_event_id in group.entity_event_ids:
-        await tx.execute(_UPSERT_EVENT_ENTITY_MAP_SQL, ...)
+        await tx.execute(_INSERT_EVENT_ENTITY_MAP_SQL, ...)
 # commits here; raises and rolls back if any statement inside failed all retries
 ```
 
@@ -1518,7 +1518,7 @@ class RedisStateClient:
 | `get`/`set`/`incr`/`delete`/`exists`/`expire`/`rename` | `GET`/`SET`/`INCR`/`DEL`/`EXISTS`/`EXPIRE`/`RENAME` | — |
 | `mget` | `MGET` | One atomic read of several keys, in order; `None` for a missing key |
 | `hget`/`hgetall`/`hmget`/`hset`/`hlen` | `HGET`/`HGETALL`/`HMGET`/`HSET`/`HLEN` | `hgetall` returns `None` if the key doesn't exist (vs. redis-py's empty-dict default) so callers can distinguish "no such key" from "empty hash" |
-| `scan(pattern)` | `SCAN` (cursor loop, collected) | Returns the full matching key list — every current caller (§12.5, §10.4) consumes the whole result anyway, so there's no streaming/cursor-exposing variant |
+| `scan(pattern)` | `SCAN` (cursor loop, collected) | Returns the full matching key list, each key once (SCAN may return a key more than once) — every current caller (§12.5, §10.4) consumes the whole result anyway, so there's no streaming/cursor-exposing variant |
 | `multi_exec(build)` | `MULTI`/`EXEC` | `build` receives a `redis.asyncio.client.Pipeline` and queues commands on it (`pipe.set(...)`, `pipe.delete(...)`, `pipe.rename(...)`, ...) — nothing is sent to Redis until `EXEC`, so every queued command commits atomically together. This is the primitive `CacheStore.write_cache_version()` (§10.4) builds its atomic swap on |
 | `ping()` | `PING` | Live connectivity check for `GET /v1/health` (§15.2); raises redis errors untranslated |
 
@@ -3016,17 +3016,19 @@ async def persist_events(self, active: list[Event]) -> list[Event]:
             row = await tx.execute_returning(_UPSERT_EVENT_SQL, *values.values())   # None: input not newer than the stored row, no write
             for entity_event_id in e.entity_event_ids:
                 mapping = EventEntityMap(event_id=e.event_id, entity_event_id=entity_event_id, created_at=now)   # §3.4
-                await tx.execute(_UPSERT_EVENT_ENTITY_MAP_SQL, mapping.event_id, mapping.entity_event_id, mapping.created_at)
+                await tx.execute(_INSERT_EVENT_ENTITY_MAP_SQL, mapping.event_id, mapping.entity_event_id, mapping.created_at)
             if row is not None:
                 flushed_events.append(_row_to_event(row))
     return flushed_events
 ```
 
-`values`' key order must match `_UPSERT_EVENT_SQL`'s `$1...$10` (§10.1). `_UPSERT_EVENT_SQL` and `_UPSERT_EVENT_ENTITY_MAP_SQL` are module-level constants. `_UPSERT_EVENT_SQL` is `INSERT ... ON CONFLICT (event_id) DO UPDATE SET ... WHERE events.aggregation_updated_at < EXCLUDED.aggregation_updated_at RETURNING *`: only newer state wins, so an unchanged Event or an older snapshot returns no row (system-design.md §4.5). `SET`: `aggregation_updated_at = $n` (from `merge_or_create()`); `updated_at = now()`; `event_type_secondary = COALESCE($n, <computed>)` and `source_list = COALESCE($n, <computed>)`, where both subqueries filter `entity_events WHERE entity_event_id = ANY($n)`, with `$n` bound to `values["entity_event_ids"]` and **not** a join through `event_entity_map`: the `events` UPSERT runs before the map INSERTs (the map's FK needs the `events` row first, §17), so on a first flush a join would see zero rows. `created_at` is absent from `SET`, so re-flushes preserve it. `RETURNING *` lets `_row_to_event()` build the `Event` without a follow-up `SELECT`.
+`values`' key order must match `_UPSERT_EVENT_SQL`'s `$1...$10` (§10.1); the JSONB values are bound as `json.dumps()` text and read back with `json.loads()`, since no asyncpg JSON codec is registered (as in §10.1). `_UPSERT_EVENT_SQL` and `_INSERT_EVENT_ENTITY_MAP_SQL` are module-level constants. `_INSERT_EVENT_ENTITY_MAP_SQL` is `INSERT ... ON CONFLICT DO NOTHING` with no conflict target, so a conflict on either the primary key or `uq_event_entity_map_entity_event_id` (§17) is absorbed and never fails a flush. `_UPSERT_EVENT_SQL` is `INSERT ... ON CONFLICT (event_id) DO UPDATE SET ... WHERE events.aggregation_updated_at < EXCLUDED.aggregation_updated_at RETURNING *`: only newer state wins, so an unchanged Event or an older snapshot returns no row (system-design.md §4.5). `SET`: `aggregation_updated_at = $n` (from `merge_or_create()`); `updated_at = now()`; `event_type_secondary = COALESCE($n, <computed>)` and `source_list = COALESCE($n, <computed>)`, where both subqueries filter `entity_events WHERE entity_event_id = ANY($n)`, with `$n` bound to `values["entity_event_ids"]` and **not** a join through `event_entity_map`: the `events` UPSERT runs before the map INSERTs (the map's FK needs the `events` row first, §17), so on a first flush a join would see zero rows. `created_at` is absent from `SET`, so re-flushes preserve it. `RETURNING *` lets `_row_to_event()` build the `Event` without a follow-up `SELECT`.
 
-`event_type_secondary`'s `<computed>` aggregation (PRD §OQ-8, Closed): every entity in the group shares the same `event_type_primary` — that's the merge key (`GroupCoroutine`'s `group_key`, §12.3) — so `entity.event_type_primary` is never a secondary-type candidate; only each constituent `entity_events.additional_outcome.output.event_type_secondary` (nullable, at most one per entity, system-design.md §9.4/OQ-8) is. Count frequency of each distinct non-`NULL` value among the matched rows, take the top 2. OQ-8 covers per-article ties (none possible — one value per entity) but not an Event-level frequency tie between two distinct types with only one slot left; that residual case is resolved here as most-recent `published_at` wins.
+`event_type_secondary`'s `<computed>` aggregation (PRD §OQ-8, Closed): every entity in the group shares the same `event_type_primary` — that's the merge key (`GroupCoroutine`'s `group_key`, §12.3) — so `entity.event_type_primary` is never a secondary-type candidate; only each constituent `entity_events.additional_outcome.output.event_type_secondary` (nullable, at most one per entity, system-design.md §9.4/OQ-8) is. Count frequency of each distinct non-`NULL` value among the matched rows, take the top 2; `[]` when there is none (api.md's empty array), so `event_type_secondary` is never `NULL` after a write. OQ-8 covers per-article ties (none possible — one value per entity) but not an Event-level frequency tie between two distinct types with only one slot left; that residual case is resolved here as most-recent `published_at` wins (the type's latest report).
 
 `source_list`'s `<computed>` aggregation: one entry per distinct `source_name` among the matched rows (§3.3's own definition). When the same source reports more than one constituent entity, its entry carries that source's most-recent `published_at`/`source_url` — the freshest report from that source, not the first.
+
+Both subqueries date a row as `COALESCE(published_at, created_at)` — the same fallback `EntityEvent.get_published_at()` gives `first_seen_at`/`last_seen_at` (§12.4) — so a row without a publication time still ranks, and its `source_list` entry's `published_at` is never `NULL`. The fallback stays inside these subqueries, whose only caller is `AggregationService`.
 
 > **Idempotency across flushes** (system-design.md §11.2's note): `entity_event_ids` in Redis is never cleared after a flush, so the same `(event_id, entity_event_id)` pair is re-attempted on every subsequent flush of that still-active group — `INSERT ... ON CONFLICT DO NOTHING` on `event_entity_map` absorbs this by design.
 
@@ -3803,11 +3805,16 @@ class AggregationService:
             active = await self._event_store.scan_all()
             changed = [e for e in active
                        if self._last_flushed.get(e.event_id) != e.aggregation_updated_at]
-            started = time.perf_counter()
-            published = await self._persist_and_publish(changed)
+            if changed:
+                started = time.perf_counter()
+                outcome = await self._persist_and_publish(changed)
+                log INFO aggregation_flush_completed with events_persisted=outcome.persisted,
+                    events_published=outcome.published, latency_ms (since `started`)
             self._last_flushed = {e.event_id: e.aggregation_updated_at for e in active}
-            log INFO aggregation_flush_completed with events_persisted=len(changed),
-                events_published=published, latency_ms (since `started`)
+        A flush with nothing changed makes no DB call and logs nothing — the
+        queue-empty trigger fires every AGG_BATCH_TIMEOUT_MS while the layer is
+        idle. events_persisted counts the rows the UPSERT actually wrote, not
+        len(changed): on the first flush after startup most are no-ops.
         Only Events whose aggregation_updated_at moved since this process
         last flushed them are sent (system-design.md §4.5). _last_flushed
         starts empty, so the first flush after startup sends every active
@@ -3821,8 +3828,9 @@ class AggregationService:
         call this (queue-empty, interval timer, or graceful shutdown,
         §12.2); this method just does it."""
 
-    async def _persist_and_publish(self, events: list[Event]) -> int:
-        """Transactional outbox (system-design.md §4.5); returns the number of Events published:
+    async def _persist_and_publish(self, events: list[Event]) -> _PersistOutcome:
+        """Transactional outbox (system-design.md §4.5); returns _PersistOutcome(persisted, published),
+        a private two-int dataclass in this module — the rows written and the Events announced:
         1. self._event_repo.persist_events(events) (§10.2) — one transaction;
            only newer state is written, and a written row is pending publish
            by construction (its aggregation_updated_at is now newer than its
@@ -3883,11 +3891,12 @@ Owns `stream:entity_event_completed` consumption (loops, `_enqueued` guard, flus
 
 ```python
 class AggregationConsumer:
-    def __init__(self, config: AggregationConfig, redis_config: RedisConfig):
+    def __init__(self, config: AggregationConfig, redis_config: RedisConfig, db_config: DatabaseConfig):
         self._service = get_aggregation_service()          # §12.1
         self._redis_stream = get_redis_stream_client()    # §6.1 — consumes, reclaims, ACKs
         self._config = config
         self._reconnect_interval_s = redis_config.reconnect_interval_s   # §6.1's reconnect behaviour
+        self._final_flush_timeout_s = db_config.close_timeout_s           # bounds the final flush, below
         self._enqueued: set[UUID] = set()
 
     async def start(self) -> None:
@@ -3900,7 +3909,7 @@ class AggregationConsumer:
                 group.create_task(self._consumer_loop())
                 group.create_task(self._reclaim_loop())
         finally:
-            await self._service.flush()
+            await self._flush_final()
 
     async def _consumer_loop(self) -> None:
         """Reads batches from stream:entity_event_completed and routes
@@ -3911,11 +3920,11 @@ class AggregationConsumer:
         autoclaim(), dead-lettering ones past AGG_MAX_RETRY — see below."""
 ```
 
-> **Graceful shutdown:** the `try`/`finally` in `start()` means `Task.cancel()` from `main.py`'s shutdown still runs one final `self._service.flush()` (system-design.md §4.5).
+> **Graceful shutdown:** the `try`/`finally` in `start()` means `Task.cancel()` from `main.py`'s shutdown still runs one final flush (system-design.md §4.5). `_flush_final()` runs the same logged `_flush()` as the triggers below inside `asyncio.timeout(self._final_flush_timeout_s)` (`DB_CLOSE_TIMEOUT_S`, §4.1), logging WARNING `aggregation_final_flush_timed_out` (`timeout_s`) on expiry. Logged rather than raised, so after a crash the loop's own exception still ends the Task; why it is bounded: system-design.md §4.5.
 
 #### `_consumer_loop()` (see Flowchart, below)
 
-Reads batches from `stream:entity_event_completed` (`read_from()`) and calls `_route_one()` for each message, plus the queue-empty/interval flush triggers — nodes `A`–`D` and `FLUSH` of the Flowchart below are this loop's entire body. Each trigger's `self._service.flush()` call is wrapped in `except Exception`: log warning `aggregation_flush_failed` with `exc_info`, don't re-raise — the next trigger retries from the same Redis state (§12.6), and the layer Task never crashes over a DB/Redis outage. `except Exception`, not bare `except:`, for the same `CancelledError` reason as `_reclaim_loop()` below. `start()`'s `finally: flush()` is not wrapped.
+Reads batches from `stream:entity_event_completed` (`read_from()`) and calls `_route_one()` for each message, plus the queue-empty/interval flush triggers — nodes `A`–`D` and `FLUSH` of the Flowchart below are this loop's entire body. Each trigger calls `_flush()`, which runs `self._service.flush()` and catches a failure without re-raising: a `SAPIError` is logged as `logger.log(exc.log_level, exc.dev_message, exc_info=exc)`, anything else as ERROR `"Unhandled exception"` — the next trigger retries from the same Redis state (§12.6), and the layer Task never crashes over a DB/Redis outage. `except Exception`, not bare `except:`, for the same `CancelledError` reason as `_reclaim_loop()` below. The interval trigger's clock restarts on every flush attempt, failed or not; a read that fails on the stream Redis triggers no flush.
 
 #### Flowchart (system-design.md §4.2 + §4.5, with the Coroutine Manager and flush triggers made explicit) — `AggregationConsumer._route_one()`
 
@@ -3996,7 +4005,7 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           with exc_info, do not re-raise — retried next tick.
 ```
 
-`except Exception` per §6.1; `start()`'s `finally: flush()` still runs on cancellation.
+`except Exception` per §6.1; `start()`'s final flush still runs on cancellation.
 
 > **Tuning note:** `STREAM_CLAIM_TIMEOUT_MS` must be set comfortably above the worst realistic backlog depth × per-item processing time for the busiest group, not just above a single item's own processing latency — otherwise the reclaim loop steals legitimately in-progress (not crashed) work from a hot `GroupCoroutine` under normal load, which the `_enqueued` guard prevents from corrupting state but still wastes a redundant DB round-trip per false reclaim.
 
@@ -4252,7 +4261,7 @@ def create_event_aggregation_store() -> EventAggregationStore:
 | DB read failure (EntityEvent fetch) | `EntityEventRepository.fetch_entity_event()` (§10.1) raises inside `AggregationService.process_entity_event()`, before anything is enqueued; caught by `AggregationConsumer._route_one()` (§12.2): discard from `_enqueued`, log at the error's own level, leave unACKed — the reclaim loop retries |
 | EntityEvent row not found | `fetch_entity_event()` returns `None` — `stream:entity_event_completed` is only published after `persist_entities()` commits (§11.1), so this means the row is gone, and no redelivery can fix it. `process_entity_event()` logs `aggregation_entity_event_missing` (warning) and calls `on_success()` (ACK) without enqueueing |
 | `RedisStateClient` unreachable, or any other failure inside the unit of work (duplicate-check read, replaced-Event persist, merge, upsert, ACK) | Caught by `_merge()`'s own `try`/`except` (§12.1): log with `entity_event_id`/`group_key` at the error's own level (a `SAPIError`'s `log_level`; ERROR for anything else, including untranslated Redis errors), call `on_failure()` (discard from `_enqueued`, no ACK), don't re-raise — the group keeps running and the reclaim loop retries |
-| DB Flush failure | `EventRepository.persist_events()` (§10.2) rolls back and re-raises after `_db_write_with_retry()`'s retries are exhausted (§5.2); `AggregationService.flush()` propagates; `_consumer_loop()` (§12.2) logs warning `aggregation_flush_failed` and continues — the next trigger retries the same still-active Redis state, nothing is lost |
+| DB Flush failure | `EventRepository.persist_events()` (§10.2) rolls back and re-raises after `_db_write_with_retry()`'s retries are exhausted (§5.2); `AggregationService.flush()` propagates; `_consumer_loop()` (§12.2) logs it at the error's own level and continues — the next trigger retries the same still-active Redis state, nothing is lost |
 | `GroupCoroutine` failure | Only reachable by a bug in `_merge()`'s own failure handling (§12.3's backstop): `_run()` logs CRITICAL `aggregation_group_work_failed` and continues with the group's next item — the group, the consumer loop, and the layer Task all keep running. Each group runs in its own never-awaited Task, so this never reaches Coroutine Monitoring (§16) or `layers.aggregation`. Only the failing item is lost: its `_enqueued` entry stays set, so redeliveries are skipped until it's dead-lettered at `AGG_MAX_RETRY` — acceptable for a genuine bug, which redelivery couldn't fix anyway |
 | `RedisStreamClient` unreachable | Per §6.1's reconnect behaviour |
 
@@ -5591,7 +5600,7 @@ async def lifespan(app: FastAPI):
         cleaned_news_consumer = CleanedNewsConsumer(entity_analysis_worker_pool, config.entity_analysis, config.redis)
         aggregation_service = create_aggregation_service(config.aggregation)
         resources.push_async_callback(aggregation_service.close)   # group Tasks outlive the layer Task (§12.1)
-        agg_consumer = AggregationConsumer(config.aggregation, config.redis)
+        agg_consumer = AggregationConsumer(config.aggregation, config.redis, config.db)
         create_scoring_service(config.scoring)
         scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring)
         cache_service = create_cache_service(config.cache)
@@ -5655,7 +5664,7 @@ app = create_app()
 app.router.lifespan_context = lifespan
 ```
 
-> **Aggregation's final flush:** `AggregationConsumer.start()`'s `try/finally` (§12.2) flushes when the Task is cancelled; `_cancel_layer_tasks()` needs only `task.cancel()` + `gather()`.
+> **Aggregation's final flush:** `AggregationConsumer.start()`'s `try/finally` (§12.2) flushes when the Task is cancelled; `_cancel_layer_tasks()` needs only `task.cancel()` + `gather()`, and runs before any client closes.
 
 > **Routes** reach infra by calling each owning module's `get_X()` in the handler body (§5.4).
 

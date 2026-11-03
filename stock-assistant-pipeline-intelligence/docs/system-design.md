@@ -327,7 +327,7 @@ DB Flush is triggered by three conditions:
 
 - **XREADGROUP timeout:** No new messages arrive within `AGG_BATCH_TIMEOUT_MS` — equivalent to the input queue being empty.
 - **`AGG_DB_FLUSH_INTERVAL_S` elapsed:** Maximum interval between flushes, ensuring timely delivery to downstream layers during continuous high-volume ingestion.
-- **Graceful shutdown:** Immediate flush before service exit to persist all in-memory state.
+- **Graceful shutdown:** Immediate flush before service exit to persist all in-memory state. It is bounded by the DB close timeout: during a stream Redis outage its publish would never complete, and an Event left unannounced is still announced by the first flush after the next start (outbox, below).
 
 On each flush, within a single DB transaction:
 - All active Events in Redis are Upserted to the `events` table
@@ -1132,7 +1132,7 @@ On Task exit:
 
 The delay keeps a crash that recurs on every start — e.g. the stream Redis still unreachable when the restarted layer creates its consumer group — from spinning into a tight crash-restart loop. During it the crashed Task stays registered, so `GET /health` reports the layer as `error`; a restart whose delay ends after shutdown has begun is skipped.
 
-A layer Task cancelled at shutdown can still end with an exception, e.g. Aggregation's final flush failing because the DB is already unreachable. Restarting it then would create a Task that shutdown never cancels, running past the lifespan against closed clients, so the monitor restarts only while the service is running.
+A layer Task cancelled at shutdown can still end with an exception, e.g. a crash just before shutdown. Restarting it then would create a Task that shutdown never cancels, running past the lifespan against closed clients, so the monitor restarts only while the service is running.
 
 This lightweight mechanism handles coroutine crash recovery without requiring hang detection — the `XREADGROUP BLOCK` pattern prevents coroutines from hanging silently.
 
