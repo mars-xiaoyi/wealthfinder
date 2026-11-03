@@ -503,7 +503,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Scoring: Consume Aggregated Events (S)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Aggregation: Flush Active Events & Publish (for `EventRepository`, `stream:event_aggregated`, migration `002`); Entity Analysis: LLM Entity Extraction (for `EntityEvent`)
 **Scope:** Consume `stream:event_aggregated` and load each Event with its constituent EntityEvents (impl.md §13.1 step 1's fetches, §13.2).
 - `app/config.py`: `ScoringConfig.batch_size`/`batch_timeout_ms`/`consumer_name` (§4.1).
@@ -526,7 +526,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Scoring: Rule Score & Persist (M)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Scoring: Consume Aggregated Events (for `score_event()` and the consumer)
 **Scope:** Score each Event from rules alone, write `event_scores`, and publish `stream:event_scored` (impl.md §13.1 steps 3 and 10, §13.3, §13.4 `_score_fusion()`, §10.3; design.md §5.6–§5.8).
 - `app/config.py`: `EventTypeScore`, `ScoringConfig.event_type_score` (one `EVENT_TYPE_WEIGHT_*` env var per event type, assembled by `load_config()`), `ScoringConfig.total_active_sources_default` (§4.1).
@@ -552,7 +552,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Scoring: Already-Scored & Stale Checks (S)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Scoring: Rule Score & Persist (for `EventScoreRepository` and the step-10 write)
 **Scope:** Skip work for an Event version already scored, or re-aggregated before its score is written (impl.md §13.1 step 1's already-scored check and step 9, §13.4 `_is_stale()`).
 - `app/persistent/event_score_repository.py`: `fetch_scored_aggregation_updated_at()` (§10.3).
@@ -571,7 +571,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Scoring: Source Weights via Admin (M)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Scoring: Rule Score & Persist (for `get_source_weights()`/`count_active_sources()` and their tier-default fallback); Startup & Health: Fetch & Cache HK Stock List (for the shared `httpx` client)
 **Scope:** Read each source's authority weight and the active-source count from `source:config`, refreshing it from Admin on a cold key; the tier defaults become the Admin-failure fallback (impl.md §9.2, §13.5; design.md §1.5).
 - `app/config.py`: `ScoringConfig.source_config_ttl_s`/`admin_api_url`.
@@ -597,7 +597,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Scoring: Brief Summary (M)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Scoring: Consume Aggregated Events (for `score_event()`); Spike: Scoring LLM Skills (for the few-shot examples and any §8.3 fixes); Entity Analysis: LLM Entity Extraction (for `SkillBase`, the LLM Adapter with `GenerationConfig`)
 **Scope:** Generate and store an Event's Traditional Chinese summary from its constituent EntityEvents, with an extractive fallback on a schema violation (impl.md §8.3, §13.1 steps 2, 4, 5; design rationale: design.md §9.5, §5.9).
 - `app/models/event.py`: `BriefSummary`, `Event.brief_summary`, `brief_summary_aggregation_updated_at`, `brief_summary_fallback`; `_row_to_event()` parses them (§3.3, §10.2).
@@ -620,7 +620,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Scoring: Brief Summary Salvage & Reuse (S)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Scoring: Brief Summary; Scoring: Rule Score & Persist (so step 3 runs while the Skill does)
 **Scope:** Keep a finished summary when a later step fails, and reuse it on the retry (impl.md §13.1 step 2's reuse check, step 3's failure handling; design.md §5.4).
 - `app/scoring/scoring_service.py`: step 2's reuse check, step 3's `try`/`except` around `brief_task`.
@@ -636,7 +636,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Scoring: Event LLM Scoring (M)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Scoring: Brief Summary (for `BriefSummary` and the step-4 result); Scoring: Already-Scored & Stale Checks (for `_is_stale()`); Spike: Scoring LLM Skills (for the few-shot examples)
 **Scope:** Score an Event's directional stock impact from BriefSummarySkill's output, with a neutral fallback, and fuse it into the stored score (impl.md §8.4, §13.1 steps 6–8, §13.4; design rationale: design.md §9.6, §5.7, §5.9).
 - `app/skills/event_scoring_skill.py`: `EventLLMScoringInput`, `EventLLMScoringResult`, `EventLLMScoringSkillLog`, `SCORING_SKILL_VERSION`, `_GENERATION_CONFIG` (temperature 0, 512), `build_prompt()` with the verbatim prompt and the spike's few-shot examples, `llm_process()`, business-constraint validation, `fallback_output()`.
