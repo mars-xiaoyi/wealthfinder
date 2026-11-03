@@ -70,6 +70,20 @@ class EventAggregationStore:
 
         await self._state_client.multi_exec(queue_upsert)
 
+    async def scan_all(self) -> list[Event]:
+        """Return every group's active Event."""
+        active_events = []
+        for key in await self._state_client.scan("agg:event:*"):
+            fields = await self._state_client.hgetall(key)
+            # Expired since the scan.
+            if fields is None:
+                continue
+            _, _, exchange, stock_code, event_type_primary = key.split(":")
+            active_events.append(
+                _decode(exchange, stock_code, EventTypeEnum(event_type_primary), fields)
+            )
+        return active_events
+
 
 _event_aggregation_store: EventAggregationStore | None = None
 

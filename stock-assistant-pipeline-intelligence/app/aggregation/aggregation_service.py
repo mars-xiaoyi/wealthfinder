@@ -1,6 +1,8 @@
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 from app.aggregation.event_aggregation_store import get_event_aggregation_store
@@ -11,21 +13,35 @@ from app.common.errors import SAPIError, ServiceUnavailableError
 from app.config import AggregationConfig
 from app.logger import get_logger
 from app.models.entity_event import EntityEvent
+from app.models.event import Event
 from app.persistent.entity_event_repository import get_entity_event_repository
+from app.persistent.event_repository import get_event_repository
+from app.redis.stream_client import get_redis_stream_client
+from app.redis.stream_enum import EventAggregatedStream
 
 logger = get_logger(__name__)
 
 
+@dataclass
+class _PersistOutcome:
+    persisted: int  # Events written
+    published: int  # Events announced on stream:event_aggregated
+
+
 class AggregationService:
-    """Merges each EntityEvent into its group's active Event."""
+    """Merges each EntityEvent into its group's active Event, and persists the active Events."""
 
     def __init__(self, config: AggregationConfig) -> None:
         self._entity_event_repo = get_entity_event_repository()
+        self._event_repo = get_event_repository()
+        self._redis_stream = get_redis_stream_client()
         self._event_store = get_event_aggregation_store()
         self._config = config
         self._groups: dict[GroupKey, GroupCoroutine] = {}
         # One permit per live group, held until the group idles out.
         self._group_semaphore = asyncio.Semaphore(config.max_concurrent)
+        # The merge state of each active Event as of this process's last flush.
+        self._last_flushed: dict[UUID, datetime | None] = {}
 
     async def process_entity_event(
         self,
@@ -52,6 +68,32 @@ class AggregationService:
         )
         group = await self._get_group(group_key)
         await group.enqueue(lambda: self._merge(entity_event, group_key, on_success, on_failure))
+
+    async def flush(self) -> None:
+        """
+        Persist every active Event whose merge state changed since this process last flushed
+        it, and announce each newly persisted version on stream:event_aggregated.
+        Raises ServiceUnavailableError or DatabaseError.
+        """
+        active_events = await self._event_store.scan_all()
+        changed = [
+            event
+            for event in active_events
+            if self._last_flushed.get(event.event_id) != event.aggregation_updated_at
+        ]
+        if changed:
+            start = time.perf_counter()
+            outcome = await self._persist_and_publish(changed)
+            logger.info(
+                "aggregation_flush_completed",
+                events_persisted=outcome.persisted,
+                events_published=outcome.published,
+                latency_ms=int((time.perf_counter() - start) * 1000),
+            )
+        # Only after a successful flush, so a failed one is sent again next time.
+        self._last_flushed = {
+            event.event_id: event.aggregation_updated_at for event in active_events
+        }
 
     async def close(self) -> None:
         """Stop every group, abandoning the work they have not run yet."""
@@ -99,31 +141,32 @@ class AggregationService:
             active_event = await self._event_store.get_active_event(
                 group_key.exchange, group_key.stock_code, group_key.event_type_primary
             )
-            if active_event is not None:
-                # Set on an active Event, which is all the store returns.
-                assert active_event.entity_event_ids is not None
-                # Checked inside the group's queue, so it can't race a merge of the same id.
-                if entity_event_id in active_event.entity_event_ids:
-                    logger.info(
-                        "aggregation_duplicate_skipped",
-                        entity_event_id=entity_event_id,
-                        group_key=group_key,
-                    )
-                    await on_success()
-                    return
-                # Merging it would start an older Event and close the live one early.
-                if is_late(active_event, entity_event):
-                    logger.warning(
-                        "aggregation_late_entity_event_skipped",
-                        entity_event_id=entity_event_id,
-                        group_key=group_key,
-                        published_at=entity_event.get_published_at(),
-                        active_event_id=active_event.event_id,
-                        active_last_seen_at=active_event.last_seen_at,
-                    )
-                    await on_success()
-                    return
+            # Checked inside the group's queue, so it can't race a merge of the same id.
+            if await self._is_merged(entity_event, active_event):
+                logger.info(
+                    "aggregation_duplicate_skipped",
+                    entity_event_id=entity_event_id,
+                    group_key=group_key,
+                )
+                await on_success()
+                return
+            # Merging it would start an older Event and close the live one early.
+            if active_event is not None and is_late(active_event, entity_event):
+                logger.warning(
+                    "aggregation_late_entity_event_skipped",
+                    entity_event_id=entity_event_id,
+                    group_key=group_key,
+                    published_at=entity_event.get_published_at(),
+                    active_event_id=active_event.event_id,
+                    active_last_seen_at=active_event.last_seen_at,
+                )
+                await on_success()
+                return
             updated = merge_or_create(active_event, entity_event)
+            if active_event is not None and updated.event_id != active_event.event_id:
+                # The new Event takes the replaced one's place in the store, so the replaced
+                # one's unflushed merges are persisted first.
+                await self._persist_and_publish([active_event])
             await self._event_store.upsert_active_event(updated, ttl_for(updated))
             await on_success()
         except SAPIError as exc:
@@ -143,6 +186,37 @@ class AggregationService:
                 exc_info=exc,
             )
             on_failure()
+
+    async def _is_merged(self, entity_event: EntityEvent, active_event: Event | None) -> bool:
+        """Return whether the EntityEvent is already part of the active Event or of a
+        persisted one."""
+        entity_event_id = entity_event.entity_event_id
+        # Set on a stored EntityEvent, which is all the repository returns.
+        assert entity_event_id is not None
+        if active_event is not None:
+            # Set on an active Event, which is all the store returns.
+            assert active_event.entity_event_ids is not None
+            if entity_event_id in active_event.entity_event_ids:
+                return True
+        return await self._event_repo.fetch_mapped_event_id(entity_event_id) is not None
+
+    async def _persist_and_publish(self, active_events: list[Event]) -> _PersistOutcome:
+        """Persist the active Events, then announce every one of them whose persisted version
+        has not been announced yet."""
+        persisted = await self._event_repo.persist_events(active_events)
+        # Includes versions persisted earlier whose announcement was lost, e.g. to a crash.
+        pending = await self._event_repo.fetch_unpublished_events(
+            [event.event_id for event in active_events]
+        )
+        for event in pending:
+            # Set on every persisted Event.
+            assert event.aggregation_updated_at is not None
+            await self._redis_stream.publish(
+                EventAggregatedStream.NAME,
+                {"event_id": str(event.event_id), "v": EventAggregatedStream.VERSION},
+            )
+            await self._event_repo.mark_published(event.event_id, event.aggregation_updated_at)
+        return _PersistOutcome(persisted=len(persisted), published=len(pending))
 
 
 _aggregation_service: AggregationService | None = None

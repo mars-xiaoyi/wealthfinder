@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
@@ -21,7 +22,11 @@ from app.models.entity_event import AnalysisOutcome, EntityEvent, EventTypeEnum,
 from app.models.event import Event
 from app.models.versioned_metadata import VersionedMetadata
 from app.persistent import entity_event_repository as repository_module
+from app.persistent import event_repository as event_repository_module
 from app.persistent.entity_event_repository import EntityEventRepository
+from app.persistent.event_repository import EventRepository
+from app.redis import stream_client as stream_client_module
+from app.redis.stream_client import RedisStreamClient
 
 # A concurrency bug shows up as a hang, so fail fast instead.
 pytestmark = [pytest.mark.timeout(5)]
@@ -45,6 +50,7 @@ HSBC = Stock("00005", "HKEX", "匯豐控股", "HSBC HOLDINGS")
 HKEX = Stock("00388", "HKEX", "香港交易所", "HKEX")
 HANG_SENG = Stock("00011", "HKEX", "恒生銀行", "HANG SENG BANK")
 ACTIVE_EVENT_ID = UUID("00000000-0000-0000-0000-0000000000e1")
+OTHER_EVENT_ID = UUID("00000000-0000-0000-0000-0000000000e2")
 
 
 def _id(n: int) -> UUID:
@@ -81,18 +87,28 @@ def _entity_event(
 
 
 def _active_event(
-    first_seen_at: datetime, last_seen_at: datetime, entity_event_ids: list[UUID]
+    first_seen_at: datetime,
+    last_seen_at: datetime,
+    entity_event_ids: list[UUID],
+    stock: Stock = TENCENT,
+    event_id: UUID = ACTIVE_EVENT_ID,
+    aggregation_updated_at: datetime = P,
 ) -> Event:
     return Event(
-        event_id=ACTIVE_EVENT_ID,
-        exchange="HKEX",
-        stock_code="00700",
+        event_id=event_id,
+        exchange=stock.exchange,
+        stock_code=stock.stock_code,
         event_type_primary=EventTypeEnum.EARNINGS,
         first_seen_at=first_seen_at,
         last_seen_at=last_seen_at,
-        aggregation_updated_at=P,
+        aggregation_updated_at=aggregation_updated_at,
         entity_event_ids=entity_event_ids,
     )
+
+
+def _persisted(event: Event) -> Event:
+    """The Event as it reads back once persisted."""
+    return dataclasses.replace(event, entity_event_ids=None, updated_at=P, created_at=P)
 
 
 class _FakeStore:
@@ -104,6 +120,7 @@ class _FakeStore:
         self.store = AsyncMock(spec=EventAggregationStore)
         self.store.get_active_event.side_effect = self._get
         self.store.upsert_active_event.side_effect = self._upsert
+        self.store.scan_all.side_effect = self._scan_all
 
     def seed(self, event: Event) -> None:
         self.events[(event.exchange, event.stock_code, event.event_type_primary)] = event
@@ -116,6 +133,9 @@ class _FakeStore:
 
     async def _get(self, exchange, stock_code, event_type_primary) -> Event | None:
         return self.events.get((exchange, stock_code, event_type_primary))
+
+    async def _scan_all(self) -> list[Event]:
+        return list(self.events.values())
 
     async def _upsert(self, event: Event, ttl_s: int) -> None:
         key = (event.exchange, event.stock_code, event.event_type_primary)
@@ -145,6 +165,24 @@ def repository(monkeypatch):
     repo.fetch_entity_event.side_effect = lambda entity_event_id: repo.stored.get(entity_event_id)
     monkeypatch.setattr(repository_module, "_entity_event_repository", repo)
     return repo
+
+
+@pytest.fixture(autouse=True)
+def event_repository(monkeypatch):
+    """An EventRepository with no Event persisted yet, unless a test says otherwise."""
+    repo = AsyncMock(spec=EventRepository)
+    repo.fetch_mapped_event_id.return_value = None
+    repo.persist_events.return_value = []
+    repo.fetch_unpublished_events.return_value = []
+    monkeypatch.setattr(event_repository_module, "_event_repository", repo)
+    return repo
+
+
+@pytest.fixture(autouse=True)
+def redis_stream(monkeypatch):
+    client = AsyncMock(spec=RedisStreamClient)
+    monkeypatch.setattr(stream_client_module, "_redis_stream_client", client)
+    return client
 
 
 def _store_entity_events(repository: AsyncMock, *entity_events: EntityEvent) -> None:
@@ -283,12 +321,22 @@ async def process_entity_event_ttl_at_max_timespan(store, repository):
     ],
 )
 async def process_entity_event_new_event_replaces(
-    store, repository, active_last_seen_at, published_at
+    store, repository, event_repository, redis_stream, active_last_seen_at, published_at
 ):
     """An EntityEvent outside the sliding window, or one that would stretch the Event to its
-    maximum timespan, starts a new active Event in its place."""
-    store.seed(_active_event(P, active_last_seen_at, [_id(1)]))
+    maximum timespan, starts a new active Event in its place, once the replaced one is
+    persisted and announced."""
+    replaced = _active_event(P, active_last_seen_at, [_id(1)])
+    store.seed(replaced)
     _store_entity_events(repository, _entity_event(2, published_at))
+    held_while_persisted: list[Event | None] = []
+
+    async def persist(active_events: list[Event]) -> list[Event]:
+        held_while_persisted.append(store.get(TENCENT))
+        return [_persisted(event) for event in active_events]
+
+    event_repository.persist_events.side_effect = persist
+    event_repository.fetch_unpublished_events.return_value = [_persisted(replaced)]
     service = AggregationService(CONFIG)
 
     outcome = await _process(service, _id(2))
@@ -299,6 +347,33 @@ async def process_entity_event_new_event_replaces(
     assert event.event_id != ACTIVE_EVENT_ID
     assert event.entity_event_ids == [_id(2)]
     assert event.first_seen_at == event.last_seen_at == published_at
+    event_repository.persist_events.assert_awaited_once_with([replaced])
+    assert held_while_persisted == [replaced]
+    event_repository.fetch_unpublished_events.assert_awaited_once_with([ACTIVE_EVENT_ID])
+    redis_stream.publish.assert_awaited_once_with(
+        "stream:event_aggregated", {"event_id": str(ACTIVE_EVENT_ID), "v": "1"}
+    )
+    event_repository.mark_published.assert_awaited_once_with(ACTIVE_EVENT_ID, P)
+    await service.close()
+
+
+async def process_entity_event_replaced_persist_failed(store, repository, event_repository):
+    """When the replaced Event can't be persisted, it stays the active Event and the failure
+    is reported through on_failure."""
+    replaced = _active_event(P, P, [_id(1)])
+    store.seed(replaced)
+    _store_entity_events(repository, _entity_event(2, P + timedelta(hours=5)))
+    event_repository.persist_events.side_effect = ServiceUnavailableError(
+        "DB connection error", category=ErrorCategory.DB
+    )
+    service = AggregationService(CONFIG)
+
+    outcome = await _process(service, _id(2))
+
+    outcome.on_failure.assert_called_once_with()
+    outcome.on_success.assert_not_awaited()
+    assert store.get(TENCENT) is replaced
+    store.store.upsert_active_event.assert_not_awaited()
     await service.close()
 
 
@@ -324,6 +399,21 @@ async def process_entity_event_duplicate_skipped(store, repository):
 
     _assert_processed(outcome)
     assert store.get(TENCENT) is active
+    store.store.upsert_active_event.assert_not_awaited()
+    await service.close()
+
+
+async def process_entity_event_persisted_duplicate_skipped(store, repository, event_repository):
+    """An EntityEvent already persisted as part of an Event is not merged again."""
+    _store_entity_events(repository, _entity_event(1, P))
+    event_repository.fetch_mapped_event_id.return_value = OTHER_EVENT_ID
+    service = AggregationService(CONFIG)
+
+    outcome = await _process(service, _id(1))
+
+    _assert_processed(outcome)
+    assert store.events == {}
+    event_repository.fetch_mapped_event_id.assert_awaited_once_with(_id(1))
     store.store.upsert_active_event.assert_not_awaited()
     await service.close()
 
@@ -376,11 +466,12 @@ async def process_entity_event_sliding_window_boundary_merged(store, repository)
     [
         pytest.param("state_redis_read", False, id="state_redis_read"),
         pytest.param("state_redis_write", False, id="state_redis_write"),
+        pytest.param("duplicate_check_read", False, id="duplicate_check_read"),
         pytest.param("invalid_active_event", False, id="invalid_active_event"),
         pytest.param("stream_redis_ack", True, id="stream_redis_ack"),
     ],
 )
-async def process_entity_event_merge_failed(store, repository, failure, acked):
+async def process_entity_event_merge_failed(store, repository, event_repository, failure, acked):
     """A failed merge is reported through on_failure, and the group still merges its next
     EntityEvent."""
     _store_entity_events(repository, _entity_event(1, P), _entity_event(2, P))
@@ -390,6 +481,11 @@ async def process_entity_event_merge_failed(store, repository, failure, acked):
         store.store.get_active_event.side_effect = [error, None]
     elif failure == "state_redis_write":
         store.store.upsert_active_event.side_effect = [error, None]
+    elif failure == "duplicate_check_read":
+        event_repository.fetch_mapped_event_id.side_effect = [
+            DatabaseError("DB error", category=ErrorCategory.DB),
+            None,
+        ]
     elif failure == "invalid_active_event":
         # An active Event must hold at least one EntityEvent.
         store.store.get_active_event.side_effect = [_active_event(P, P, []), None]
@@ -487,6 +583,161 @@ async def process_entity_event_group_started_while_waiting(store, repository):
     assert event is not None
     assert event.entity_event_ids == [_id(3), _id(4)]
     await service.close()
+
+
+async def flush_success(store, repository, event_repository, redis_stream):
+    """The first flush persists every active Event and announces each persisted version not
+    yet announced, marking it published after its announcement."""
+    tencent = _active_event(P, P, [_id(1)])
+    hsbc = _active_event(P, P, [_id(2)], stock=HSBC, event_id=OTHER_EVENT_ID)
+    store.seed(tencent)
+    store.seed(hsbc)
+    event_repository.persist_events.return_value = [_persisted(tencent), _persisted(hsbc)]
+    event_repository.fetch_unpublished_events.return_value = [
+        _persisted(tencent),
+        _persisted(hsbc),
+    ]
+    calls = MagicMock()
+    calls.attach_mock(redis_stream.publish, "publish")
+    calls.attach_mock(event_repository.mark_published, "mark_published")
+
+    await AggregationService(CONFIG).flush()
+
+    event_repository.persist_events.assert_awaited_once_with([tencent, hsbc])
+    event_repository.fetch_unpublished_events.assert_awaited_once_with(
+        [ACTIVE_EVENT_ID, OTHER_EVENT_ID]
+    )
+    assert calls.mock_calls == [
+        mock.call.publish("stream:event_aggregated", {"event_id": str(ACTIVE_EVENT_ID), "v": "1"}),
+        mock.call.mark_published(ACTIVE_EVENT_ID, P),
+        mock.call.publish("stream:event_aggregated", {"event_id": str(OTHER_EVENT_ID), "v": "1"}),
+        mock.call.mark_published(OTHER_EVENT_ID, P),
+    ]
+
+
+async def flush_unannounced_version_published(store, repository, event_repository, redis_stream):
+    """A version persisted earlier but never announced is announced, though nothing new is
+    written."""
+    tencent = _active_event(P, P, [_id(1)])
+    store.seed(tencent)
+    event_repository.fetch_unpublished_events.return_value = [_persisted(tencent)]
+
+    await AggregationService(CONFIG).flush()
+
+    event_repository.persist_events.assert_awaited_once_with([tencent])
+    redis_stream.publish.assert_awaited_once_with(
+        "stream:event_aggregated", {"event_id": str(ACTIVE_EVENT_ID), "v": "1"}
+    )
+    event_repository.mark_published.assert_awaited_once_with(ACTIVE_EVENT_ID, P)
+
+
+async def flush_only_changed(store, repository, event_repository, redis_stream):
+    """A later flush sends only the active Events whose merge state changed since the last
+    flush, and none at all when nothing changed."""
+    tencent = _active_event(P, P, [_id(1)])
+    hsbc = _active_event(P, P, [_id(2)], stock=HSBC, event_id=OTHER_EVENT_ID)
+    store.seed(tencent)
+    store.seed(hsbc)
+    service = AggregationService(CONFIG)
+    await service.flush()
+    merged = _active_event(
+        P, P + timedelta(hours=1), [_id(1), _id(3)], aggregation_updated_at=P + timedelta(hours=1)
+    )
+    store.seed(merged)
+
+    await service.flush()
+    await service.flush()
+
+    assert event_repository.persist_events.await_args_list == [
+        mock.call([tencent, hsbc]),
+        mock.call([merged]),
+    ]
+    assert event_repository.fetch_unpublished_events.await_args_list == [
+        mock.call([ACTIVE_EVENT_ID, OTHER_EVENT_ID]),
+        mock.call([ACTIVE_EVENT_ID]),
+    ]
+
+
+async def flush_no_active_events(store, repository, event_repository, redis_stream):
+    await AggregationService(CONFIG).flush()
+
+    store.store.scan_all.assert_awaited_once_with()
+    event_repository.persist_events.assert_not_awaited()
+    event_repository.fetch_unpublished_events.assert_not_awaited()
+    redis_stream.publish.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("failing", "outbox_reads", "announcements"),
+    [
+        pytest.param("persist_events", 1, 1, id="persist"),
+        pytest.param("fetch_unpublished_events", 2, 1, id="outbox_read"),
+        # Announced again: delivery is at least once.
+        pytest.param("mark_published", 2, 2, id="mark_published"),
+    ],
+)
+async def flush_failed(
+    store, repository, event_repository, redis_stream, failing, outbox_reads, announcements
+):
+    """A failed flush is raised, and the next flush sends the same active Events again and
+    announces the version left unannounced."""
+    tencent = _active_event(P, P, [_id(1)])
+    store.seed(tencent)
+    event_repository.fetch_unpublished_events.return_value = [_persisted(tencent)]
+    error = ServiceUnavailableError("DB connection error", category=ErrorCategory.DB)
+    later_result = {
+        "persist_events": [],
+        "fetch_unpublished_events": [_persisted(tencent)],
+        "mark_published": None,
+    }[failing]
+    getattr(event_repository, failing).side_effect = [error, later_result]
+    service = AggregationService(CONFIG)
+
+    with pytest.raises(ServiceUnavailableError) as excinfo:
+        await service.flush()
+    await service.flush()
+
+    assert excinfo.value is error
+    assert event_repository.persist_events.await_args_list == [mock.call([tencent])] * 2
+    assert (
+        event_repository.fetch_unpublished_events.await_args_list
+        == [mock.call([ACTIVE_EVENT_ID])] * outbox_reads
+    )
+    assert (
+        redis_stream.publish.await_args_list
+        == [mock.call("stream:event_aggregated", {"event_id": str(ACTIVE_EVENT_ID), "v": "1"})]
+        * announcements
+    )
+    assert (
+        event_repository.mark_published.await_args_list
+        == [mock.call(ACTIVE_EVENT_ID, P)] * announcements
+    )
+
+
+async def flush_merged_during_flush(store, repository, event_repository):
+    """An Event merged into while a flush is running is sent by the next flush."""
+    tencent = _active_event(P, P, [_id(1)])
+    store.seed(tencent)
+    merged = _active_event(
+        P, P + timedelta(hours=1), [_id(1), _id(2)], aggregation_updated_at=P + timedelta(hours=1)
+    )
+
+    async def persist(active_events: list[Event]) -> list[Event]:
+        if event_repository.persist_events.await_count == 1:
+            store.seed(merged)
+        return []
+
+    event_repository.persist_events.side_effect = persist
+    service = AggregationService(CONFIG)
+
+    await service.flush()
+    await service.flush()
+    await service.flush()
+
+    assert event_repository.persist_events.await_args_list == [
+        mock.call([tencent]),
+        mock.call([merged]),
+    ]
 
 
 async def close_success(store, repository):

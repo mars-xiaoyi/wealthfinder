@@ -42,6 +42,22 @@ async def hgetall_missing_key(redis_mock):
     assert fields is None
 
 
+async def scan_success(redis_mock):
+    """Every matching key is returned once, even when SCAN returns it more than once."""
+
+    async def scan_iter(match: str):
+        for key in ["agg:event:HKEX:00700:EARNINGS", "agg:event:HKEX:00005:MA"]:
+            yield key
+        yield "agg:event:HKEX:00700:EARNINGS"
+
+    redis_mock.scan_iter = MagicMock(side_effect=scan_iter)
+
+    keys = await RedisStateClient(redis_mock).scan("agg:event:*")
+
+    assert keys == ["agg:event:HKEX:00700:EARNINGS", "agg:event:HKEX:00005:MA"]
+    redis_mock.scan_iter.assert_called_once_with(match="agg:event:*")
+
+
 async def multi_exec_success(redis_mock):
     pipe = MagicMock()
     pipe.execute = AsyncMock(return_value=[1, True])

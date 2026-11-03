@@ -94,6 +94,7 @@ def infra():
     create_llm = MagicMock(return_value=llm_adapter)
     create_news = MagicMock()
     create_repository = MagicMock()
+    create_event_repository = MagicMock()
     create_service = MagicMock()
 
     def _consume_until_cancelled(name: str):
@@ -125,6 +126,7 @@ def infra():
     calls.attach_mock(create_llm, "create_llm_adapter")
     calls.attach_mock(create_news, "create_news_client")
     calls.attach_mock(create_repository, "create_entity_event_repository")
+    calls.attach_mock(create_event_repository, "create_event_repository")
     calls.attach_mock(create_service, "create_entity_analysis_service")
     calls.attach_mock(worker_pool_cls, "WorkerPool")
     calls.attach_mock(consumer_cls, "CleanedNewsConsumer")
@@ -141,6 +143,7 @@ def infra():
         mock.patch.object(main_module, "create_llm_adapter", create_llm),
         mock.patch.object(main_module, "create_news_client", create_news),
         mock.patch.object(main_module, "create_entity_event_repository", create_repository),
+        mock.patch.object(main_module, "create_event_repository", create_event_repository),
         mock.patch.object(main_module, "create_entity_analysis_service", create_service),
         mock.patch.object(main_module, "WorkerPool", worker_pool_cls),
         mock.patch.object(main_module, "CleanedNewsConsumer", consumer_cls),
@@ -163,6 +166,7 @@ STARTUP_CALLS = [
     "create_llm_adapter",
     "create_news_client",
     "create_entity_event_repository",
+    "create_event_repository",
     "create_event_aggregation_store",
     "refresh_hk_stock_list",
     "WorkerPool",
@@ -200,6 +204,7 @@ async def lifespan(infra):
             infra.create_http_client.return_value, CONFIG.entity_analysis.sadi_api_url
         )
         infra.create_entity_event_repository.assert_called_once_with()
+        infra.create_event_repository.assert_called_once_with()
         infra.refresh_hk_stock_list.assert_awaited_once_with()
         infra.create_entity_analysis_service.assert_called_once_with(CONFIG.entity_analysis)
         infra.WorkerPool.assert_called_once_with("entity_analysis", 3, 60)
@@ -208,7 +213,9 @@ async def lifespan(infra):
         )
         infra.create_event_aggregation_store.assert_called_once_with()
         infra.create_aggregation_service.assert_called_once_with(CONFIG.aggregation)
-        infra.AggregationConsumer.assert_called_once_with(CONFIG.aggregation, CONFIG.redis)
+        infra.AggregationConsumer.assert_called_once_with(
+            CONFIG.aggregation, CONFIG.redis, CONFIG.db
+        )
 
         layer_tasks = layer_tasks_module.get_layer_tasks()
         assert set(layer_tasks) == {"entity_analysis", "aggregation"}

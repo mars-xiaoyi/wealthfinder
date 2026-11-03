@@ -74,6 +74,14 @@ class TransactionConnection:
     def __init__(self, conn: PoolConnectionProxy) -> None:
         self._conn = conn
 
+    async def execute(self, query: str, *args: object) -> None:
+        """
+        Execute a write statement.
+        Raises ServiceUnavailableError, UniqueConstraintError or DatabaseError.
+        """
+        with _translated_errors():
+            await self._conn.execute(query, *args)
+
     async def execute_returning(self, query: str, *args: object) -> asyncpg.Record | None:
         """
         Execute a write statement with a RETURNING clause and return its first row, or None if
@@ -95,6 +103,18 @@ class DatabaseClient:
     def __init__(self, pool: asyncpg.Pool, config: DatabaseConfig) -> None:
         self._pool = pool
         self._config = config
+
+    async def execute(self, query: str, *args: object) -> None:
+        """
+        Execute a write statement, retrying it while the failure is transient.
+        Raises ServiceUnavailableError, UniqueConstraintError or DatabaseError.
+        """
+
+        async def write() -> None:
+            async with self._pool.acquire() as conn:
+                await conn.execute(query, *args)
+
+        await _db_write_with_retry(self._config, write)
 
     async def fetch_one(self, query: str, *args: object) -> asyncpg.Record | None:
         """

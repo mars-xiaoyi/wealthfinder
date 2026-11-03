@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 from unittest import mock
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -11,7 +12,7 @@ from app.aggregation.aggregation_consumer import AggregationConsumer
 from app.aggregation.aggregation_service import AggregationService
 from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
-from app.config import AggregationConfig, RedisConfig
+from app.config import AggregationConfig, DatabaseConfig, RedisConfig
 from app.db.errors import DatabaseError
 from app.redis import stream_client as stream_client_module
 from app.redis.stream_client import RedisStreamClient, StreamMessage
@@ -34,6 +35,13 @@ REDIS_CONFIG = RedisConfig(
     state_url="redis://localhost/1",
     reconnect_interval_s=3,
     stream_claim_timeout_ms=1500,
+)
+DB_CONFIG = DatabaseConfig(
+    url="postgresql://user:pass@localhost/sapi",
+    pool_size=10,
+    close_timeout_s=1,
+    max_retry=3,
+    retry_base_wait_ms=100,
 )
 ID_A = UUID("00000000-0000-0000-0000-00000000000a")
 ID_B = UUID("00000000-0000-0000-0000-00000000000b")
@@ -65,7 +73,9 @@ def service(monkeypatch):
     return aggregation_service
 
 
-async def _run(redis_stream: AsyncMock, batches: list[object]) -> AsyncMock:
+async def _run(
+    redis_stream: AsyncMock, batches: list[object], config: AggregationConfig = CONFIG
+) -> AsyncMock:
     """Run start() over the given read_from() results (a list of messages, an exception to
     raise, or an async callable returning either), stopping by cancellation on the next read.
     Returns the patched asyncio.sleep, so its awaits can be checked."""
@@ -84,7 +94,7 @@ async def _run(redis_stream: AsyncMock, batches: list[object]) -> AsyncMock:
         mock.patch("asyncio.sleep", new=AsyncMock()) as sleep,
         pytest.raises(asyncio.CancelledError),
     ):
-        await AggregationConsumer(CONFIG, REDIS_CONFIG).start()
+        await AggregationConsumer(config, REDIS_CONFIG, DB_CONFIG).start()
     return sleep
 
 
@@ -233,3 +243,92 @@ async def start_redis_unreachable_on_ack(redis_stream, service):
     assert sleep.await_args_list == [mock.call(REDIS_CONFIG.reconnect_interval_s)]
     assert _processed_ids(service) == [ID_A, ID_A]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A), _ack_call(MESSAGE_A2)]
+
+
+async def start_flushes_when_drained(redis_stream, service):
+    """The active Events are flushed each time a read finds the stream drained, and once more
+    when consuming stops."""
+    counts: list[int] = []
+
+    async def drained() -> list[StreamMessage]:
+        counts.append(service.flush.await_count)
+        return []
+
+    async def after_drained() -> list[StreamMessage]:
+        counts.append(service.flush.await_count)
+        return [MESSAGE_B]
+
+    await _run(redis_stream, [[MESSAGE_A], drained, after_drained])
+
+    assert counts == [0, 1]
+    assert service.flush.await_count == 2
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A), _ack_call(MESSAGE_B)]
+
+
+async def start_flushes_on_interval(redis_stream, service):
+    """Under steady input the active Events are still flushed once the flush interval has
+    passed."""
+    config = dataclasses.replace(CONFIG, db_flush_interval_s=0)
+
+    await _run(redis_stream, [[MESSAGE_A], [MESSAGE_B]], config)
+
+    # One flush after each batch, plus the one when consuming stops.
+    assert service.flush.await_count == 3
+
+
+async def start_flushes_when_stopped(redis_stream, service):
+    """Stopping the consumer flushes the active Events once more."""
+    await _run(redis_stream, [[MESSAGE_A]])
+
+    service.flush.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            ServiceUnavailableError("DB connection error", category=ErrorCategory.DB),
+            id="database_unreachable",
+        ),
+        pytest.param(DatabaseError("DB error", category=ErrorCategory.DB), id="database"),
+        pytest.param(redis.exceptions.ConnectionError("down"), id="state_redis_unreachable"),
+    ],
+)
+async def start_flush_failed(redis_stream, service, error):
+    """A failed flush doesn't stop consuming; the next flush is tried as usual."""
+    service.flush.side_effect = [error, None, None]
+
+    sleep = await _run(redis_stream, [[], [MESSAGE_A], []])
+
+    assert service.flush.await_count == 3
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A)]
+    sleep.assert_not_awaited()
+
+
+async def start_final_flush_failed(redis_stream, service):
+    """A failure of the flush when consuming stops is not raised in place of the stop."""
+    service.flush.side_effect = DatabaseError("DB error", category=ErrorCategory.DB)
+
+    await _run(redis_stream, [[MESSAGE_A]])
+
+    service.flush.assert_awaited_once_with()
+
+
+async def start_final_flush_timed_out(redis_stream, service):
+    """A flush that hangs when consuming stops is abandoned after the final flush timeout, so
+    stopping completes."""
+    abandoned = asyncio.Event()
+
+    async def hang() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            abandoned.set()
+            raise
+
+    service.flush.side_effect = hang
+
+    await _run(redis_stream, [[MESSAGE_A]])
+
+    assert abandoned.is_set()
+    service.flush.assert_awaited_once_with()
