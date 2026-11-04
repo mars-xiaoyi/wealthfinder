@@ -510,16 +510,16 @@ This document does not introduce new design — every ticket below implements so
 - `app/persistent/event_repository.py`: `fetch_event()` (§10.2).
 - `app/persistent/entity_event_repository.py`: `fetch_entity_events_for_event()` (§10.1).
 - `app/scoring/scoring_service.py`: `ScoringService` + singleton — `score_event()` step 1's fetches and its missing-Event return only (§13.1).
-- `app/scoring/scoring_consumer.py`: `ScoringConsumer` with one consumer loop calling `_process_one()` directly — `_in_process` guard and the three-tier `try`/`except` (§13.2).
+- `app/scoring/scoring_consumer.py`: `ScoringConsumer` with one consumer loop calling `_process_one()` directly, and its three-tier `try`/`except` (§13.2).
 - `app/main.py`: `create_scoring_service()`, the consumer started as a plain `layer_tasks` Task (§16).
 **Acceptance criteria** (per impl.md §13.1, §13.2, §13.6):
 - An Event in `events` is loaded with its constituent EntityEvents, and the message is ACKed.
 - A missing Event logs `scoring_event_missing` and ACKs.
-- An Event already in `_in_process` is skipped and left un-ACKed; any other exception logs ERROR `Unhandled exception: …` and leaves it un-ACKed.
+- A `SAPIError` is logged at its own level and any other exception logs ERROR `Unhandled exception: …`; either leaves the message un-ACKed.
 - Unit-tested with fake repositories.
 - Integration pass against real Postgres and Redis: seed an Event via Aggregation's tables, publish `stream:event_aggregated` directly, check the message is ACKed.
 **Docs:** impl.md §4.1, §10.1, §10.2, §13.1, §13.2, §13.6, §16; design.md §5.2.
-**Explicitly deferred:** scoring and `event_scores`; reclaim/dead-letter and the `v` check; `WorkerPool`/backoff; layer monitoring.
+**Explicitly deferred:** scoring and `event_scores`; reclaim/dead-letter, the `v` check and the `_in_process` guard; `WorkerPool`/backoff; layer monitoring.
 **PM note:** meanwhile a message is ACKed after loading, unscored — the same as Entity Analysis: Consume Cleaned News & Fetch Article ACKing after its fetch. Nothing consumes scores yet.
 
 ---
@@ -662,10 +662,12 @@ This document does not introduce new design — every ticket below implements so
 - `app/config.py`: `ScoringConfig.max_retry`.
 - `ScoringConsumer`: `start()` runs both loops in one `asyncio.TaskGroup`; `_reclaim_loop()` dead-letters to `stream:scoring_dead_letter` at `SCORING_MAX_RETRY` and otherwise calls the same `_process_one()`; each sweep wrapped in `except Exception` → `scoring_reclaim_sweep_failed`.
 - The message shape check (`v` and `event_id`) immediately after `read_from()`/`autoclaim()`, each message handled in isolation (§6.1).
+- `ScoringConsumer._process_one()`: the `_in_process` guard (§13.2), shared by both loops.
 **Acceptance criteria** (per impl.md §6.1, §13.2):
 - An un-ACKed message (LLM failure, skipped in-flight duplicate) is reclaimed after `STREAM_CLAIM_TIMEOUT_MS` and scored.
 - At `delivery_count >= SCORING_MAX_RETRY`, dead-lettered with §6.1's payload and ACKed, unprocessed.
 - A message whose `v` is missing or unrecognised, or whose `event_id` is missing or not a valid UUID, on either path, is dead-lettered (`delivery_count="1"` on the `read_from()` path) and ACKed; every other message in its batch is still processed normally.
+- An Event already in `_in_process` is skipped and left un-ACKed.
 - A failing sweep logs a warning and the loop continues.
 - Unit-tested against mocked Redis.
 - Integration pass against real Redis/Postgres: a message that fails once is retried and scored; one that keeps failing reaches the dead-letter stream.

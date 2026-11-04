@@ -545,8 +545,8 @@ class EventTypeScore:
 ```python
 @dataclass
 class ScoringConfig:
-    batch_size: int                        # env: SCORING_BATCH_SIZE
-    batch_timeout_ms: int                  # env: SCORING_BATCH_TIMEOUT_MS
+    batch_size: int                        # env: SCORING_BATCH_SIZE (default 10)
+    batch_timeout_ms: int                  # env: SCORING_BATCH_TIMEOUT_MS (default 5000)
     max_concurrent: int                    # env: SCORING_MAX_CONCURRENT
     max_retry: int                         # env: SCORING_MAX_RETRY
     source_config_ttl_s: int               # env: SOURCE_CONFIG_TTL_S
@@ -4494,7 +4494,7 @@ Owns `stream:event_aggregated` consumption (loops, in-flight guard, `WorkerPool`
 
 ```python
 class ScoringConsumer:
-    def __init__(self, worker_pool: WorkerPool, config: ScoringConfig):
+    def __init__(self, worker_pool: WorkerPool, config: ScoringConfig, redis_config: RedisConfig):
         self._service = get_scoring_service()               # §13.1
         self._redis_stream = get_redis_stream_client()      # §6.1 — consumes, reclaims, ACKs
         self._worker_pool = worker_pool
@@ -5278,10 +5278,11 @@ CACHE_UNAVAILABLE = "SAPI-5001"            # Morning Brief cache has no current 
 
 #### `app/common/error_categories.py` — Error Categories
 
-The part of SAPI an error was raised from. Every raise site sets one, by where the raising code lives: anything under `app/common/` uses `COMMON`, except the HK Stock List (§4.2), which has its own; other packages use their own member (`app/config.py` → `CONFIG`, `app/db/` → `DB`, `app/entity_analysis/` → `ENTITY_ANALYSIS`, `app/llm/` → `LLM`, `app/clients/news_client.py` → `NEWS_CLIENT`, `app/redis/` → `REDIS`). Each ticket adds the members it first uses. Raise-site samples elsewhere in this doc leave `category` out; every real raise site passes one.
+The part of SAPI an error was raised from. Every raise site sets one, by where the raising code lives: anything under `app/common/` uses `COMMON`, except the HK Stock List (§4.2), which has its own; other packages use their own member (`app/aggregation/` → `AGGREGATION`, `app/config.py` → `CONFIG`, `app/db/` → `DB`, `app/entity_analysis/` → `ENTITY_ANALYSIS`, `app/llm/` → `LLM`, `app/clients/news_client.py` → `NEWS_CLIENT`, `app/redis/` → `REDIS`, `app/scoring/` → `SCORING`). Each ticket adds the members it first uses. Raise-site samples elsewhere in this doc leave `category` out; every real raise site passes one.
 
 ```python
 class ErrorCategory(StrEnum):
+    AGGREGATION = "AGGREGATION"
     COMMON = "COMMON"
     CONFIG = "CONFIG"
     DB = "DB"
@@ -5289,6 +5290,7 @@ class ErrorCategory(StrEnum):
     LLM = "LLM"
     NEWS_CLIENT = "NEWS_CLIENT"
     REDIS = "REDIS"
+    SCORING = "SCORING"
     STOCK_LIST = "STOCK_LIST"
 ```
 
@@ -5624,7 +5626,7 @@ async def lifespan(app: FastAPI):
         resources.push_async_callback(aggregation_service.close)   # group Tasks outlive the layer Task (§12.1)
         agg_consumer = AggregationConsumer(config.aggregation, config.redis, config.db)
         create_scoring_service(config.scoring)
-        scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring)
+        scoring_consumer = ScoringConsumer(scoring_worker_pool, config.scoring, config.redis)
         cache_service = create_cache_service(config.cache)
 
         # Eager, BLOCKING initial cache build before CacheConsumer's Task exists (both write through the
