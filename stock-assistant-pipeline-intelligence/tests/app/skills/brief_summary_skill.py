@@ -175,10 +175,24 @@ async def run_success(adapter):
 async def run_no_secondary_type(adapter, event_type_secondary):
     _answer(adapter, SUMMARY.model_copy())
 
-    await _run([_entity_event("HKEX", "騰訊公布業績。")], _event(event_type_secondary))
+    result = await _run([_entity_event("HKEX", "騰訊公布業績。")], _event(event_type_secondary))
 
+    assert result == BriefSummaryResult(
+        output=SUMMARY,
+        skill_log=_skill_log(result, InputSummary(1, 7, truncated_by_source_cap=False)),
+    )
     messages = adapter.generate_structured.await_args.args[0]
-    assert "次要事件類型：無\n" in messages[1].content  # noqa: RUF001
+    assert messages[1] == Message(
+        Role.USER,
+        "【實體信息】\n"
+        "股票代碼：00700\n"  # noqa: RUF001
+        "公司名稱：騰訊控股\n"  # noqa: RUF001
+        "主要事件類型：EARNINGS\n"  # noqa: RUF001
+        "次要事件類型：無\n"  # noqa: RUF001
+        "\n"
+        "【各文章實體摘要】\n"
+        "- [HKEX] 騰訊公布業績。",
+    )
 
 
 async def run_selects_articles(adapter):
@@ -199,18 +213,26 @@ async def run_selects_articles(adapter):
         ]
     )
 
+    assert result == BriefSummaryResult(
+        output=SUMMARY,
+        skill_log=_skill_log(result, InputSummary(6, 23, truncated_by_source_cap=True)),
+    )
     messages = adapter.generate_structured.await_args.args[0]
-    assert messages[1].content.endswith(
+    assert messages[1] == Message(
+        Role.USER,
+        "【實體信息】\n"
+        "股票代碼：00700\n"  # noqa: RUF001
+        "公司名稱：騰訊控股\n"  # noqa: RUF001
+        "主要事件類型：EARNINGS\n"  # noqa: RUF001
+        "次要事件類型：無\n"  # noqa: RUF001
+        "\n"
         "【各文章實體摘要】\n"
         "- [HKEX] 交易所4\n"
         "- [HKEX] 交易所3\n"
         "- [HKEX] 交易所2\n"
         "- [AASTOCKS] 阿思達克1\n"
         "- [MINGPAO] 明報1\n"
-        "- [UNKNOWN] 未知1"
-    )
-    assert result.skill_log.input_summary == InputSummary(
-        entity_summary_count=6, entity_summary_total_chars=23, truncated_by_source_cap=True
+        "- [UNKNOWN] 未知1",
     )
 
 

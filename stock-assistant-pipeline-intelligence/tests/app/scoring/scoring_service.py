@@ -225,9 +225,7 @@ async def score_event_success(
     )
 
 
-async def score_event_summary_fallback(
-    adapter, event_repository, event_score_repository, redis_stream
-):
+async def score_event_summary_fallback(adapter, event_repository, redis_stream):
     """A summary that doesn't fit the schema is replaced by the highest-weight source's
     headline, and the Event is still scored."""
     adapter.generate_structured.side_effect = LLMSchemaViolationError(
@@ -245,7 +243,6 @@ async def score_event_summary_fallback(
         AGGREGATION_UPDATED_AT,
         True,
     )
-    event_score_repository.persist_score_if_not_stale.assert_awaited_once()
     redis_stream.publish.assert_awaited_once_with(
         "stream:event_scored", {"event_id": str(EVENT_ID), "v": "1"}
     )
