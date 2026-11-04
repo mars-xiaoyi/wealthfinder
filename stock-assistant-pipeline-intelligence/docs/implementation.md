@@ -4643,12 +4643,18 @@ The caller computes `SentimentAggregation` once (§13.1 step 3) and passes it to
 
 ### 13.4 Score Fusion and Stale-Data Detection — `app/scoring/scoring_service.py`
 
-#### Function: `_score_fusion(rule_score: RuleScore, llm_score: LLMScore, sentiment_agg: SentimentAggregation) -> tuple[int, float, float]`
+#### Function: `_score_fusion(rule_score: RuleScore, llm_score: LLMScore, sentiment_agg: SentimentAggregation) -> _FusedScore`
 
 Design rationale (direction derivation, persistence): system-design.md §5.7.
 
 ```python
-def _score_fusion(rule_score, llm_score, sentiment_agg) -> tuple[int, float, float]:
+@dataclass
+class _FusedScore:   # private to scoring_service.py
+    direction: int   # 1 or -1
+    base_rule_score: float
+    abs_final_score: float
+
+def _score_fusion(rule_score, llm_score, sentiment_agg) -> _FusedScore:
     if llm_score.stock_impact_score > 0:
         direction = 1
     elif llm_score.stock_impact_score < 0:
@@ -4660,7 +4666,7 @@ def _score_fusion(rule_score, llm_score, sentiment_agg) -> tuple[int, float, flo
     signed_rule_score = base_rule_score * direction
     raw_final_score = signed_rule_score * 0.67 + llm_score.stock_impact_score * 0.33 * 2
     abs_final_score = abs(raw_final_score)
-    return direction, base_rule_score, abs_final_score
+    return _FusedScore(direction, base_rule_score, abs_final_score)
 ```
 
 > `base_rule_score` returned here is the **stored** (recency-excluded, unsigned) value written to `event_scores.base_rule_score` — not the signed, recency-inclusive value the Cache Layer exposes in the API response (§6.6/§14.3). Do not conflate the two; they share a name across sections of the system-design doc but are computed at different pipeline stages.
