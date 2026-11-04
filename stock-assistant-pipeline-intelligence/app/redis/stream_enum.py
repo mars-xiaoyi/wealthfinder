@@ -42,3 +42,9 @@ class AggregationDeadLetterStream:
     """The stream of messages the Aggregation layer could not process."""
 
     NAME: Final = "stream:aggregation_dead_letter"
+
+
+class ScoringDeadLetterStream:
+    """The stream of messages the Scoring layer could not process."""
+
+    NAME: Final = "stream:scoring_dead_letter"

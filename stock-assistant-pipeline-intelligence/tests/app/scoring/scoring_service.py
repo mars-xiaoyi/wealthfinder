@@ -25,6 +25,7 @@ from app.scoring.scoring_service import ScoringService
 CONFIG = ScoringConfig(
     batch_size=5,
     batch_timeout_ms=200,
+    max_retry=3,
     consumer_name="pod-1",
     total_active_sources_default=4,
     event_type_score=[
