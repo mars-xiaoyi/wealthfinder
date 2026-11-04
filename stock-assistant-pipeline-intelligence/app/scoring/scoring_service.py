@@ -1,3 +1,5 @@
+import asyncio
+import dataclasses
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,6 +23,7 @@ from app.scoring.rule_score import (
     count_active_sources,
     get_source_weights,
 )
+from app.skills.brief_summary_skill import BriefSummaryInput, BriefSummarySkill
 
 logger = get_logger(__name__)
 
@@ -64,9 +67,10 @@ class ScoringService:
 
     async def score_event(self, event_id: UUID) -> None:
         """
-        Score the stored Event with this id and announce its new score. An Event no longer
-        stored is skipped, and so is one re-aggregated since it was read.
-        Raises ServiceUnavailableError or DatabaseError.
+        Summarize and score the stored Event with this id, and announce its new score. An
+        Event no longer stored is skipped, and so is one re-aggregated since it was read.
+        Raises an LLMError subclass (e.g. LLMRateLimitError), ServiceUnavailableError or
+        DatabaseError.
         """
         event = await self._event_repo.fetch_event(event_id)
         if event is None:
@@ -81,12 +85,32 @@ class ScoringService:
         source_weights = await get_source_weights(
             [source.source_name for source in event.source_list]
         )
+        brief_task = asyncio.create_task(
+            BriefSummarySkill(
+                BriefSummaryInput(event, constituent_entity_events, source_weights)
+            ).run()
+        )
 
         total_active_sources = await count_active_sources(self._config)
         sentiment_agg = compute_sentiment_aggregation(constituent_entity_events, source_weights)
         rule_score_detail = compute_rule_score(
             event, sentiment_agg, source_weights, total_active_sources, self._config
         )
+
+        brief_result = await brief_task
+        brief_log = dataclasses.asdict(brief_result.skill_log) | {"event_id": str(event_id)}
+        if brief_result.failure_reason is not None:
+            logger.info("brief_summary_completed", **brief_log)
+            raise brief_result.failure_reason
+        # Set whenever failure_reason is not.
+        assert brief_result.output is not None
+        await self._event_repo.update_brief_summary(
+            event_id,
+            VersionedMetadata(brief_result.skill_log.skill_version, brief_result.output),
+            expected,
+            brief_result.skill_log.fallback,
+        )
+        logger.info("brief_summary_completed", **brief_log)
 
         llm_score_detail = _LLM_SCORE_PLACEHOLDER
         scored_at = datetime.now(UTC)

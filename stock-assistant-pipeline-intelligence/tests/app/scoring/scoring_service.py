@@ -4,11 +4,21 @@ from uuid import UUID
 
 import pytest
 
+from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 from app.common.stock import Stock
 from app.config import EventTypeScore, ScoringConfig
+from app.llm import vertex_adapter as vertex_adapter_module
+from app.llm.adapter import LLMAdapter, StructuredLLMResponse
+from app.llm.errors import (
+    LLMAuthenticationError,
+    LLMProviderError,
+    LLMRateLimitError,
+    LLMRequestError,
+    LLMSchemaViolationError,
+)
 from app.models.entity_event import AnalysisOutcome, EntityEvent, EventTypeEnum, SentimentEnum
-from app.models.event import EntitySource, Event
+from app.models.event import BriefSummary, EntitySource, Event
 from app.models.event_score import EventScore, LLMScore, RuleScore
 from app.models.versioned_metadata import VersionedMetadata
 from app.persistent import entity_event_repository as entity_event_repository_module
@@ -42,6 +52,11 @@ EVENT_ID = UUID("00000000-0000-0000-0000-0000000000e1")
 SEEN_AT = datetime(2026, 9, 8, 1, 0, tzinfo=UTC)
 AGGREGATION_UPDATED_AT = datetime(2026, 9, 8, 3, 0, 5, tzinfo=UTC)
 TENCENT = Stock("00700", "HKEX", "騰訊控股", "TENCENT")
+SUMMARY = BriefSummary(
+    summary_short="騰訊業績超預期",
+    summary_full="騰訊季度收入按年增長，盈利勝預期。",  # noqa: RUF001
+    key_numbers=["收入增長 12%"],
+)
 
 
 def _event() -> Event:
@@ -79,7 +94,7 @@ def _entity_event(
                 event_type_secondary=None,
                 sentiment_label=sentiment_label,
                 sentiment_score=sentiment_score,
-                headline="騰訊業績",
+                headline=f"{source_name}標題",
                 entity_summary="騰訊公布季度業績。",
             ),
         ),
@@ -127,6 +142,17 @@ def redis_stream(monkeypatch):
     client = AsyncMock(spec=RedisStreamClient)
     monkeypatch.setattr(stream_client_module, "_redis_stream_client", client)
     return client
+
+
+@pytest.fixture(autouse=True)
+def adapter(monkeypatch):
+    """An LLM adapter answering with SUMMARY, unless a test says otherwise."""
+    llm_adapter = AsyncMock(spec=LLMAdapter)
+    llm_adapter.generate_structured.return_value = StructuredLLMResponse(
+        output=SUMMARY.model_copy(), input_tokens=800, output_tokens=120, latency_ms=700
+    )
+    monkeypatch.setattr(vertex_adapter_module, "_llm_adapter", llm_adapter)
+    return llm_adapter
 
 
 @pytest.mark.parametrize(
@@ -194,6 +220,60 @@ async def score_event_success(
     redis_stream.publish.assert_awaited_once_with(
         "stream:event_scored", {"event_id": str(EVENT_ID), "v": "1"}
     )
+    event_repository.update_brief_summary.assert_awaited_once_with(
+        EVENT_ID, VersionedMetadata("v1.0.0", SUMMARY), AGGREGATION_UPDATED_AT, False
+    )
+
+
+async def score_event_summary_fallback(
+    adapter, event_repository, event_score_repository, redis_stream
+):
+    """A summary that doesn't fit the schema is replaced by the highest-weight source's
+    headline, and the Event is still scored."""
+    adapter.generate_structured.side_effect = LLMSchemaViolationError(
+        "bad json", category=ErrorCategory.LLM
+    )
+
+    await ScoringService(CONFIG).score_event(EVENT_ID)
+
+    event_repository.update_brief_summary.assert_awaited_once_with(
+        EVENT_ID,
+        VersionedMetadata(
+            "v1.0.0",
+            BriefSummary(summary_short="HKEX標題", summary_full="HKEX標題", key_numbers=[]),
+        ),
+        AGGREGATION_UPDATED_AT,
+        True,
+    )
+    event_score_repository.persist_score_if_not_stale.assert_awaited_once()
+    redis_stream.publish.assert_awaited_once_with(
+        "stream:event_scored", {"event_id": str(EVENT_ID), "v": "1"}
+    )
+
+
+@pytest.mark.parametrize(
+    "error_cls",
+    [
+        pytest.param(LLMRateLimitError, id="rate_limited"),
+        pytest.param(LLMProviderError, id="provider_error"),
+        pytest.param(LLMRequestError, id="request_rejected"),
+        pytest.param(LLMAuthenticationError, id="authentication_failure"),
+    ],
+)
+async def score_event_summary_failed(
+    adapter, event_repository, event_score_repository, redis_stream, error_cls
+):
+    """A failed summary is raised, and nothing is stored or announced."""
+    error = error_cls("call failed", category=ErrorCategory.LLM)
+    adapter.generate_structured.side_effect = error
+
+    with pytest.raises(error_cls) as exc_info:
+        await ScoringService(CONFIG).score_event(EVENT_ID)
+
+    assert exc_info.value is error
+    event_repository.update_brief_summary.assert_not_awaited()
+    event_score_repository.persist_score_if_not_stale.assert_not_awaited()
+    redis_stream.publish.assert_not_awaited()
 
 
 async def score_event_stale(event_score_repository, redis_stream):
@@ -210,7 +290,7 @@ async def score_event_stale(event_score_repository, redis_stream):
 
 
 async def score_event_missing(
-    event_repository, entity_event_repository, event_score_repository, redis_stream
+    adapter, event_repository, entity_event_repository, event_score_repository, redis_stream
 ):
     """An Event no longer stored is skipped without loading or writing anything else."""
     event_repository.fetch_event.return_value = None
@@ -219,6 +299,8 @@ async def score_event_missing(
 
     event_repository.fetch_event.assert_awaited_once_with(EVENT_ID)
     entity_event_repository.fetch_entity_events_for_event.assert_not_awaited()
+    adapter.generate_structured.assert_not_awaited()
+    event_repository.update_brief_summary.assert_not_awaited()
     event_score_repository.persist_score_if_not_stale.assert_not_awaited()
     redis_stream.publish.assert_not_awaited()
 
