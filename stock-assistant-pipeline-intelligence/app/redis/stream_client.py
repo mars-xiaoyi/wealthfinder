@@ -1,5 +1,9 @@
 import asyncio
+import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Final
 
 import redis.asyncio
 import redis.exceptions
@@ -12,6 +16,9 @@ from app.logger import get_logger
 logger = get_logger(__name__)
 
 _REDIS_UNREACHABLE = (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
+
+# The message format of every dead-letter stream.
+_DEAD_LETTER_VERSION: Final = "1"
 
 
 @dataclass
@@ -28,6 +35,11 @@ class ReclaimedMessage(StreamMessage):
     delivered, this claim included."""
 
     delivery_count: int
+
+
+class DeadLetterReason(StrEnum):
+    RETRIES_EXHAUSTED = "retries_exhausted"
+    MALFORMED = "malformed"
 
 
 class RedisStreamClient:
@@ -117,6 +129,38 @@ class RedisStreamClient:
             for message, pending_entries in zip(claimed, pending, strict=True)
             if pending_entries
         ]
+
+    async def dead_letter(
+        self,
+        message: StreamMessage,
+        stream: str,
+        group: str,
+        dead_letter_stream: str,
+        reason: DeadLetterReason,
+    ) -> None:
+        """
+        Move a message of a consumer group to a dead-letter stream.
+        Raises redis.ConnectionError / redis.TimeoutError.
+        """
+        delivery_count = message.delivery_count if isinstance(message, ReclaimedMessage) else 1
+        await self.publish(
+            dead_letter_stream,
+            {
+                "message_id": message.id,
+                "fields": json.dumps(message.fields),
+                "delivery_count": str(delivery_count),
+                "failed_at": datetime.now(UTC).isoformat(),
+                "v": _DEAD_LETTER_VERSION,
+            },
+        )
+        await self.ack(stream, group, message.id)
+        logger.warning(
+            "message_dead_lettered",
+            dead_letter_stream=dead_letter_stream,
+            message_id=message.id,
+            delivery_count=delivery_count,
+            reason=reason,
+        )
 
     async def ping(self) -> None:
         """

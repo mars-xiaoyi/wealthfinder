@@ -1,8 +1,6 @@
 import asyncio
-import json
 import time
 from collections.abc import Sequence
-from datetime import UTC, datetime
 from uuid import UUID
 
 import redis.exceptions
@@ -14,7 +12,12 @@ from app.entity_analysis.entity_analysis_service import get_entity_analysis_serv
 from app.entity_analysis.worker_pool import WorkerPool
 from app.llm.errors import LLMRateLimitError
 from app.logger import get_logger
-from app.redis.stream_client import ReclaimedMessage, StreamMessage, get_redis_stream_client
+from app.redis.stream_client import (
+    DeadLetterReason,
+    ReclaimedMessage,
+    StreamMessage,
+    get_redis_stream_client,
+)
 from app.redis.stream_enum import EntityAnalysisDeadLetterStream, RawNewsCleanedStream
 
 logger = get_logger(__name__)
@@ -30,10 +33,6 @@ def _get_valid_cleaned_id(message: StreamMessage) -> UUID | None:
         return UUID(message.fields["cleaned_id"])
     except (KeyError, ValueError):
         return None
-
-
-def _get_delivery_count(message: StreamMessage) -> int:
-    return message.delivery_count if isinstance(message, ReclaimedMessage) else 1
 
 
 class CleanedNewsConsumer:
@@ -131,11 +130,11 @@ class CleanedNewsConsumer:
                 isinstance(message, ReclaimedMessage)
                 and message.delivery_count >= self._config.max_retry
             ):
-                await self._push_dead_letter(message, reason="retries_exhausted")
+                await self._push_dead_letter(message, DeadLetterReason.RETRIES_EXHAUSTED)
                 return
             cleaned_id = _get_valid_cleaned_id(message)
             if cleaned_id is None:
-                await self._push_dead_letter(message, reason="malformed")
+                await self._push_dead_letter(message, DeadLetterReason.MALFORMED)
                 return
             await self._process_one(cleaned_id, message.id)
         except _REDIS_UNREACHABLE:
@@ -145,27 +144,14 @@ class CleanedNewsConsumer:
                 "entity_analysis_message_handling_failed", message_id=message.id, exc_info=True
             )
 
-    async def _push_dead_letter(self, message: StreamMessage, reason: str) -> None:
+    async def _push_dead_letter(self, message: StreamMessage, reason: DeadLetterReason) -> None:
         """Move the message to the dead-letter stream."""
-        delivery_count = _get_delivery_count(message)
-        await self._redis_stream.publish(
+        await self._redis_stream.dead_letter(
+            message,
+            RawNewsCleanedStream.NAME,
+            RawNewsCleanedStream.CONSUMER_GROUP,
             EntityAnalysisDeadLetterStream.NAME,
-            {
-                "message_id": message.id,
-                "fields": json.dumps(message.fields),
-                "delivery_count": str(delivery_count),
-                "failed_at": datetime.now(UTC).isoformat(),
-                "v": EntityAnalysisDeadLetterStream.VERSION,
-            },
-        )
-        await self._redis_stream.ack(
-            RawNewsCleanedStream.NAME, RawNewsCleanedStream.CONSUMER_GROUP, message.id
-        )
-        logger.warning(
-            "entity_analysis_message_dead_lettered",
-            message_id=message.id,
-            delivery_count=delivery_count,
-            reason=reason,
+            reason,
         )
 
     async def _process_one(self, cleaned_id: UUID, message_id: str) -> None:

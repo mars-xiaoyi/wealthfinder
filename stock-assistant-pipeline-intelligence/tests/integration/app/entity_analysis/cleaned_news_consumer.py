@@ -842,7 +842,7 @@ MANY_RETRIES_ENV = {**RECLAIM_ENV, "ENTITY_ANALYSIS_MAX_RETRY": "10"}
 CLAIM_TIMEOUT_S = 1.5
 # _wait_attempts() sees a failure up to one poll after it is logged.
 CLAIM_TIMING_SLACK_S = 2 * POLL_INTERVAL_S
-DEAD_LETTERED_EVENT = "entity_analysis_message_dead_lettered"
+DEAD_LETTERED_EVENT = "message_dead_lettered"
 SWEEP_FAILED_EVENT = "entity_analysis_reclaim_sweep_failed"
 
 
@@ -875,6 +875,7 @@ def _dead_lettered(logs: list[MutableMapping[str, Any]]) -> list[tuple[object, .
         (log["log_level"], log["message_id"], log["delivery_count"], log["reason"])
         for log in logs
         if log["event"] == DEAD_LETTERED_EVENT
+        and log["dead_letter_stream"] == "stream:entity_analysis_dead_letter"
     ]
 
 

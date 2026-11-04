@@ -55,6 +55,7 @@ def load_config_defaults():
     assert config.aggregation.max_concurrent == 100
     assert config.aggregation.group_idle_timeout_s == 10
     assert config.aggregation.db_flush_interval_s == 300
+    assert config.aggregation.max_retry == 3
     assert config.aggregation.sliding_window_hours == 4
     assert config.aggregation.event_max_timespan_hours == 24
     assert config.aggregation.consumer_name == "sapi-aggregation-1"
@@ -87,6 +88,7 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("AGG_MAX_CONCURRENT", "50")
     monkeypatch.setenv("AGG_GROUP_IDLE_TIMEOUT_S", "30")
     monkeypatch.setenv("AGG_DB_FLUSH_INTERVAL_S", "120")
+    monkeypatch.setenv("AGG_MAX_RETRY", "7")
 
     config = config_module.load_config()
 
@@ -116,6 +118,7 @@ def load_config_overrides(monkeypatch):
     assert config.aggregation.max_concurrent == 50
     assert config.aggregation.group_idle_timeout_s == 30
     assert config.aggregation.db_flush_interval_s == 120
+    assert config.aggregation.max_retry == 7
     assert config.aggregation.consumer_name == "sapi-pod-7"
 
 

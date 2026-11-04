@@ -1,3 +1,5 @@
+import json
+from datetime import UTC, datetime
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
@@ -7,7 +9,12 @@ import redis.exceptions
 
 from app.common.errors import ServiceUnavailableError
 from app.redis import stream_client as stream_client_module
-from app.redis.stream_client import ReclaimedMessage, RedisStreamClient, StreamMessage
+from app.redis.stream_client import (
+    DeadLetterReason,
+    ReclaimedMessage,
+    RedisStreamClient,
+    StreamMessage,
+)
 
 REDIS_URL = "redis://localhost:6379/0"
 STREAM = "stream:test"
@@ -186,6 +193,47 @@ async def autoclaim_nothing_pending(redis_mock):
 
     assert messages == []
     redis_mock.pipeline.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("message", "delivery_count"),
+    [
+        pytest.param(StreamMessage(id="1-0", fields={"cleaned_id": "a", "v": "1"}), "1", id="read"),
+        pytest.param(
+            ReclaimedMessage(id="1-0", fields={"cleaned_id": "a", "v": "1"}, delivery_count=3),
+            "3",
+            id="reclaimed",
+        ),
+    ],
+)
+async def dead_letter_success(redis_mock, message, delivery_count):
+    """The message is written to the dead-letter stream with its delivery count, then ACKed on
+    its own stream."""
+    start = datetime.now(UTC)
+
+    await RedisStreamClient(redis_mock, RECONNECT_INTERVAL_S).dead_letter(
+        message,
+        STREAM,
+        GROUP,
+        "stream:test_dead_letter",
+        DeadLetterReason.MALFORMED,
+    )
+
+    redis_mock.xadd.assert_awaited_once_with(
+        "stream:test_dead_letter",
+        {
+            "message_id": "1-0",
+            "fields": json.dumps({"cleaned_id": "a", "v": "1"}),
+            "delivery_count": delivery_count,
+            "failed_at": mock.ANY,
+            "v": "1",
+        },
+    )
+    failed_at = datetime.fromisoformat(redis_mock.xadd.await_args.args[1]["failed_at"])
+    assert failed_at.tzinfo == UTC
+    assert start <= failed_at <= datetime.now(UTC)
+    redis_mock.xack.assert_awaited_once_with(STREAM, GROUP, "1-0")
+    assert [name for name, _args, _kwargs in redis_mock.method_calls] == ["xadd", "xack"]
 
 
 async def ping(redis_mock):

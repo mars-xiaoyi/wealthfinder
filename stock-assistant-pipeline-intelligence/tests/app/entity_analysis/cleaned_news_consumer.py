@@ -1,6 +1,4 @@
 import asyncio
-import json
-from datetime import UTC, datetime
 from unittest import mock
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -157,25 +155,14 @@ def _ack_call(message: StreamMessage) -> object:
     return mock.call("stream:raw_news_cleaned", "sapi-entity-analysis", message.id)
 
 
-def _dead_letter_call(message: StreamMessage, delivery_count: int) -> object:
+def _dead_letter_call(message: StreamMessage, reason: str) -> object:
     return mock.call(
+        message,
+        "stream:raw_news_cleaned",
+        "sapi-entity-analysis",
         "stream:entity_analysis_dead_letter",
-        {
-            "message_id": message.id,
-            "fields": json.dumps(message.fields),
-            "delivery_count": str(delivery_count),
-            "failed_at": mock.ANY,
-            "v": "1",
-        },
+        reason,
     )
-
-
-def _assert_failed_at_between(redis_stream: AsyncMock, start: datetime) -> None:
-    """Every dead-letter entry's failed_at is a UTC ISO-8601 time from this test's run."""
-    for call in redis_stream.publish.await_args_list:
-        failed_at = datetime.fromisoformat(call.args[1]["failed_at"])
-        assert failed_at.tzinfo == UTC
-        assert start <= failed_at <= datetime.now(UTC)
 
 
 async def start_acks_analysed(redis_stream, service):
@@ -193,7 +180,7 @@ async def start_acks_analysed(redis_stream, service):
     assert sleep.await_args_list == [mock.call(CLAIM_SLEEP_S)] * 2
     assert service.find_entity_events.await_args_list == [mock.call(ID_A), mock.call(ID_B)]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A), _ack_call(MESSAGE_B)]
-    redis_stream.publish.assert_not_awaited()
+    redis_stream.dead_letter.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -240,7 +227,7 @@ async def start_failed_analysis_reclaimed(redis_stream, service, error, backoffs
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B), _ack_call(MESSAGE_A)]
     assert redis_stream.read_from.await_count == 3
     assert redis_stream.autoclaim.await_count == 2
-    redis_stream.publish.assert_not_awaited()
+    redis_stream.dead_letter.assert_not_awaited()
 
 
 @pytest.mark.parametrize("fields", MALFORMED_FIELDS)
@@ -249,9 +236,8 @@ async def start_failed_analysis_reclaimed(redis_stream, service, error, backoffs
     [pytest.param(False, id="read_path"), pytest.param(True, id="reclaim_path")],
 )
 async def start_malformed_message_dead_lettered(redis_stream, service, fields, reclaimed):
-    """A message this layer can never process is dead-lettered and ACKed without being
-    analysed, on either path; the rest of its batch is processed as normal."""
-    start = datetime.now(UTC)
+    """A message this layer can never process is dead-lettered without being analysed, on
+    either path; the rest of its batch is processed as normal."""
     if reclaimed:
         malformed: StreamMessage = ReclaimedMessage(id="9-0", fields=fields, delivery_count=2)
         await _run(redis_stream, [], [[malformed, RECLAIMED_B]])
@@ -259,30 +245,25 @@ async def start_malformed_message_dead_lettered(redis_stream, service, fields, r
         malformed = StreamMessage(id="9-0", fields=fields)
         await _run(redis_stream, [[malformed, MESSAGE_B]])
 
-    assert redis_stream.publish.await_args_list == [
-        _dead_letter_call(malformed, delivery_count=2 if reclaimed else 1)
-    ]
-    _assert_failed_at_between(redis_stream, start)
+    assert redis_stream.dead_letter.await_args_list == [_dead_letter_call(malformed, "malformed")]
     assert service.find_entity_events.await_args_list == [mock.call(ID_B)]
-    assert redis_stream.ack.await_args_list == [_ack_call(malformed), _ack_call(MESSAGE_B)]
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B)]
 
 
 async def start_reclaimed_retries_exhausted(redis_stream, service):
-    """A reclaimed message delivered max_retry times is dead-lettered and ACKed without being
-    analysed; one with deliveries left is analysed."""
-    start = datetime.now(UTC)
+    """A reclaimed message delivered max_retry times is dead-lettered without being analysed;
+    one with deliveries left is analysed."""
     exhausted = ReclaimedMessage(
         id=MESSAGE_A.id, fields=MESSAGE_A.fields, delivery_count=CONFIG.max_retry
     )
 
     await _run(redis_stream, [], [[exhausted, RECLAIMED_B]])
 
-    assert redis_stream.publish.await_args_list == [
-        _dead_letter_call(exhausted, delivery_count=CONFIG.max_retry)
+    assert redis_stream.dead_letter.await_args_list == [
+        _dead_letter_call(exhausted, "retries_exhausted")
     ]
-    _assert_failed_at_between(redis_stream, start)
     assert service.find_entity_events.await_args_list == [mock.call(ID_B)]
-    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A), _ack_call(MESSAGE_B)]
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B)]
 
 
 async def start_in_flight_duplicate_skipped(redis_stream, service):
@@ -374,12 +355,12 @@ async def start_cancelled(redis_stream, service):
 async def start_dead_letter_failure_isolated(redis_stream, service):
     """A message whose dead-lettering fails is left un-ACKed, and the rest of its batch is
     processed as normal."""
-    redis_stream.publish.side_effect = redis.exceptions.ResponseError("OOM")
+    redis_stream.dead_letter.side_effect = redis.exceptions.ResponseError("OOM")
     malformed = StreamMessage(id="9-0", fields={"v": "1"})
 
     await _run(redis_stream, [[malformed, MESSAGE_B], []])
 
-    assert redis_stream.publish.await_args_list == [_dead_letter_call(malformed, 1)]
+    assert redis_stream.dead_letter.await_args_list == [_dead_letter_call(malformed, "malformed")]
     assert service.find_entity_events.await_args_list == [mock.call(ID_B)]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B)]
     assert redis_stream.read_from.await_count == 3

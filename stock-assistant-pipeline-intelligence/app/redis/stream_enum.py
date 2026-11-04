@@ -28,4 +28,9 @@ class EntityAnalysisDeadLetterStream:
     """The stream of messages the Entity Analysis layer could not process."""
 
     NAME: Final = "stream:entity_analysis_dead_letter"
-    VERSION: Final = "1"
+
+
+class AggregationDeadLetterStream:
+    """The stream of messages the Aggregation layer could not process."""
+
+    NAME: Final = "stream:aggregation_dead_letter"
