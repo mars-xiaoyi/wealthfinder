@@ -1406,12 +1406,11 @@ Returns : List of ReclaimedMessage. delivery_count is the pending entry's times_
 Raises  : redis.ConnectionError / redis.TimeoutError, untranslated (Reconnect behaviour, below).
 ```
 
-#### Method: `dead_letter(message, stream, group, dead_letter_stream, reason, log_event) -> None`
+#### Method: `dead_letter(message, stream, group, dead_letter_stream, reason) -> None`
 
 ```python
 async def dead_letter(self, message: StreamMessage, stream: str, group: str,
-                      dead_letter_stream: str, reason: DeadLetterReason,
-                      log_event: str) -> None:
+                      dead_letter_stream: str, reason: DeadLetterReason) -> None:
     delivery_count = message.delivery_count if isinstance(message, ReclaimedMessage) else 1
     await self.publish(dead_letter_stream, {
         "message_id": message.id, "fields": json.dumps(message.fields),
@@ -1419,7 +1418,8 @@ async def dead_letter(self, message: StreamMessage, stream: str, group: str,
         "v": _DEAD_LETTER_VERSION,   # "1" — one message format for every dead-letter stream, a constant in this module
     })
     await self.ack(stream, group, message.id)
-    logger.warning(log_event, message_id=message.id, delivery_count=delivery_count, reason=reason)
+    logger.warning("message_dead_lettered", dead_letter_stream=dead_letter_stream,
+                   message_id=message.id, delivery_count=delivery_count, reason=reason)
 ```
 
 The one dead-letter write every layer uses (Reclaim and Dead Letter pattern, below). A message from `read_from()` is a first delivery, so its `delivery_count` is `1`. `ack()` raises `redis.ConnectionError` / `redis.TimeoutError` untranslated, like the layer's other calls.
@@ -1474,7 +1474,7 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`
   if reclaimed.delivery_count >= config.max_retry:   # ENTITY_ANALYSIS_MAX_RETRY / AGG_MAX_RETRY / SCORING_MAX_RETRY / CACHE_MAX_RETRY
       await redis_stream.dead_letter(
           reclaimed, <Layer stream>.NAME, <Layer stream>.CONSUMER_GROUP,
-          <Layer>DeadLetterStream.NAME, DeadLetterReason.RETRIES_EXHAUSTED, "<layer>_message_dead_lettered",
+          <Layer>DeadLetterStream.NAME, DeadLetterReason.RETRIES_EXHAUSTED,
       )
       continue   # never enters the layer's normal processing path
   ```
@@ -3644,8 +3644,8 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           group=RawNewsCleanedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=ENTITY_ANALYSIS_BATCH_SIZE).
           For each reclaimed message: if delivery_count >= ENTITY_ANALYSIS_MAX_RETRY,
-          dead_letter() to EntityAnalysisDeadLetterStream, logged as
-          entity_analysis_message_dead_lettered (never reaches _process_one()).
+          dead_letter() to EntityAnalysisDeadLetterStream (never reaches
+          _process_one()).
           Otherwise, run the shape check (§6.1), then extract cleaned_id from fields and
           call _process_one(cleaned_id, message_id) — the claimed messages gathered as one
           batch, identical to _consumer_loop() (§11.3).
@@ -3705,7 +3705,7 @@ The same `WorkerPool` class is used, as independent instances, by Entity Analysi
 | DB write failure | `EntityEventRepository.persist_entities()`'s transaction (§5.1) rolls back and raises `ServiceUnavailableError` (connection unusable / retries exhausted) or `DatabaseError`; `EntityAnalysisService.find_entity_events()` doesn't catch it — `CleanedNewsConsumer._process_one()`'s `except SAPIError` logs it at its own level, no ACK (§11.2) |
 | SADI API failure | `NewsClient` raises `ServiceUnavailableError` (`COMMON-5002`) or, for an unexpected body, `ParseError` (§9.1); `EntityAnalysisService.find_entity_events()` doesn't catch this itself — propagates uncaught to `CleanedNewsConsumer`'s `except SAPIError`, which logs it at its own `log_level` (WARNING for `COMMON-5002`, ERROR for `ParseError`); no ACK |
 | `RedisStreamClient` unreachable | `redis.ConnectionError`/`redis.TimeoutError` caught by `CleanedNewsConsumer._consumer_loop()` around its `read_from()`/`ack()` calls: WARNING `entity_analysis_redis_stream_unreachable`, sleep `REDIS_RECONNECT_INTERVAL_S`, read again; `_reclaim_loop()` logs the same WARNING and claims again next tick (§6.1's reconnect behaviour) |
-| Malformed message (`v` missing or unrecognised, `cleaned_id` missing or not a UUID), or `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` | Dead-lettered to `stream:entity_analysis_dead_letter`, ACKed and logged WARNING `entity_analysis_message_dead_lettered` with `reason` `malformed` / `retries_exhausted`; never reaches `_process_one()` (§6.1) |
+| Malformed message (`v` missing or unrecognised, `cleaned_id` missing or not a UUID), or `delivery_count >= ENTITY_ANALYSIS_MAX_RETRY` | Dead-lettered to `stream:entity_analysis_dead_letter`, ACKed and logged WARNING `message_dead_lettered` (§6.1's `dead_letter()`) with `reason` `malformed` / `retries_exhausted`; never reaches `_process_one()` (§6.1) |
 | HK Stock List not ready (`len(get_hk_stock_list_cache()) == 0`) | `CleanedNewsConsumer._process_one()`'s first check, before the in-flight Set and before `EntityAnalysisService` is called at all (§11.1); log warning `hk_stock_list_not_ready`; no ACK — never reaches `news_client.fetch_cleaned_news()` or `entity_skill.run()` at all, so no entity ever gets a permanently-wrong empty-result outcome from this cause |
 
 ---
@@ -4015,8 +4015,8 @@ Purpose : while True: await asyncio.sleep(STREAM_CLAIM_TIMEOUT_MS / 1000);
           group=EntityEventCompletedStream.CONSUMER_GROUP, consumer=config.consumer_name,
           min_idle_ms=STREAM_CLAIM_TIMEOUT_MS, count=AGG_BATCH_SIZE).
           For each reclaimed message, one at a time: if delivery_count >= AGG_MAX_RETRY,
-          dead_letter() to AggregationDeadLetterStream, logged as
-          aggregation_message_dead_lettered (never reaches _route_one()). Otherwise,
+          dead_letter() to AggregationDeadLetterStream (never reaches
+          _route_one()). Otherwise,
           run the shape check (§6.1), then extract entity_event_id from fields and
           call _route_one(entity_event_id, message_id) — identical call as
           _consumer_loop() uses.
@@ -4284,7 +4284,7 @@ def create_event_aggregation_store() -> EventAggregationStore:
 | `RedisStateClient` unreachable, or any other failure inside the unit of work (duplicate-check read, replaced-Event persist, merge, upsert, ACK) | Caught by `_merge()`'s own `try`/`except` (§12.1): log with `entity_event_id`/`group_key` at the error's own level (a `SAPIError`'s `log_level`; ERROR for anything else, including untranslated Redis errors), call `on_failure()` (discard from `_enqueued`, no ACK), don't re-raise — the group keeps running and the reclaim loop retries |
 | DB Flush failure | `EventRepository.persist_events()` (§10.2) rolls back and re-raises after `_db_write_with_retry()`'s retries are exhausted (§5.2); `AggregationService.flush()` propagates; `_consumer_loop()` (§12.2) logs it at the error's own level and continues — the next trigger retries the same still-active Redis state, nothing is lost |
 | `GroupCoroutine` failure | Only reachable by a bug in `_merge()`'s own failure handling (§12.3's backstop): `_run()` logs CRITICAL `aggregation_group_work_failed` and continues with the group's next item — the group, the consumer loop, and the layer Task all keep running. Each group runs in its own never-awaited Task, so this never reaches Coroutine Monitoring (§16) or `layers.aggregation`. Only the failing item is lost: its `_enqueued` entry stays set, so redeliveries are skipped until it's dead-lettered at `AGG_MAX_RETRY` — acceptable for a genuine bug, which redelivery couldn't fix anyway |
-| Malformed message (`v` missing or unrecognised, `entity_event_id` missing or not a UUID), or `delivery_count >= AGG_MAX_RETRY` | Dead-lettered to `stream:aggregation_dead_letter`, ACKed and logged WARNING `aggregation_message_dead_lettered` with `reason` `malformed` / `retries_exhausted`; never reaches `_route_one()` (§6.1) |
+| Malformed message (`v` missing or unrecognised, `entity_event_id` missing or not a UUID), or `delivery_count >= AGG_MAX_RETRY` | Dead-lettered to `stream:aggregation_dead_letter`, ACKed and logged WARNING `message_dead_lettered` (§6.1's `dead_letter()`) with `reason` `malformed` / `retries_exhausted`; never reaches `_route_one()` (§6.1) |
 | `RedisStreamClient` unreachable | Per §6.1's reconnect behaviour |
 
 ---
@@ -5833,7 +5833,7 @@ Open questions from system-design.md §14 carry forward below, plus implementati
 | # | Gap | Where | Recommended resolution |
 |---|---|---|---|
 | I-1 | **`lookup_stock`'s (§4.2) real-traffic latency is unmeasured.** Its name search (`_search()`) runs synchronously on the shared event loop (§16). Before traffic it measured p50 0.18 ms, p99 5.0 ms, max 6.6 ms over 737 real name queries (Python 3.12, Apple M5 Pro), with the `StockNameIndex` prepared at refresh (16 ms to build), and it runs for about 1.5% of entities on real news. So `asyncio.to_thread()` is not needed. | §4.2 | After traffic: p50/p95/p99 from `lookup_stock_completed`. Revisit `asyncio.to_thread()` only if calls cross the 20 ms WARNING threshold. |
-| I-4 | **`STREAM_CLAIM_TIMEOUT_MS=300000` and `ENTITY_ANALYSIS_MAX_RETRY=3` (§4.1) are derived, not measured.** The claim timeout sits above the configured worst case of one message (`HTTP_TIMEOUT_S` 120 s + `LLM_API_TIMEOUT_S` 30 s) and above `RATE_LIMIT_BACKOFF_S`, but not above the worst case of one batch: `ENTITY_ANALYSIS_BATCH_SIZE` 10 at `ENTITY_ANALYSIS_MAX_CONCURRENT` 3 runs in up to 4 rounds (§11.3); a message reclaimed while it waits for a slot is skipped (§11.2), but the claim still counts as a delivery. The retry count matches SADI's. | §4.1, §6.1 | After traffic: per-batch `latency_ms` p99/max from `entity_analysis_batch_completed` (§11.3 — the longest a read message stays un-ACKed), and the `entity_analysis_message_dead_lettered` rate by `reason`; lower the claim timeout toward that p99 plus headroom, and adjust the retry count if transient causes still dead-letter. |
+| I-4 | **`STREAM_CLAIM_TIMEOUT_MS=300000` and `ENTITY_ANALYSIS_MAX_RETRY=3` (§4.1) are derived, not measured.** The claim timeout sits above the configured worst case of one message (`HTTP_TIMEOUT_S` 120 s + `LLM_API_TIMEOUT_S` 30 s) and above `RATE_LIMIT_BACKOFF_S`, but not above the worst case of one batch: `ENTITY_ANALYSIS_BATCH_SIZE` 10 at `ENTITY_ANALYSIS_MAX_CONCURRENT` 3 runs in up to 4 rounds (§11.3); a message reclaimed while it waits for a slot is skipped (§11.2), but the claim still counts as a delivery. The retry count matches SADI's. | §4.1, §6.1 | After traffic: per-batch `latency_ms` p99/max from `entity_analysis_batch_completed` (§11.3 — the longest a read message stays un-ACKed), and the `message_dead_lettered` rate (`dead_letter_stream` `stream:entity_analysis_dead_letter`) by `reason`; lower the claim timeout toward that p99 plus headroom, and adjust the retry count if transient causes still dead-letter. |
 ---
 
 *— End of Document | SAPI Implementation Guide v0.1 —*

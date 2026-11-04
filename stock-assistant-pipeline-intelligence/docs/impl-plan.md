@@ -254,7 +254,7 @@ This document does not introduce new design — every ticket below implements so
 - `CleanedNewsConsumer`:
   - `start()` runs `_consumer_loop()` and `_reclaim_loop()` in one `asyncio.TaskGroup` (§6.1's Layer Supervision, §11.2).
   - `_reclaim_loop()`: retry-exhaustion check → dead-letter + ACK; otherwise into the same `_process_one()` as the consumer loop. Each sweep catches an unreachable stream Redis (→ `entity_analysis_redis_stream_unreachable`) and then `except Exception` (→ `entity_analysis_reclaim_sweep_failed`).
-  - Every dead-lettered message logs WARNING `entity_analysis_message_dead_lettered` with `message_id`, `delivery_count` and `reason` (`retries_exhausted` / `malformed`).
+  - Every dead-lettered message logs WARNING `message_dead_lettered` with `dead_letter_stream`, `message_id`, `delivery_count` and `reason` (`retries_exhausted` / `malformed`).
   - The `processing_cleaned_ids` dedup guard (§11.2, design.md §3.4 Layer 1) — needed now, since this is the first time two coroutines can dispatch the same message concurrently.
   - The message shape check (§6.1's shape-check callout), immediately after `read_from()`/`autoclaim()` returns: a missing or unrecognised `v`, or a missing or invalid `cleaned_id`, goes straight to dead-letter + ACK, never reaching `_process_one()`; each message is handled in isolation (§6.1).
 **Acceptance criteria** (per impl.md §6.1/§11.2):
@@ -319,7 +319,7 @@ This document does not introduce new design — every ticket below implements so
 
 **Status:** Created
 **Depends on:** every Entity Analysis ticket above; Deployment: SAPI Container, Compose & Production-like Run (below — the real-traffic run), run for an agreed length.
-**Scope:** Answer the Entity Analysis open questions that need real volume, from the logs the earlier tickets already produce (`entity_analysis_completed`, `llm_calls[]`, `lookup_stock_completed`, `entity_analysis_batch_completed`, `entity_analysis_message_dead_lettered`) — no new instrumentation. Except Q-1 and I-4, each starts from a value already sanity-checked by a spike.
+**Scope:** Answer the Entity Analysis open questions that need real volume, from the logs the earlier tickets already produce (`entity_analysis_completed`, `llm_calls[]`, `lookup_stock_completed`, `entity_analysis_batch_completed`, `message_dead_lettered`) — no new instrumentation. Except Q-1 and I-4, each starts from a value already sanity-checked by a spike.
 - **Q-1:** `ENTITY_ANALYSIS_BATCH_SIZE`/`ENTITY_ANALYSIS_BATCH_TIMEOUT_MS`, from throughput and per-batch latency.
 - **Q-7:** `MAX_FC_ROUNDS`/`MAX_FC_RETRIES_PER_ENTITY`, from `fc_summary` — how often `max_rounds_reached` fires, and the retry distribution.
 - **Q-9:** `RATE_LIMIT_BACKOFF_S` (and `ENTITY_ANALYSIS_MAX_CONCURRENT`), from 429 frequency and recovery time.
@@ -327,7 +327,7 @@ This document does not introduce new design — every ticket below implements so
 - **Q-16 at scale:** `lookup_stock` hit/miss rates, plus a hand-checked sample of unverified entities.
 - **I-1 real-traffic part:** `lookup_stock_completed` p50/p95/p99 and fuzzy-path frequency.
 - **Max tokens:** EntityAnalysisSkill's `max_tokens` (§8's table), against `output_tokens` p95/p99 and any truncation.
-- **I-4:** `STREAM_CLAIM_TIMEOUT_MS` and `ENTITY_ANALYSIS_MAX_RETRY`, from per-batch `latency_ms` p99/max (`entity_analysis_batch_completed`) and the `entity_analysis_message_dead_lettered` rate by `reason`.
+- **I-4:** `STREAM_CLAIM_TIMEOUT_MS` and `ENTITY_ANALYSIS_MAX_RETRY`, from per-batch `latency_ms` p99/max (`entity_analysis_batch_completed`) and the `message_dead_lettered` rate (`dead_letter_stream` `stream:entity_analysis_dead_letter`) by `reason`.
 **Acceptance criteria:**
 - Each item has measured numbers and a decision: keep the default, or change it with the reason.
 - Changed defaults are applied in `app/config.py` and impl.md §4.1/§8.
