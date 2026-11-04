@@ -59,6 +59,7 @@ CONFIG = AppConfig(
         max_concurrent=100,
         group_idle_timeout_s=60,
         db_flush_interval_s=300,
+        max_retry=3,
         sliding_window_hours=4,
         event_max_timespan_hours=24,
         consumer_name="sapi-aggregation-1",

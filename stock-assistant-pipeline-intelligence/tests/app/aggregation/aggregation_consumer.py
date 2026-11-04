@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+from collections.abc import Awaitable, Callable
 from unittest import mock
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -15,7 +16,7 @@ from app.common.errors import ServiceUnavailableError
 from app.config import AggregationConfig, DatabaseConfig, RedisConfig
 from app.db.errors import DatabaseError
 from app.redis import stream_client as stream_client_module
-from app.redis.stream_client import RedisStreamClient, StreamMessage
+from app.redis.stream_client import ReclaimedMessage, RedisStreamClient, StreamMessage
 
 # A concurrency bug shows up as a hang, so fail fast instead.
 pytestmark = [pytest.mark.timeout(5)]
@@ -26,6 +27,7 @@ CONFIG = AggregationConfig(
     max_concurrent=2,
     group_idle_timeout_s=60,
     db_flush_interval_s=300,
+    max_retry=3,
     sliding_window_hours=4,
     event_max_timespan_hours=24,
     consumer_name="pod-1",
@@ -36,6 +38,7 @@ REDIS_CONFIG = RedisConfig(
     reconnect_interval_s=3,
     stream_claim_timeout_ms=1500,
 )
+CLAIM_SLEEP_S = REDIS_CONFIG.stream_claim_timeout_ms / 1000
 DB_CONFIG = DatabaseConfig(
     url="postgresql://user:pass@localhost/sapi",
     pool_size=10,
@@ -50,6 +53,14 @@ MESSAGE_B = StreamMessage(id="2-0", fields={"entity_event_id": str(ID_B), "v": "
 # Later deliveries of A's EntityEvent, as separate stream entries.
 MESSAGE_A2 = StreamMessage(id="3-0", fields={"entity_event_id": str(ID_A), "v": "1"})
 MESSAGE_A3 = StreamMessage(id="4-0", fields={"entity_event_id": str(ID_A), "v": "1"})
+RECLAIMED_A = ReclaimedMessage(id=MESSAGE_A.id, fields=MESSAGE_A.fields, delivery_count=2)
+RECLAIMED_B = ReclaimedMessage(id=MESSAGE_B.id, fields=MESSAGE_B.fields, delivery_count=2)
+MALFORMED_FIELDS = [
+    pytest.param({"v": "1"}, id="missing_entity_event_id"),
+    pytest.param({"entity_event_id": "not-a-uuid", "v": "1"}, id="invalid_entity_event_id"),
+    pytest.param({"entity_event_id": str(ID_A)}, id="missing_v"),
+    pytest.param({"entity_event_id": str(ID_A), "v": "2"}, id="unrecognised_v"),
+]
 
 
 @pytest.fixture
@@ -73,27 +84,34 @@ def service(monkeypatch):
     return aggregation_service
 
 
-async def _run(
-    redis_stream: AsyncMock, batches: list[object], config: AggregationConfig = CONFIG
-) -> AsyncMock:
-    """Run start() over the given read_from() results (a list of messages, an exception to
-    raise, or an async callable returning either), stopping by cancellation on the next read.
-    Returns the patched asyncio.sleep, so its awaits can be checked."""
-    results = iter([*batches, asyncio.CancelledError()])
+def _side_effect(results: list[object]) -> Callable[..., Awaitable[object]]:
+    """Return each result in turn (a list of messages, an exception to raise, or an async
+    callable returning either), then a cancellation."""
+    remaining = iter([*results, asyncio.CancelledError()])
 
-    async def read_from(*_args, **_kwargs):
-        result = next(results)
+    async def next_result(*_args: object, **_kwargs: object) -> object:
+        result = next(remaining)
         if callable(result):
             result = await result()
         if isinstance(result, BaseException):
             raise result
         return result
 
-    redis_stream.read_from.side_effect = read_from
-    with (
-        mock.patch("asyncio.sleep", new=AsyncMock()) as sleep,
-        pytest.raises(asyncio.CancelledError),
-    ):
+    return next_result
+
+
+async def _run(
+    redis_stream: AsyncMock,
+    batches: list[object],
+    claims: list[object] | None = None,
+    config: AggregationConfig = CONFIG,
+) -> AsyncMock:
+    """Run start() over the given read_from() and autoclaim() results (see _side_effect()),
+    each loop stopping by cancellation on its next call. Returns the patched asyncio.sleep, so
+    its awaits can be checked."""
+    redis_stream.read_from.side_effect = _side_effect(batches)
+    redis_stream.autoclaim.side_effect = _side_effect(claims or [])
+    with mock.patch("asyncio.sleep", new=AsyncMock()) as sleep:
         await AggregationConsumer(config, REDIS_CONFIG, DB_CONFIG).start()
     return sleep
 
@@ -108,6 +126,26 @@ def _read_call() -> object:
     )
 
 
+def _claim_call() -> object:
+    return mock.call(
+        "stream:entity_event_completed",
+        "sapi-aggregation",
+        CONFIG.consumer_name,
+        min_idle_ms=REDIS_CONFIG.stream_claim_timeout_ms,
+        count=CONFIG.batch_size,
+    )
+
+
+def _dead_letter_call(message: StreamMessage, reason: str) -> object:
+    return mock.call(
+        message,
+        "stream:entity_event_completed",
+        "sapi-aggregation",
+        "stream:aggregation_dead_letter",
+        reason,
+    )
+
+
 def _ack_call(message: StreamMessage) -> object:
     return mock.call("stream:entity_event_completed", "sapi-aggregation", message.id)
 
@@ -119,30 +157,67 @@ def _processed_ids(service: AsyncMock) -> list[UUID]:
 async def start_acks_processed(redis_stream, service):
     """Each message's EntityEvent is processed in stream order, and the message ACKed once
     its outcome is final."""
-    await _run(redis_stream, [[MESSAGE_A, MESSAGE_B], []])
+    sleep = await _run(redis_stream, [[MESSAGE_A, MESSAGE_B], []], [[]])
 
     redis_stream.create_group_if_not_exists.assert_awaited_once_with(
         "stream:entity_event_completed", "sapi-aggregation"
     )
     assert redis_stream.read_from.await_args_list == [_read_call()] * 3
+    assert redis_stream.autoclaim.await_args_list == [_claim_call()] * 2
+    assert sleep.await_args_list == [mock.call(CLAIM_SLEEP_S)] * 2
     assert _processed_ids(service) == [ID_A, ID_B]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A), _ack_call(MESSAGE_B)]
+    redis_stream.dead_letter.assert_not_awaited()
 
 
+@pytest.mark.parametrize("fields", MALFORMED_FIELDS)
 @pytest.mark.parametrize(
-    "fields",
-    [
-        pytest.param({"v": "1"}, id="missing_entity_event_id"),
-        pytest.param({"entity_event_id": "not-a-uuid", "v": "1"}, id="invalid_entity_event_id"),
-    ],
+    "reclaimed",
+    [pytest.param(False, id="read_path"), pytest.param(True, id="reclaim_path")],
 )
-async def start_invalid_message_left_unacked(redis_stream, service, fields):
-    """A message without a valid entity_event_id is left un-ACKed, and the rest of its batch
-    is processed as normal."""
-    await _run(redis_stream, [[StreamMessage(id="9-0", fields=fields), MESSAGE_B]])
+async def start_malformed_message_dead_lettered(redis_stream, service, fields, reclaimed):
+    """A message this layer can never process is dead-lettered without being processed, on
+    either path; the rest of its batch is processed as normal."""
+    if reclaimed:
+        malformed: StreamMessage = ReclaimedMessage(id="9-0", fields=fields, delivery_count=2)
+        await _run(redis_stream, [], [[malformed, RECLAIMED_B]])
+    else:
+        malformed = StreamMessage(id="9-0", fields=fields)
+        await _run(redis_stream, [[malformed, MESSAGE_B]])
 
+    assert redis_stream.dead_letter.await_args_list == [_dead_letter_call(malformed, "malformed")]
     assert _processed_ids(service) == [ID_B]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B)]
+
+
+async def start_reclaimed_retries_exhausted(redis_stream, service):
+    """A reclaimed message delivered max_retry times is dead-lettered without being processed;
+    one with deliveries left is processed and ACKed."""
+    exhausted = ReclaimedMessage(
+        id=MESSAGE_A.id, fields=MESSAGE_A.fields, delivery_count=CONFIG.max_retry
+    )
+
+    await _run(redis_stream, [], [[exhausted, RECLAIMED_B]])
+
+    assert redis_stream.dead_letter.await_args_list == [
+        _dead_letter_call(exhausted, "retries_exhausted")
+    ]
+    assert _processed_ids(service) == [ID_B]
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B)]
+
+
+async def start_dead_letter_failure_isolated(redis_stream, service):
+    """A message whose dead-lettering fails is left un-ACKed, and the rest of its batch is
+    processed as normal."""
+    redis_stream.dead_letter.side_effect = redis.exceptions.ResponseError("OOM")
+    malformed = StreamMessage(id="9-0", fields={"v": "1"})
+
+    await _run(redis_stream, [[malformed, MESSAGE_B], []])
+
+    assert redis_stream.dead_letter.await_args_list == [_dead_letter_call(malformed, "malformed")]
+    assert _processed_ids(service) == [ID_B]
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B)]
+    assert redis_stream.read_from.await_count == 3
 
 
 async def start_in_flight_duplicate_skipped(redis_stream, service):
@@ -214,7 +289,7 @@ async def start_route_failed(redis_stream, service, error):
 
     assert _processed_ids(service) == [ID_A, ID_B, ID_A]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B), _ack_call(MESSAGE_A2)]
-    sleep.assert_not_awaited()
+    assert sleep.await_args_list == [mock.call(CLAIM_SLEEP_S)]
 
 
 @pytest.mark.parametrize(
@@ -228,7 +303,12 @@ async def start_redis_unreachable_on_read(redis_stream, service, error):
     """An unreachable stream Redis is retried after the reconnect interval, not raised."""
     sleep = await _run(redis_stream, [error, error, [MESSAGE_A]])
 
-    assert sleep.await_args_list == [mock.call(REDIS_CONFIG.reconnect_interval_s)] * 2
+    # The reclaim loop's sleep interleaves with the consumer loop's, so compare without order.
+    assert sorted(call.args[0] for call in sleep.await_args_list) == [
+        CLAIM_SLEEP_S,
+        REDIS_CONFIG.reconnect_interval_s,
+        REDIS_CONFIG.reconnect_interval_s,
+    ]
     assert redis_stream.read_from.await_count == 4
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A)]
 
@@ -240,7 +320,10 @@ async def start_redis_unreachable_on_ack(redis_stream, service):
 
     sleep = await _run(redis_stream, [[MESSAGE_A, MESSAGE_B], [MESSAGE_A2]])
 
-    assert sleep.await_args_list == [mock.call(REDIS_CONFIG.reconnect_interval_s)]
+    assert sorted(call.args[0] for call in sleep.await_args_list) == [
+        CLAIM_SLEEP_S,
+        REDIS_CONFIG.reconnect_interval_s,
+    ]
     assert _processed_ids(service) == [ID_A, ID_A]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A), _ack_call(MESSAGE_A2)]
 
@@ -270,7 +353,7 @@ async def start_flushes_on_interval(redis_stream, service):
     passed."""
     config = dataclasses.replace(CONFIG, db_flush_interval_s=0)
 
-    await _run(redis_stream, [[MESSAGE_A], [MESSAGE_B]], config)
+    await _run(redis_stream, [[MESSAGE_A], [MESSAGE_B]], config=config)
 
     # One flush after each batch, plus the one when consuming stops.
     assert service.flush.await_count == 3
@@ -302,7 +385,7 @@ async def start_flush_failed(redis_stream, service, error):
 
     assert service.flush.await_count == 3
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A)]
-    sleep.assert_not_awaited()
+    assert sleep.await_args_list == [mock.call(CLAIM_SLEEP_S)]
 
 
 async def start_final_flush_failed(redis_stream, service):
@@ -331,4 +414,113 @@ async def start_final_flush_timed_out(redis_stream, service):
     await _run(redis_stream, [[MESSAGE_A]])
 
     assert abandoned.is_set()
+    service.flush.assert_awaited_once_with()
+
+
+async def start_reclaimed_in_flight_skipped(redis_stream, service):
+    """A reclaimed message whose EntityEvent is still in flight from its first delivery is
+    skipped; the first delivery ACKs it once its outcome is final."""
+    queued = asyncio.Event()
+    pending: list[Callable[[], Awaitable[None]]] = []
+
+    async def hold(entity_event_id, on_success, on_failure) -> None:
+        pending.append(on_success)
+        queued.set()
+
+    service.process_entity_event.side_effect = hold
+
+    async def claim_once_queued() -> list[StreamMessage]:
+        await queued.wait()
+        return [RECLAIMED_A]
+
+    async def finish_first() -> list[StreamMessage]:
+        await pending[0]()
+        return []
+
+    await _run(redis_stream, [[MESSAGE_A]], [claim_once_queued, finish_first])
+
+    assert _processed_ids(service) == [ID_A]
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A)]
+    redis_stream.dead_letter.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(redis.exceptions.ResponseError("NOPERM"), id="sweep_failed"),
+        pytest.param(redis.exceptions.ConnectionError("down"), id="connection_error"),
+        pytest.param(redis.exceptions.TimeoutError("hung"), id="timeout"),
+    ],
+)
+async def start_reclaim_sweep_failed(redis_stream, service, error):
+    """A failed sweep is retried on the next claim timeout, not raised."""
+    sleep = await _run(redis_stream, [], [error, [RECLAIMED_A]])
+
+    assert sleep.await_args_list == [mock.call(CLAIM_SLEEP_S)] * 3
+    assert redis_stream.autoclaim.await_args_list == [_claim_call()] * 3
+    assert _processed_ids(service) == [ID_A]
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A)]
+
+
+async def start_loop_failure_stops_layer(redis_stream, service):
+    """An unexpected error in one loop stops the other one, and start() raises it once the
+    active Events are flushed once more."""
+    error = redis.exceptions.ResponseError("WRONGTYPE")
+    claiming = asyncio.Event()
+    stopped: list[str] = []
+
+    async def claim(*_args: object, **_kwargs: object) -> list[ReclaimedMessage]:
+        claiming.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.append("reclaim_loop")
+        return []
+
+    async def read(*_args: object, **_kwargs: object) -> list[StreamMessage]:
+        await claiming.wait()
+        raise error
+
+    redis_stream.read_from.side_effect = read
+    redis_stream.autoclaim.side_effect = claim
+    with mock.patch("asyncio.sleep", new=AsyncMock()), pytest.raises(ExceptionGroup) as raised:
+        await AggregationConsumer(CONFIG, REDIS_CONFIG, DB_CONFIG).start()
+
+    assert raised.value.exceptions == (error,)
+    assert stopped == ["reclaim_loop"]
+    service.flush.assert_awaited_once_with()
+
+
+async def start_cancelled(redis_stream, service):
+    """Cancelling start() stops both loops and flushes the active Events once more before the
+    cancellation reaches the caller."""
+    reading = asyncio.Event()
+    claiming = asyncio.Event()
+    stopped: list[str] = []
+
+    async def block(started: asyncio.Event, name: str) -> list[StreamMessage]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.append(name)
+        return []
+
+    async def read(*_args: object, **_kwargs: object) -> list[StreamMessage]:
+        return await block(reading, "consumer_loop")
+
+    async def claim(*_args: object, **_kwargs: object) -> list[StreamMessage]:
+        return await block(claiming, "reclaim_loop")
+
+    redis_stream.read_from.side_effect = read
+    redis_stream.autoclaim.side_effect = claim
+    with mock.patch("asyncio.sleep", new=AsyncMock()):
+        task = asyncio.create_task(AggregationConsumer(CONFIG, REDIS_CONFIG, DB_CONFIG).start())
+        await reading.wait()
+        await claiming.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert sorted(stopped) == ["consumer_loop", "reclaim_loop"]
     service.flush.assert_awaited_once_with()

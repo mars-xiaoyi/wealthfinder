@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 import functools
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import asyncpg
 import pytest
@@ -104,6 +106,31 @@ class AggregationProbe:
             "stream:entity_event_completed", {"entity_event_id": str(entity_event_id), "v": "1"}
         )
         return message_id
+
+    async def add_fields(self, fields: dict[str, str]) -> str:
+        """XADD a stream:entity_event_completed message with exactly these fields; returns its
+        id."""
+        message_id: str = await self._stream.xadd("stream:entity_event_completed", fields)
+        return message_id
+
+    async def hold_as_ghost(self, *messages: dict[str, str]) -> list[str]:
+        """XADD messages and read them as consumer ghost, so they are left pending the way a
+        consumer that died would leave them (delivery count 1). Call before the app starts.
+        Returns their stream ids."""
+        with contextlib.suppress(redis.exceptions.ResponseError):  # the group already exists
+            await self._stream.xgroup_create(
+                "stream:entity_event_completed", "sapi-aggregation", id="0", mkstream=True
+            )
+        message_ids = [await self.add_fields(fields) for fields in messages]
+        await self._stream.xreadgroup(
+            "sapi-aggregation", "ghost", {"stream:entity_event_completed": ">"}
+        )
+        return message_ids
+
+    async def dead_letters(self) -> list[dict[str, str]]:
+        """The fields of every stream:aggregation_dead_letter entry, oldest first."""
+        entries = await self._stream.xrange("stream:aggregation_dead_letter")
+        return [fields for _id, fields in entries]
 
     async def pending(self) -> dict[str, int]:
         """{stream id: delivery count} of every delivered but un-ACKed message."""
@@ -692,3 +719,153 @@ async def persist_events_only_newer_state(start_aggregation, probe):
     assert unannounced_before == []
     assert [event.event_id for event in unannounced_after] == [event_id]
     assert unannounced_after[0].aggregation_updated_at == stored_at + timedelta(seconds=1)
+
+
+CLAIM_TIMEOUT_S = 1
+RECLAIM_ENV = {"STREAM_CLAIM_TIMEOUT_MS": "1000", "AGG_MAX_RETRY": "3"}
+# Enough retries that an outage of a few claim timeouts can't use them up.
+MANY_RETRIES_ENV = {**RECLAIM_ENV, "AGG_MAX_RETRY": "20"}
+
+
+def _dead_lettered(logs: list[MutableMapping[str, Any]]) -> list[tuple[object, ...]]:
+    """(log_level, message_id, delivery_count, reason) of each Aggregation dead-letter
+    record."""
+    return [
+        (log["log_level"], log["message_id"], log["delivery_count"], log["reason"])
+        for log in logs
+        if log["event"] == "message_dead_lettered"
+        and log["dead_letter_stream"] == "stream:aggregation_dead_letter"
+    ]
+
+
+def _assert_dead_letter(
+    fields: dict[str, str],
+    message_id: str,
+    original: dict[str, str],
+    delivery_count: int,
+    started: datetime,
+) -> None:
+    """fields is the dead-letter entry for message_id, whose original fields were original."""
+    assert set(fields) == {"message_id", "fields", "delivery_count", "failed_at", "v"}
+    assert fields["message_id"] == message_id
+    assert json.loads(fields["fields"]) == original
+    assert fields["delivery_count"] == str(delivery_count)
+    assert fields["v"] == "1"
+    failed_at = datetime.fromisoformat(fields["failed_at"])
+    assert failed_at.tzinfo == UTC
+    assert started <= failed_at <= datetime.now(UTC)
+
+
+async def start_abandoned_message_recovered(start_aggregation, probe):
+    """A message left pending by a consumer that died is claimed no sooner than the claim
+    timeout, merged and ACKed."""
+    entity_event_id = await probe.seed("00700", P)
+    await probe.hold_as_ghost({"entity_event_id": str(entity_event_id), "v": "1"})
+    started = time.monotonic()
+
+    async with start_aggregation(**RECLAIM_ENV):
+        await _wait_merged(probe, "00700", [entity_event_id])
+        waited_s = time.monotonic() - started
+
+    assert waited_s >= CLAIM_TIMEOUT_S
+    assert await probe.pending() == {}
+    assert await probe.dead_letters() == []
+
+
+async def start_reclaimed_until_cause_clears(start_aggregation, probe, infra):
+    """A message whose merge fails (here Postgres down) stays pending and is reclaimed every
+    claim timeout; once the cause clears, the same message is merged and ACKed, without being
+    dead-lettered."""
+    entity_event_id = await probe.seed("00700", P)
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_aggregation(**MANY_RETRIES_ENV):
+            await _wait_for(probe.group_created, 5)
+            infra.postgres.stop()
+            message_id = await probe.add(entity_event_id)
+
+            async def reclaimed() -> bool:
+                return (await probe.pending()).get(message_id, 0) >= 2
+
+            await _wait_for(reclaimed, 15)
+            assert await probe.active_event("00700") == {}
+
+            infra.postgres.restore()
+            await _wait_merged(probe, "00700", [entity_event_id])
+
+    assert await probe.dead_letters() == []
+    assert _dead_lettered(logs) == []
+
+
+async def start_retries_exhausted_dead_lettered(start_aggregation, probe, infra):
+    """A message that keeps failing (here Postgres down) is dead-lettered with its original
+    fields once delivered AGG_MAX_RETRY times, then ACKed, and is not processed again."""
+    entity_event_id = await probe.seed("00700", P)
+    started = datetime.now(UTC)
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_aggregation(**RECLAIM_ENV):
+            await _wait_for(probe.group_created, 5)
+            infra.postgres.stop()
+            message_id = await probe.add(entity_event_id)
+
+            async def dead_lettered() -> bool:
+                return bool(await probe.dead_letters())
+
+            await _wait_for(dead_lettered, 20)
+            await asyncio.sleep(2 * CLAIM_TIMEOUT_S)  # two more sweeps
+            infra.postgres.restore()
+            await asyncio.sleep(2 * CLAIM_TIMEOUT_S)
+            fields = await probe.active_event("00700")
+
+    [dead_letter] = await probe.dead_letters()
+    _assert_dead_letter(
+        dead_letter, message_id, {"entity_event_id": str(entity_event_id), "v": "1"}, 3, started
+    )
+    assert await probe.pending() == {}
+    # Deliveries 1 and 2 are processed and fail; delivery 3 is dead-lettered unprocessed.
+    assert len([log for log in logs if log.get("entity_event_id") == entity_event_id]) == 2
+    assert _dead_lettered(logs) == [("warning", message_id, 3, "retries_exhausted")]
+    assert fields == {}
+
+
+@pytest.mark.parametrize(
+    "reclaimed",
+    [pytest.param(False, id="read_path"), pytest.param(True, id="reclaim_path")],
+)
+async def start_malformed_messages_dead_lettered(start_aggregation, probe, reclaimed):
+    """Messages this layer can never process are dead-lettered with their original fields and
+    ACKed without being processed, on either path; the valid message behind them is merged."""
+    entity_event_id = await probe.seed("00700", P)
+    malformed = [
+        {"entity_event_id": "not-a-uuid", "v": "1"},
+        {"v": "1"},
+        {"entity_event_id": str(uuid.uuid4())},
+        {"entity_event_id": str(uuid.uuid4()), "v": "2"},
+    ]
+    valid = {"entity_event_id": str(entity_event_id), "v": "1"}
+    started = datetime.now(UTC)
+
+    with structlog.testing.capture_logs() as logs:
+        if reclaimed:
+            *malformed_ids, _valid_id = await probe.hold_as_ghost(*malformed, valid)
+            async with start_aggregation(**RECLAIM_ENV):
+                await _wait_merged(probe, "00700", [entity_event_id])
+        else:
+            async with start_aggregation(**RECLAIM_ENV):
+                await _wait_for(probe.group_created, 5)
+                malformed_ids = [await probe.add_fields(fields) for fields in malformed]
+                await probe.add_fields(valid)
+                await _wait_merged(probe, "00700", [entity_event_id])
+
+    delivery_count = 2 if reclaimed else 1
+    dead_letters = await probe.dead_letters()
+    assert len(dead_letters) == len(malformed)
+    for dead_letter, message_id, original in zip(
+        dead_letters, malformed_ids, malformed, strict=True
+    ):
+        _assert_dead_letter(dead_letter, message_id, original, delivery_count, started)
+    assert _dead_lettered(logs) == [
+        ("warning", message_id, delivery_count, "malformed") for message_id in malformed_ids
+    ]
+    assert await probe.pending() == {}

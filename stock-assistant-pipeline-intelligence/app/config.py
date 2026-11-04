@@ -67,6 +67,7 @@ class AggregationConfig:
     max_concurrent: int  # env: AGG_MAX_CONCURRENT (default 100), live groups at once
     group_idle_timeout_s: int  # env: AGG_GROUP_IDLE_TIMEOUT_S (default 10)
     db_flush_interval_s: int  # env: AGG_DB_FLUSH_INTERVAL_S (default 300)
+    max_retry: int  # env: AGG_MAX_RETRY (default 3)
     sliding_window_hours: int  # env: SLIDING_WINDOW_HOURS (default 4)
     event_max_timespan_hours: int  # env: EVENT_MAX_TIMESPAN_HOURS (default 24)
     consumer_name: str  # env: HOSTNAME (default sapi-aggregation-1), unique per pod
@@ -144,6 +145,7 @@ def load_config() -> AppConfig:
             max_concurrent=int(os.environ.get("AGG_MAX_CONCURRENT", "100")),
             group_idle_timeout_s=int(os.environ.get("AGG_GROUP_IDLE_TIMEOUT_S", "10")),
             db_flush_interval_s=int(os.environ.get("AGG_DB_FLUSH_INTERVAL_S", "300")),
+            max_retry=int(os.environ.get("AGG_MAX_RETRY", "3")),
             sliding_window_hours=int(os.environ.get("SLIDING_WINDOW_HOURS", "4")),
             event_max_timespan_hours=int(os.environ.get("EVENT_MAX_TIMESPAN_HOURS", "24")),
             consumer_name=os.environ.get("HOSTNAME", "sapi-aggregation-1"),
