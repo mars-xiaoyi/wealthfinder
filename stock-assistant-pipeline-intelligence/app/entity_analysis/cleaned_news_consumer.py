@@ -169,7 +169,7 @@ class CleanedNewsConsumer:
     async def _process_one(self, cleaned_id: UUID, message_id: str) -> None:
         """Analyse one message's article and ACK the message once its outcome is final:
         analysed, or not found in SADI. Any other outcome, including an HK Stock List not loaded
-        yet, leaves it un-ACKed. Raises the stream Redis error if the ACK fails."""
+        yet, leaves it un-ACKed. Raises redis.ConnectionError or redis.TimeoutError."""
         if len(get_hk_stock_list_cache()) == 0:
             logger.warning("hk_stock_list_not_ready", message_id=message_id)
             return
