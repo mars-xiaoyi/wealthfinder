@@ -18,6 +18,7 @@ SOURCE_WEIGHTS = {"HKEX": 10.0, "MINGPAO": 5.0, "AASTOCKS": 5.0}
 CONFIG = ScoringConfig(
     batch_size=5,
     batch_timeout_ms=200,
+    max_retry=3,
     consumer_name="pod-1",
     total_active_sources_default=3,
     event_type_score=[

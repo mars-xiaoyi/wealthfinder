@@ -86,6 +86,7 @@ class EventTypeScore:
 class ScoringConfig:
     batch_size: int  # env: SCORING_BATCH_SIZE (default 10)
     batch_timeout_ms: int  # env: SCORING_BATCH_TIMEOUT_MS (default 5000)
+    max_retry: int  # env: SCORING_MAX_RETRY (default 3)
     consumer_name: str  # env: HOSTNAME (default sapi-scoring-1), unique per pod
     total_active_sources_default: int  # env: TOTAL_ACTIVE_SOURCES_DEFAULT (default 4)
     event_type_score: list[EventTypeScore]  # one entry per EventTypeEnum member
@@ -184,6 +185,7 @@ def load_config() -> AppConfig:
         scoring=ScoringConfig(
             batch_size=int(os.environ.get("SCORING_BATCH_SIZE", "10")),
             batch_timeout_ms=int(os.environ.get("SCORING_BATCH_TIMEOUT_MS", "5000")),
+            max_retry=int(os.environ.get("SCORING_MAX_RETRY", "3")),
             consumer_name=os.environ.get("HOSTNAME", "sapi-scoring-1"),
             total_active_sources_default=int(os.environ.get("TOTAL_ACTIVE_SOURCES_DEFAULT", "4")),
             event_type_score=[

@@ -63,6 +63,7 @@ def load_config_defaults():
     assert config.aggregation.consumer_name == "sapi-aggregation-1"
     assert config.scoring.batch_size == 10
     assert config.scoring.batch_timeout_ms == 5000
+    assert config.scoring.max_retry == 3
     assert config.scoring.consumer_name == "sapi-scoring-1"
     assert config.scoring.total_active_sources_default == 4
     assert config.scoring.event_type_score == [
@@ -107,6 +108,7 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("AGG_MAX_RETRY", "7")
     monkeypatch.setenv("SCORING_BATCH_SIZE", "4")
     monkeypatch.setenv("SCORING_BATCH_TIMEOUT_MS", "300")
+    monkeypatch.setenv("SCORING_MAX_RETRY", "6")
     monkeypatch.setenv("TOTAL_ACTIVE_SOURCES_DEFAULT", "6")
     monkeypatch.setenv("EVENT_TYPE_WEIGHT_EARNINGS", "1.5")
     monkeypatch.setenv("EVENT_TYPE_WEIGHT_BUYBACK", "2.5")
@@ -149,6 +151,7 @@ def load_config_overrides(monkeypatch):
     assert config.aggregation.consumer_name == "sapi-pod-7"
     assert config.scoring.batch_size == 4
     assert config.scoring.batch_timeout_ms == 300
+    assert config.scoring.max_retry == 6
     assert config.scoring.consumer_name == "sapi-pod-7"
     assert config.scoring.total_active_sources_default == 6
     assert config.scoring.event_type_score == [

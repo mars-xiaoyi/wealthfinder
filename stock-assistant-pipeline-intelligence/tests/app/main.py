@@ -68,6 +68,7 @@ CONFIG = AppConfig(
     scoring=ScoringConfig(
         batch_size=10,
         batch_timeout_ms=5000,
+        max_retry=3,
         consumer_name="sapi-scoring-1",
         total_active_sources_default=4,
         event_type_score=[],
