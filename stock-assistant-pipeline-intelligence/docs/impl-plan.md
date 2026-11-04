@@ -732,7 +732,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Cache: Startup Full Build (M)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Scoring: Rule Score & Persist (for `event_scores`, `EventScoreRepository`); Scoring: Brief Summary (for `Event.brief_summary`)
 **Scope:** Build one cache version at startup from every scored Event above the noise threshold, ranked with recency applied (impl.md §14.1 `build_initial_version()`/`_build_full()`, §14.3, §14.5, §10.4, §16; design rationale: design.md §6.1, §6.3–§6.6).
 - `app/config.py`: `CacheConfig.noise_filter_threshold`/`recency_decay_lambda`/`full_fetch_page_size`.
@@ -763,7 +763,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### API: `GET /v1/morning-brief` (M)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Cache: Startup Full Build (for `CacheStore`, `CacheRecord`, and a built version)
 **Scope:** Serve the Morning Brief from the current cache version, as built — no re-scoring per request (impl.md §15.3, §15.4, §3.5, §10.4; api.md §3.3; design.md §6.3, §7).
 - `app/config.py`: `CacheConfig.top_k_default`.
@@ -794,7 +794,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Cache: Parse Once with CacheReader (S)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** API: `GET /v1/morning-brief` (for the route, `read_cache_version()`, `from_dict()`)
 **Scope:** Parse each cache version at most once, and hand a freshly written version to the API without a parse (impl.md §14.8).
 - `app/cache/cache_reader.py`: `CacheReader` + `create_cache_reader()`/`get_cache_reader()` — `prime()` and `get_records()` (§14.8); `main.py` creates it after `CacheStore` (§16).
@@ -812,7 +812,7 @@ This document does not introduce new design — every ticket below implements so
 
 ### Cache: Consume Scores & Incremental Build (M)
 
-**Status:** Designed
+**Status:** Created
 **Depends on:** Cache: Parse Once with CacheReader (for `prime()`, and through it `read_cache_version()`/`from_dict()`); Scoring: Rule Score & Persist (for `stream:event_scored`)
 **Scope:** Consume `stream:event_scored` and build a new cache version per batch, incrementally (impl.md §14.1 `build_new_version()`, §14.2, §14.4; design.md §6.1, §6.2, §6.4).
 - `app/config.py`: `CacheConfig.batch_timeout_ms`/`consumer_name` — no batch-size setting (§14.2).
