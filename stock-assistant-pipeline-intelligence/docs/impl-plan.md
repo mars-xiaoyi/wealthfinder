@@ -456,8 +456,8 @@ This document does not introduce new design — every ticket below implements so
 - `app/api/routes/health.py`: `layers.aggregation` reflects whether its Task is running.
 **Acceptance criteria** (per impl.md §15.2, §16):
 - A crash in `AggregationConsumer.start()` logs `layer_task_crashed` and restarts the Task on the same consumer instance; a cancelled Task is never restarted.
-- `layers.aggregation` flips between `ok` and `error` with the Task's state. With `database`/`redis_stream`/`redis_state`/`hk_stock_list` all `ok`, overall status is `degraded`, `HTTP 200`, since the Scoring and Cache layers don't exist yet.
-- The Health Check ticket's integration cases re-run with `layers.aggregation` real: with everything up, `degraded`, `HTTP 200`, with `layers.entity_analysis`/`layers.aggregation` `ok` and the other two `error`. Each Postgres/Redis stop or pause gives `unhealthy`, `HTTP 503`, with only the failed field `error` and both real layers still `ok`. Recovery returns to `degraded`, `HTTP 200`, without restarting the app.
+- `layers.aggregation` flips between `ok` and `error` with the Task's state. With `database`/`redis_stream`/`redis_state`/`hk_stock_list` all `ok`, overall status is `degraded`, `HTTP 200`, since the Cache layer doesn't exist yet.
+- The Health Check ticket's integration cases re-run with `layers.aggregation` real: with everything up, `degraded`, `HTTP 200`, with `layers.entity_analysis`/`layers.aggregation`/`layers.scoring` `ok` and `layers.cache` `error`. Each Postgres/Redis stop or pause gives `unhealthy`, `HTTP 503`, with only the failed field `error` and the running layers still `ok`. Recovery returns to `degraded`, `HTTP 200`, without restarting the app.
 - Unit-tested with a fake consumer whose `start()` raises.
 **Docs:** impl.md §15.2, §16; design.md §7.1, §12.1.
 **Explicitly deferred:** the Scoring and Cache layers' registration.

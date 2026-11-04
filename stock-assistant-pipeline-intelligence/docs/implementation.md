@@ -4000,15 +4000,18 @@ Purpose : Shared entry point for routing one EntityEvent id, whether it
           lambda: self._enqueued.discard(entity_event_id)). A failure
           before the enqueue (e.g. the fetch_entity_event() DB read)
           discards entity_event_id from _enqueued and leaves the message
-          unACKed. A stream Redis connection/timeout error (the missing-row
-          ACK) is re-raised to the loop's reconnect handling (§6.1); any
-          other error is logged at its own level — a SAPIError as
+          unACKed; so does a cancellation before the enqueue (the layer's
+          Task stopping, §16), which is re-raised. A stream Redis
+          connection/timeout error (the missing-row ACK) is re-raised to
+          the loop's reconnect handling (§6.1); any other error is logged at its own level — a SAPIError as
           logger.log(exc.log_level, exc.dev_message, ...), anything else as
           ERROR "Unhandled exception" — and not re-raised, so one bad
           message never takes down the consumer loop.
 Why failures release the guard : _enqueued must be cleared on every outcome; an entry left
           behind would make every redelivery SKIP until the message dead-letters at
-          AGG_MAX_RETRY. On failure it is cleared without ACKing, so the reclaim loop retries.
+          AGG_MAX_RETRY. That includes a cancellation: a crashed layer is restarted on the
+          same consumer (§16), so _enqueued outlives the Task. On failure it is cleared
+          without ACKing, so the reclaim loop retries.
 Why the _enqueued guard exists : merge_or_create() (§12.4) appends entity_event_id with no
           dedup check, so it must not run twice for one id. A busy GroupCoroutine
           (system-design.md §4.3) can leave a message queued and unACKed past
