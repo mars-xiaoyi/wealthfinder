@@ -304,7 +304,20 @@ def _set_restart_delay(infra: MagicMock, delay_s: int) -> None:
     main_module.load_config.return_value = dataclasses.replace(CONFIG, health=health)
 
 
-async def lifespan_layer_task_crashed(infra):
+# Each monitored layer: its layer name, its consumer class and the prefix of its recorded calls.
+_MONITORED_LAYERS = pytest.mark.parametrize(
+    ("layer", "consumer_cls", "consumer"),
+    [
+        pytest.param("entity_analysis", "CleanedNewsConsumer", "consumer", id="entity_analysis"),
+        pytest.param(
+            "aggregation", "AggregationConsumer", "aggregation_consumer", id="aggregation"
+        ),
+    ],
+)
+
+
+@_MONITORED_LAYERS
+async def lifespan_layer_task_crashed(infra, layer, consumer_cls, consumer):
     """A crashed layer is restarted on the same consumer instance once the restart delay has
     passed; until then the crashed Task stays registered."""
     _set_restart_delay(infra, 1)
@@ -314,17 +327,17 @@ async def lifespan_layer_task_crashed(infra):
 
     async def crash_once() -> None:
         start_times.append(loop.time())
-        infra.consumer_started()
+        getattr(infra, f"{consumer}_started")()
         if len(start_times) == 1:
             raise RuntimeError("consumer loop bug")
         restarted_event.set()
         await asyncio.Event().wait()
 
-    infra.CleanedNewsConsumer.return_value.start = crash_once
+    getattr(infra, consumer_cls).return_value.start = crash_once
 
     async with main_module.lifespan(FastAPI()):
         await asyncio.sleep(0.01)  # let the first Task crash
-        crashed = layer_tasks_module.get_layer_tasks()["entity_analysis"]
+        crashed = layer_tasks_module.get_layer_tasks()[layer]
         assert crashed.done()
         assert isinstance(crashed.exception(), RuntimeError)
         assert _call_names(infra) == STARTUP_CALLS
@@ -332,29 +345,38 @@ async def lifespan_layer_task_crashed(infra):
         await asyncio.wait_for(restarted_event.wait(), timeout=3)
 
         assert start_times[1] - start_times[0] >= 0.99
-        restarted = layer_tasks_module.get_layer_tasks()["entity_analysis"]
+        restarted = layer_tasks_module.get_layer_tasks()[layer]
         assert restarted is not crashed
         assert not restarted.done()
-        assert _call_names(infra) == [*STARTUP_CALLS, "consumer_started"]
-        infra.CleanedNewsConsumer.assert_called_once()
+        assert _call_names(infra) == [*STARTUP_CALLS, f"{consumer}_started"]
+        getattr(infra, consumer_cls).assert_called_once()
 
     assert restarted.cancelled()
-    assert _call_names(infra) == [*STARTUP_CALLS, "consumer_started", *SHUTDOWN_CALLS[1:]]
+    assert _call_names(infra) == [
+        *STARTUP_CALLS,
+        f"{consumer}_started",
+        *(call for call in SHUTDOWN_CALLS if call != f"{consumer}_cancelled"),
+    ]
 
 
-async def lifespan_layer_task_cancelled(infra):
+@_MONITORED_LAYERS
+async def lifespan_layer_task_cancelled(infra, layer, consumer_cls, consumer):
     """A cancelled layer Task is not restarted."""
     async with main_module.lifespan(FastAPI()):
         await asyncio.sleep(0)  # let the consumer Task start
-        cancelled = layer_tasks_module.get_layer_tasks()["entity_analysis"]
+        cancelled = layer_tasks_module.get_layer_tasks()[layer]
         cancelled.cancel()
         await asyncio.sleep(0.05)  # past the restart delay
 
-        assert layer_tasks_module.get_layer_tasks()["entity_analysis"] is cancelled
+        assert layer_tasks_module.get_layer_tasks()[layer] is cancelled
         assert cancelled.cancelled()
-        assert _call_names(infra) == [*STARTUP_CALLS, "consumer_cancelled"]
+        assert _call_names(infra) == [*STARTUP_CALLS, f"{consumer}_cancelled"]
 
-    assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS
+    assert _call_names(infra) == [
+        *STARTUP_CALLS,
+        f"{consumer}_cancelled",
+        *(call for call in SHUTDOWN_CALLS if call != f"{consumer}_cancelled"),
+    ]
 
 
 async def lifespan_layer_task_returned(infra):

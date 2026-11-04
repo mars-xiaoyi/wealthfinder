@@ -122,7 +122,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         layer_tasks[Layer.ENTITY_ANALYSIS] = _make_monitored(
             Layer.ENTITY_ANALYSIS, cleaned_news_consumer.start
         )
-        layer_tasks[Layer.AGGREGATION] = asyncio.create_task(aggregation_consumer.start())
+        layer_tasks[Layer.AGGREGATION] = _make_monitored(
+            Layer.AGGREGATION, aggregation_consumer.start
+        )
         layer_tasks[Layer.SCORING] = asyncio.create_task(scoring_consumer.start())
         register_layer_tasks(layer_tasks)
 

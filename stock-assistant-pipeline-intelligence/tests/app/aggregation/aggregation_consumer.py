@@ -491,6 +491,41 @@ async def start_loop_failure_stops_layer(redis_stream, service):
     service.flush.assert_awaited_once_with()
 
 
+async def start_restart_reprocesses_cancelled_entity_event(redis_stream, service):
+    """An EntityEvent whose routing was cancelled by a loop failure is processed again by a
+    restart of the same consumer."""
+    processing = asyncio.Event()
+
+    async def block_first(entity_event_id, on_success, on_failure) -> None:
+        if service.process_entity_event.await_count == 1:
+            processing.set()
+            await asyncio.Event().wait()
+        await on_success()
+
+    error = redis.exceptions.ResponseError("NOGROUP")
+
+    async def fail_once_processing(*_args: object, **_kwargs: object) -> list[StreamMessage]:
+        await processing.wait()
+        raise error
+
+    service.process_entity_event.side_effect = block_first
+    consumer = AggregationConsumer(CONFIG, REDIS_CONFIG, DB_CONFIG)
+    with mock.patch("asyncio.sleep", new=AsyncMock()):
+        redis_stream.read_from.side_effect = fail_once_processing
+        redis_stream.autoclaim.side_effect = _side_effect([[RECLAIMED_A]])
+        with pytest.raises(ExceptionGroup) as raised:
+            await consumer.start()
+
+        redis_stream.read_from.side_effect = _side_effect([[MESSAGE_A2]])
+        redis_stream.autoclaim.side_effect = _side_effect([])
+        await consumer.start()
+
+    assert raised.value.exceptions == (error,)
+    assert _processed_ids(service) == [ID_A, ID_A]
+    assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A2)]
+    redis_stream.dead_letter.assert_not_awaited()
+
+
 async def start_cancelled(redis_stream, service):
     """Cancelling start() stops both loops and flushes the active Events once more before the
     cancellation reaches the caller."""

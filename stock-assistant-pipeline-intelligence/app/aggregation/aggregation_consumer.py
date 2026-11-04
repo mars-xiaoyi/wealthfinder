@@ -180,6 +180,11 @@ class AggregationConsumer:
                 lambda: self._on_success(entity_event_id, message_id),
                 lambda: self._enqueued.discard(entity_event_id),
             )
+        except asyncio.CancelledError:
+            # Not handed to its group, and a restart reuses this consumer, so a leftover entry
+            # would make every redelivery skip as in flight.
+            self._enqueued.discard(entity_event_id)
+            raise
         except _REDIS_UNREACHABLE:
             self._enqueued.discard(entity_event_id)
             raise
