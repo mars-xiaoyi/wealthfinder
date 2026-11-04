@@ -124,19 +124,31 @@ class CleanedNewsConsumer:
                 raise result
 
     async def _route(self, message: StreamMessage) -> None:
-        """Dead-letter a message that is out of retries or malformed, and process any other."""
+        """Skip a message whose article is already in flight, dead-letter one that is malformed
+        or out of retries, and process any other."""
         try:
+            cleaned_id = _get_valid_cleaned_id(message)
+            if cleaned_id is None:
+                await self._push_dead_letter(message, DeadLetterReason.MALFORMED)
+                return
+            # Ahead of the retry check, so a message whose article is still in flight is never
+            # dead-lettered. No await between this check and the insert below, so two loops
+            # can't both pass it. An article waiting for a worker slot counts as in flight.
+            if cleaned_id in self._processing_cleaned_ids:
+                return
             if (
                 isinstance(message, ReclaimedMessage)
                 and message.delivery_count >= self._config.max_retry
             ):
                 await self._push_dead_letter(message, DeadLetterReason.RETRIES_EXHAUSTED)
                 return
-            cleaned_id = _get_valid_cleaned_id(message)
-            if cleaned_id is None:
-                await self._push_dead_letter(message, DeadLetterReason.MALFORMED)
-                return
-            await self._process_one(cleaned_id, message.id)
+            self._processing_cleaned_ids.add(cleaned_id)
+            # Released even on a failed ACK or a cancellation; a leftover entry would make every
+            # redelivery of the article skip as in flight.
+            try:
+                await self._process_one(cleaned_id, message.id)
+            finally:
+                self._processing_cleaned_ids.discard(cleaned_id)
         except _REDIS_UNREACHABLE:
             raise
         except Exception:
@@ -157,24 +169,11 @@ class CleanedNewsConsumer:
     async def _process_one(self, cleaned_id: UUID, message_id: str) -> None:
         """Analyse one message's article and ACK the message once its outcome is final:
         analysed, or not found in SADI. Any other outcome, including an HK Stock List not loaded
-        yet or the same article already in flight, leaves it un-ACKed. Raises the stream Redis
-        error if the ACK fails."""
+        yet, leaves it un-ACKed. Raises the stream Redis error if the ACK fails."""
         if len(get_hk_stock_list_cache()) == 0:
             logger.warning("hk_stock_list_not_ready", message_id=message_id)
             return
-
-        # No await between this check and the insert, so two loops can't both pass it. An
-        # article waiting for a worker slot counts as in flight.
-        if cleaned_id in self._processing_cleaned_ids:
-            return
-        self._processing_cleaned_ids.add(cleaned_id)
-
-        # Released even on a failed ACK or a cancellation; a leftover entry would make every
-        # redelivery of the article skip as in flight.
-        try:
-            await self._worker_pool.dispatch(lambda: self._analyse(cleaned_id, message_id))
-        finally:
-            self._processing_cleaned_ids.discard(cleaned_id)
+        await self._worker_pool.dispatch(lambda: self._analyse(cleaned_id, message_id))
 
     async def _analyse(self, cleaned_id: UUID, message_id: str) -> None:
         """Analyse the article and ACK its message. A failed analysis leaves the message
