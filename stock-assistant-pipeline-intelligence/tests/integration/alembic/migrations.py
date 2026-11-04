@@ -176,7 +176,7 @@ async def upgrade_downgrade_002_success(infra: Infra, alembic):
         entity_event_id, event_id, other_event_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         await conn.execute(_INSERT_ENTITY_EVENT_SQL, entity_event_id, f"u{entity_event_id}")
 
-        alembic("upgrade", "head")
+        alembic("upgrade", "002")
 
         assert await _columns(conn, "events") == EVENTS_COLUMNS
         assert await _columns(conn, "event_entity_map") == EVENT_ENTITY_MAP_COLUMNS
@@ -198,6 +198,77 @@ async def upgrade_downgrade_002_success(infra: Infra, alembic):
         assert await conn.fetchval("SELECT to_regclass('event_entity_map') IS NULL")
         assert await conn.fetch("SELECT entity_event_id FROM entity_events") == [(entity_event_id,)]
         assert await conn.fetch("SELECT version_num FROM alembic_version") == [("001",)]
+    finally:
+        alembic("downgrade", "base")
+        alembic("upgrade", "head")
+        await conn.close()
+
+
+# (column, type, nullable) of event_scores, in table order.
+EVENT_SCORES_COLUMNS = [
+    ("score_id", "uuid", "NO"),
+    ("event_id", "uuid", "NO"),
+    ("abs_final_score", "double precision", "NO"),
+    ("base_rule_score", "double precision", "NO"),
+    ("stock_impact_score", "double precision", "NO"),
+    ("direction", "smallint", "NO"),
+    ("llm_fallback", "boolean", "NO"),
+    ("rule_score_detail", "jsonb", "NO"),
+    ("llm_score_detail", "jsonb", "NO"),
+    ("scored_at", "timestamp with time zone", "NO"),
+    ("scored_aggregation_updated_at", "timestamp with time zone", "NO"),
+    ("updated_at", "timestamp with time zone", "NO"),
+    ("created_at", "timestamp with time zone", "NO"),
+]
+EVENT_SCORES_INDEXES = {
+    "event_scores_pkey": "CREATE UNIQUE INDEX event_scores_pkey ON public.event_scores "
+    "USING btree (score_id)",
+    "uq_event_scores_event_id": "CREATE UNIQUE INDEX uq_event_scores_event_id ON "
+    "public.event_scores USING btree (event_id)",
+    "idx_event_scores_abs_final_score": "CREATE INDEX idx_event_scores_abs_final_score ON "
+    "public.event_scores USING btree (abs_final_score)",
+    "idx_event_scores_base_rule_score": "CREATE INDEX idx_event_scores_base_rule_score ON "
+    "public.event_scores USING btree (base_rule_score)",
+    "idx_event_scores_llm_fallback": "CREATE INDEX idx_event_scores_llm_fallback ON "
+    "public.event_scores USING btree (llm_fallback)",
+}
+_INSERT_EVENT_SCORE_SQL = """
+    INSERT INTO event_scores (
+        score_id, event_id, abs_final_score, base_rule_score, stock_impact_score, direction,
+        llm_fallback, rule_score_detail, llm_score_detail, scored_at,
+        scored_aggregation_updated_at, updated_at, created_at
+    )
+    VALUES ($1, $2, 4.29, 6.41, 0.0, 1, true, '{}', '{}', now(), now(), now(), now())
+"""
+
+
+async def upgrade_downgrade_003_success(infra: Infra, alembic):
+    """Upgrading from 002 creates event_scores as specified, holding at most one score per
+    stored Event. Downgrading removes it and leaves events and its rows."""
+    alembic("downgrade", "base")
+    alembic("upgrade", "002")
+    conn = await asyncpg.connect(infra.env()["DATABASE_URL"])
+    try:
+        event_id = uuid.uuid4()
+        await conn.execute(_INSERT_EVENT_SQL, event_id)
+
+        alembic("upgrade", "head")
+
+        assert await _columns(conn, "event_scores") == EVENT_SCORES_COLUMNS
+        assert await _indexes(conn, "event_scores") == EVENT_SCORES_INDEXES
+        assert await conn.fetch("SELECT version_num FROM alembic_version") == [("003",)]
+        await conn.execute(_INSERT_EVENT_SCORE_SQL, uuid.uuid4(), event_id)
+        with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+            await conn.execute(_INSERT_EVENT_SCORE_SQL, uuid.uuid4(), event_id)
+        assert excinfo.value.constraint_name == "uq_event_scores_event_id"
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute(_INSERT_EVENT_SCORE_SQL, uuid.uuid4(), uuid.uuid4())
+
+        alembic("downgrade", "-1")
+
+        assert await conn.fetchval("SELECT to_regclass('event_scores') IS NULL")
+        assert await conn.fetch("SELECT event_id FROM events") == [(event_id,)]
+        assert await conn.fetch("SELECT version_num FROM alembic_version") == [("002",)]
     finally:
         alembic("downgrade", "base")
         alembic("upgrade", "head")

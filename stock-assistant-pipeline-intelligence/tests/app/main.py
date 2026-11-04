@@ -65,7 +65,13 @@ CONFIG = AppConfig(
         event_max_timespan_hours=24,
         consumer_name="sapi-aggregation-1",
     ),
-    scoring=ScoringConfig(batch_size=10, batch_timeout_ms=5000, consumer_name="sapi-scoring-1"),
+    scoring=ScoringConfig(
+        batch_size=10,
+        batch_timeout_ms=5000,
+        consumer_name="sapi-scoring-1",
+        total_active_sources_default=4,
+        event_type_score=[],
+    ),
 )
 
 
@@ -98,6 +104,7 @@ def infra():
     create_news = MagicMock()
     create_repository = MagicMock()
     create_event_repository = MagicMock()
+    create_event_score_repository = MagicMock()
     create_service = MagicMock()
 
     def _consume_until_cancelled(name: str):
@@ -134,6 +141,7 @@ def infra():
     calls.attach_mock(create_news, "create_news_client")
     calls.attach_mock(create_repository, "create_entity_event_repository")
     calls.attach_mock(create_event_repository, "create_event_repository")
+    calls.attach_mock(create_event_score_repository, "create_event_score_repository")
     calls.attach_mock(create_service, "create_entity_analysis_service")
     calls.attach_mock(worker_pool_cls, "WorkerPool")
     calls.attach_mock(consumer_cls, "CleanedNewsConsumer")
@@ -153,6 +161,9 @@ def infra():
         mock.patch.object(main_module, "create_news_client", create_news),
         mock.patch.object(main_module, "create_entity_event_repository", create_repository),
         mock.patch.object(main_module, "create_event_repository", create_event_repository),
+        mock.patch.object(
+            main_module, "create_event_score_repository", create_event_score_repository
+        ),
         mock.patch.object(main_module, "create_entity_analysis_service", create_service),
         mock.patch.object(main_module, "WorkerPool", worker_pool_cls),
         mock.patch.object(main_module, "CleanedNewsConsumer", consumer_cls),
@@ -178,6 +189,7 @@ STARTUP_CALLS = [
     "create_news_client",
     "create_entity_event_repository",
     "create_event_repository",
+    "create_event_score_repository",
     "create_event_aggregation_store",
     "refresh_hk_stock_list",
     "WorkerPool",

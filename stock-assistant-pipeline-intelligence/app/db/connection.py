@@ -116,6 +116,19 @@ class DatabaseClient:
 
         await _db_write_with_retry(self._config, write)
 
+    async def execute_returning(self, query: str, *args: object) -> asyncpg.Record | None:
+        """
+        Execute a write statement with a RETURNING clause, retrying it while the failure is
+        transient, and return its first row, or None if it affected no rows.
+        Raises ServiceUnavailableError, UniqueConstraintError or DatabaseError.
+        """
+
+        async def write() -> asyncpg.Record | None:
+            async with self._pool.acquire() as conn:
+                return await conn.fetchrow(query, *args)
+
+        return await _db_write_with_retry(self._config, write)
+
     async def fetch_one(self, query: str, *args: object) -> asyncpg.Record | None:
         """
         Execute a SELECT and return the first matching row, or None. No retry — reads are

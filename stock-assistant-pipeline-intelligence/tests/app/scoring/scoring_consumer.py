@@ -19,7 +19,13 @@ from app.scoring.scoring_service import ScoringService
 # A loop bug shows up as a hang, so fail fast instead.
 pytestmark = [pytest.mark.timeout(5)]
 
-CONFIG = ScoringConfig(batch_size=5, batch_timeout_ms=200, consumer_name="pod-1")
+CONFIG = ScoringConfig(
+    batch_size=5,
+    batch_timeout_ms=200,
+    consumer_name="pod-1",
+    total_active_sources_default=4,
+    event_type_score=[],
+)
 REDIS_CONFIG = RedisConfig(
     stream_url="redis://localhost/0",
     state_url="redis://localhost/1",

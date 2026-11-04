@@ -25,6 +25,13 @@ class EventAggregatedStream:
     CONSUMER_GROUP: Final = "sapi-scoring"
 
 
+class EventScoredStream:
+    """The stream of scored Events."""
+
+    NAME: Final = "stream:event_scored"
+    VERSION: Final = "1"
+
+
 class EntityAnalysisDeadLetterStream:
     """The stream of messages the Entity Analysis layer could not process."""
 

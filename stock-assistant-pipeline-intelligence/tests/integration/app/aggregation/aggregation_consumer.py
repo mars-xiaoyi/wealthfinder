@@ -96,7 +96,7 @@ class AggregationProbe:
     async def truncate(self) -> None:
         conn = await asyncpg.connect(self._database_url)
         try:
-            await conn.execute("TRUNCATE event_entity_map, events, entity_events")
+            await conn.execute("TRUNCATE event_scores, event_entity_map, events, entity_events")
         finally:
             await conn.close()
 

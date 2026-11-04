@@ -214,6 +214,75 @@ async def execute_failure(error, expected_cls, expected_code):
     assert conn.execute.await_count == expected_attempts
 
 
+async def execute_returning_row():
+    client, _, conn = _make_client()
+    record = MagicMock(spec=asyncpg.Record)
+    conn.fetchrow = AsyncMock(return_value=record)
+
+    row = await client.execute_returning("INSERT $1 RETURNING *", 1)
+
+    assert row is record
+    conn.fetchrow.assert_awaited_once_with("INSERT $1 RETURNING *", 1)
+
+
+async def execute_returning_no_row():
+    client, _, conn = _make_client()
+    conn.fetchrow = AsyncMock(return_value=None)
+
+    assert await client.execute_returning("INSERT $1 RETURNING *", 1) is None
+
+
+async def execute_returning_retried():
+    """A write that fails in a way a fresh attempt can clear is retried with exponential
+    backoff."""
+    client, _, conn = _make_client()
+    record = MagicMock(spec=asyncpg.Record)
+    error = asyncpg.ConnectionDoesNotExistError("lost")
+    conn.fetchrow = AsyncMock(side_effect=[error, error, record])
+
+    with mock.patch("asyncio.sleep", AsyncMock()) as sleep:
+        row = await client.execute_returning("INSERT $1 RETURNING *", 1)
+
+    assert row is record
+    assert conn.fetchrow.await_args_list == [mock.call("INSERT $1 RETURNING *", 1)] * 3
+    assert sleep.await_args_list == [mock.call(0.1), mock.call(0.2)]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_cls", "expected_code"),
+    [
+        pytest.param(
+            asyncpg.ConnectionDoesNotExistError("lost"),
+            ServiceUnavailableError,
+            "COMMON-5001",
+            id="retries_exhausted",
+        ),
+        pytest.param(
+            asyncpg.StringDataRightTruncationError("too long"),
+            DatabaseError,
+            "COMMON-8000",
+            id="data",
+        ),
+    ],
+)
+async def execute_returning_failure(error, expected_cls, expected_code):
+    client, _, conn = _make_client()
+    conn.fetchrow = AsyncMock(side_effect=error)
+
+    with (
+        mock.patch("asyncio.sleep", AsyncMock()),
+        pytest.raises(expected_cls) as excinfo,
+    ):
+        await client.execute_returning("INSERT $1 RETURNING *", 1)
+
+    assert type(excinfo.value) is expected_cls
+    assert excinfo.value.error_code == expected_code
+    assert excinfo.value.category is ErrorCategory.DB
+    assert excinfo.value.__cause__ is error
+    expected_attempts = 3 if expected_cls is ServiceUnavailableError else 1
+    assert conn.fetchrow.await_count == expected_attempts
+
+
 async def transaction_success():
     client, pool, conn = _make_transaction_client()
     record = MagicMock(spec=asyncpg.Record)
@@ -307,7 +376,7 @@ async def transaction_commit_fails():
         ),
     ],
 )
-async def execute_returning_failure(error, expected_cls, expected_code):
+async def transaction_execute_returning_failure(error, expected_cls, expected_code):
     """A failed statement is translated, not retried, and its transaction rolls back."""
     client, pool, conn = _make_transaction_client()
     conn.fetchrow.side_effect = error
@@ -328,7 +397,7 @@ async def execute_returning_failure(error, expected_cls, expected_code):
     pool.release.assert_awaited_once_with(conn)
 
 
-async def execute_returning_unique_violation():
+async def transaction_execute_returning_unique_violation():
     """Like any failed statement, but the error also names the violated constraint."""
     client, pool, conn = _make_transaction_client()
     error = asyncpg.UniqueViolationError("dup")
