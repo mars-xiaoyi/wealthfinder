@@ -20,6 +20,7 @@ from app.config import (
     HttpConfig,
     LLMConfig,
     RedisConfig,
+    ScoringConfig,
 )
 
 CONFIG = AppConfig(
@@ -64,6 +65,7 @@ CONFIG = AppConfig(
         event_max_timespan_hours=24,
         consumer_name="sapi-aggregation-1",
     ),
+    scoring=ScoringConfig(batch_size=10, batch_timeout_ms=5000, consumer_name="sapi-scoring-1"),
 )
 
 
@@ -118,6 +120,10 @@ def infra():
     aggregation_consumer_cls = MagicMock(
         return_value=MagicMock(start=_consume_until_cancelled("aggregation_consumer"))
     )
+    create_scoring_service = MagicMock()
+    scoring_consumer_cls = MagicMock(
+        return_value=MagicMock(start=_consume_until_cancelled("scoring_consumer"))
+    )
     worker_pool_cls = MagicMock()
     calls.attach_mock(create_db, "create_db_client")
     calls.attach_mock(create_stream, "create_stream_client")
@@ -134,6 +140,8 @@ def infra():
     calls.attach_mock(create_store, "create_event_aggregation_store")
     calls.attach_mock(create_aggregation_service, "create_aggregation_service")
     calls.attach_mock(aggregation_consumer_cls, "AggregationConsumer")
+    calls.attach_mock(create_scoring_service, "create_scoring_service")
+    calls.attach_mock(scoring_consumer_cls, "ScoringConsumer")
     with (
         mock.patch.object(main_module, "load_config", return_value=CONFIG),
         mock.patch.object(main_module, "create_db_client", create_db),
@@ -151,6 +159,8 @@ def infra():
         mock.patch.object(main_module, "create_event_aggregation_store", create_store),
         mock.patch.object(main_module, "create_aggregation_service", create_aggregation_service),
         mock.patch.object(main_module, "AggregationConsumer", aggregation_consumer_cls),
+        mock.patch.object(main_module, "create_scoring_service", create_scoring_service),
+        mock.patch.object(main_module, "ScoringConsumer", scoring_consumer_cls),
     ):
         yield calls
 
@@ -175,12 +185,16 @@ STARTUP_CALLS = [
     "CleanedNewsConsumer",
     "create_aggregation_service",
     "AggregationConsumer",
+    "create_scoring_service",
+    "ScoringConsumer",
     "consumer_started",
     "aggregation_consumer_started",
+    "scoring_consumer_started",
 ]
 SHUTDOWN_CALLS = [
     "consumer_cancelled",
     "aggregation_consumer_cancelled",
+    "scoring_consumer_cancelled",
     "aggregation_service_close",
     "llm_adapter_close",
     "http_client_aclose",
@@ -217,16 +231,20 @@ async def lifespan(infra):
         infra.AggregationConsumer.assert_called_once_with(
             CONFIG.aggregation, CONFIG.redis, CONFIG.db
         )
+        infra.create_scoring_service.assert_called_once_with(CONFIG.scoring)
+        infra.ScoringConsumer.assert_called_once_with(CONFIG.scoring, CONFIG.redis)
 
         layer_tasks = layer_tasks_module.get_layer_tasks()
-        assert set(layer_tasks) == {"entity_analysis", "aggregation"}
+        assert set(layer_tasks) == {"entity_analysis", "aggregation", "scoring"}
         assert not layer_tasks["entity_analysis"].done()
         assert not layer_tasks["aggregation"].done()
+        assert not layer_tasks["scoring"].done()
 
     assert _call_names(infra) == STARTUP_CALLS + SHUTDOWN_CALLS
     infra.db_close.assert_awaited_once_with(CONFIG.db.close_timeout_s)
     assert layer_tasks["entity_analysis"].cancelled()
     assert layer_tasks["aggregation"].cancelled()
+    assert layer_tasks["scoring"].cancelled()
 
 
 @pytest.mark.parametrize(

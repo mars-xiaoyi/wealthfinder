@@ -23,6 +23,8 @@ from app.persistent.entity_event_repository import create_entity_event_repositor
 from app.persistent.event_repository import create_event_repository
 from app.redis.state_client import create_state_client
 from app.redis.stream_client import create_stream_client
+from app.scoring.scoring_consumer import ScoringConsumer
+from app.scoring.scoring_service import create_scoring_service
 
 configure_logging()
 logger = get_logger(__name__)
@@ -74,6 +76,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # layers have stopped and before the clients they use close.
         resources.push_async_callback(aggregation_service.close)
         aggregation_consumer = AggregationConsumer(config.aggregation, config.redis, config.db)
+        create_scoring_service(config.scoring)
+        scoring_consumer = ScoringConsumer(config.scoring, config.redis)
 
         layer_tasks: dict[Layer, asyncio.Task[None]] = {}
         shutting_down = False
@@ -117,6 +121,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             Layer.ENTITY_ANALYSIS, cleaned_news_consumer.start
         )
         layer_tasks[Layer.AGGREGATION] = asyncio.create_task(aggregation_consumer.start())
+        layer_tasks[Layer.SCORING] = asyncio.create_task(scoring_consumer.start())
         register_layer_tasks(layer_tasks)
 
         async def _cancel_layer_tasks() -> None:

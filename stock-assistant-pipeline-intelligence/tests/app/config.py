@@ -59,6 +59,9 @@ def load_config_defaults():
     assert config.aggregation.sliding_window_hours == 4
     assert config.aggregation.event_max_timespan_hours == 24
     assert config.aggregation.consumer_name == "sapi-aggregation-1"
+    assert config.scoring.batch_size == 10
+    assert config.scoring.batch_timeout_ms == 5000
+    assert config.scoring.consumer_name == "sapi-scoring-1"
 
 
 def load_config_overrides(monkeypatch):
@@ -89,6 +92,8 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("AGG_GROUP_IDLE_TIMEOUT_S", "30")
     monkeypatch.setenv("AGG_DB_FLUSH_INTERVAL_S", "120")
     monkeypatch.setenv("AGG_MAX_RETRY", "7")
+    monkeypatch.setenv("SCORING_BATCH_SIZE", "4")
+    monkeypatch.setenv("SCORING_BATCH_TIMEOUT_MS", "300")
 
     config = config_module.load_config()
 
@@ -120,6 +125,9 @@ def load_config_overrides(monkeypatch):
     assert config.aggregation.db_flush_interval_s == 120
     assert config.aggregation.max_retry == 7
     assert config.aggregation.consumer_name == "sapi-pod-7"
+    assert config.scoring.batch_size == 4
+    assert config.scoring.batch_timeout_ms == 300
+    assert config.scoring.consumer_name == "sapi-pod-7"
 
 
 @pytest.mark.parametrize("missing", list(REQUIRED_ENV))

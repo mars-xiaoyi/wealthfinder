@@ -29,6 +29,12 @@ _SELECT_ENTITY_EVENT_IDS_BY_SOURCE_URL_SQL = (
 
 _SELECT_ENTITY_EVENT_SQL = "SELECT * FROM entity_events WHERE entity_event_id = $1"
 
+_SELECT_ENTITY_EVENTS_FOR_EVENT_SQL = """
+    SELECT ee.* FROM entity_events ee
+    JOIN event_entity_map m ON m.entity_event_id = ee.entity_event_id
+    WHERE m.event_id = $1
+"""
+
 
 def _row_to_entity_event(row: asyncpg.Record) -> EntityEvent:
     additional_outcome = json.loads(row["additional_outcome"])
@@ -134,6 +140,15 @@ class EntityEventRepository:
         """
         row = await self._db.fetch_one(_SELECT_ENTITY_EVENT_SQL, entity_event_id)
         return _row_to_entity_event(row) if row is not None else None
+
+    async def fetch_entity_events_for_event(self, event_id: UUID) -> list[EntityEvent]:
+        """
+        Return every stored EntityEvent the Event was merged from; an empty list if there is
+        none.
+        Raises ServiceUnavailableError or DatabaseError.
+        """
+        rows = await self._db.fetch_all(_SELECT_ENTITY_EVENTS_FOR_EVENT_SQL, event_id)
+        return [_row_to_entity_event(row) for row in rows]
 
 
 _entity_event_repository: EntityEventRepository | None = None

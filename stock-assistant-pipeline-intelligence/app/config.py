@@ -74,6 +74,13 @@ class AggregationConfig:
 
 
 @dataclass
+class ScoringConfig:
+    batch_size: int  # env: SCORING_BATCH_SIZE (default 10)
+    batch_timeout_ms: int  # env: SCORING_BATCH_TIMEOUT_MS (default 5000)
+    consumer_name: str  # env: HOSTNAME (default sapi-scoring-1), unique per pod
+
+
+@dataclass
 class AppConfig:
     db: DatabaseConfig
     http: HttpConfig
@@ -82,6 +89,7 @@ class AppConfig:
     llm: LLMConfig
     entity_analysis: EntityAnalysisConfig
     aggregation: AggregationConfig
+    scoring: ScoringConfig
 
 
 _config: AppConfig | None = None
@@ -149,6 +157,11 @@ def load_config() -> AppConfig:
             sliding_window_hours=int(os.environ.get("SLIDING_WINDOW_HOURS", "4")),
             event_max_timespan_hours=int(os.environ.get("EVENT_MAX_TIMESPAN_HOURS", "24")),
             consumer_name=os.environ.get("HOSTNAME", "sapi-aggregation-1"),
+        ),
+        scoring=ScoringConfig(
+            batch_size=int(os.environ.get("SCORING_BATCH_SIZE", "10")),
+            batch_timeout_ms=int(os.environ.get("SCORING_BATCH_TIMEOUT_MS", "5000")),
+            consumer_name=os.environ.get("HOSTNAME", "sapi-scoring-1"),
         ),
     )
     return _config

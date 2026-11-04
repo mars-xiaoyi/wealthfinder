@@ -19,8 +19,8 @@ pytestmark = [pytest.mark.live, pytest.mark.timeout(120)]
 COMPONENTS = ("database", "redis_stream", "redis_state")
 REQUEST_TIMEOUT_S = 10
 
-# Everything up and the real HK Stock List loaded: degraded, because only the Entity Analysis
-# and Aggregation layers exist yet.
+# Everything up and the real HK Stock List loaded: degraded, because the Cache layer doesn't
+# exist yet.
 ALL_UP_BODY = {
     "status": "degraded",
     "database": "ok",
@@ -30,7 +30,7 @@ ALL_UP_BODY = {
     "layers": {
         "entity_analysis": "ok",
         "aggregation": "ok",
-        "scoring": "error",
+        "scoring": "ok",
         "cache": "error",
     },
 }
@@ -62,7 +62,11 @@ async def _wait_consumer_reading(stream_redis: redis.asyncio.Redis) -> None:
     """Wait until every consumer has created its group, so a failure injected next hits the
     running consumers rather than their startup."""
     async with asyncio.timeout(3):
-        for stream in ("stream:raw_news_cleaned", "stream:entity_event_completed"):
+        for stream in (
+            "stream:raw_news_cleaned",
+            "stream:entity_event_completed",
+            "stream:event_aggregated",
+        ):
             while True:
                 try:
                     if await stream_redis.xinfo_groups(stream):

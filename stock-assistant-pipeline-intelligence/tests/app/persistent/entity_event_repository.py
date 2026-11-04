@@ -162,22 +162,17 @@ async def fetch_entity_event_ids_by_source_url_none(db):
     assert await EntityEventRepository(db).fetch_entity_event_ids_by_source_url(SOURCE_URL) == []
 
 
-@pytest.mark.parametrize(
-    "published_at",
-    [pytest.param(PUBLISHED_AT, id="published"), pytest.param(None, id="no_publication_time")],
-)
-async def fetch_entity_event_success(db, published_at):
-    """The stored row comes back as the EntityEvent it was written from, publication time as
-    stored."""
-    entity_event_id = UUID(int=7)
-    created_at = datetime(2026, 9, 8, 2, 0, tzinfo=UTC)
-    db.fetch_one.return_value = {
+def _row(
+    stock: Stock, entity_event_id: UUID, published_at: datetime | None, created_at: datetime
+) -> dict:
+    """An entity_events row as Postgres returns it, JSONB columns as text."""
+    return {
         "entity_event_id": entity_event_id,
-        "exchange": "HKEX",
+        "exchange": stock.exchange,
         "source_url": SOURCE_URL,
         "source_name": "MINGPAO",
         "published_at": published_at,
-        "stock_code": "00700",
+        "stock_code": stock.stock_code,
         "event_type_primary": "EARNINGS",
         "sentiment_label": "POSITIVE",
         "sentiment_score": 0.8,
@@ -187,8 +182,8 @@ async def fetch_entity_event_success(db, published_at):
             {
                 "version": "v1.0.0",
                 "output": {
-                    "company_name_zh": "騰訊控股",
-                    "company_name_en": "TENCENT",
+                    "company_name_zh": stock.company_name_zh,
+                    "company_name_en": stock.company_name_en,
                     "event_type_secondary": "DIVIDEND",
                     "headline": "業績超預期",
                     "entity_summary": "季度收入按年增長。",
@@ -200,13 +195,32 @@ async def fetch_entity_event_success(db, published_at):
         "updated_at": created_at,
     }
 
-    result = await EntityEventRepository(db).fetch_entity_event(entity_event_id)
 
-    expected = _entity_event(TENCENT)
+def _stored_entity_event(
+    stock: Stock, entity_event_id: UUID, published_at: datetime | None, created_at: datetime
+) -> EntityEvent:
+    """The EntityEvent _row() reads back as."""
+    expected = _entity_event(stock)
     expected.published_at = published_at
     expected.entity_event_id = entity_event_id
     expected.created_at = created_at
-    assert result == expected
+    return expected
+
+
+@pytest.mark.parametrize(
+    "published_at",
+    [pytest.param(PUBLISHED_AT, id="published"), pytest.param(None, id="no_publication_time")],
+)
+async def fetch_entity_event_success(db, published_at):
+    """The stored row comes back as the EntityEvent it was written from, publication time as
+    stored."""
+    entity_event_id = UUID(int=7)
+    created_at = datetime(2026, 9, 8, 2, 0, tzinfo=UTC)
+    db.fetch_one.return_value = _row(TENCENT, entity_event_id, published_at, created_at)
+
+    result = await EntityEventRepository(db).fetch_entity_event(entity_event_id)
+
+    assert result == _stored_entity_event(TENCENT, entity_event_id, published_at, created_at)
     db.fetch_one.assert_awaited_once_with(
         repository_module._SELECT_ENTITY_EVENT_SQL, entity_event_id
     )
@@ -216,6 +230,33 @@ async def fetch_entity_event_not_found(db):
     db.fetch_one.return_value = None
 
     assert await EntityEventRepository(db).fetch_entity_event(UUID(int=7)) is None
+
+
+async def fetch_entity_events_for_event_success(db):
+    """Every row the Event was merged from comes back as the EntityEvent it was written
+    from."""
+    event_id = UUID(int=100)
+    created_at = datetime(2026, 9, 8, 2, 0, tzinfo=UTC)
+    db.fetch_all.return_value = [
+        _row(TENCENT, UUID(int=7), PUBLISHED_AT, created_at),
+        _row(HSBC, UUID(int=8), None, created_at),
+    ]
+
+    result = await EntityEventRepository(db).fetch_entity_events_for_event(event_id)
+
+    assert result == [
+        _stored_entity_event(TENCENT, UUID(int=7), PUBLISHED_AT, created_at),
+        _stored_entity_event(HSBC, UUID(int=8), None, created_at),
+    ]
+    db.fetch_all.assert_awaited_once_with(
+        repository_module._SELECT_ENTITY_EVENTS_FOR_EVENT_SQL, event_id
+    )
+
+
+async def fetch_entity_events_for_event_none(db):
+    db.fetch_all.return_value = []
+
+    assert await EntityEventRepository(db).fetch_entity_events_for_event(UUID(int=100)) == []
 
 
 def get_entity_event_repository_not_initialized():
