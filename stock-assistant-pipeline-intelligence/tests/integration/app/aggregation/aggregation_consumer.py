@@ -142,6 +142,9 @@ class AggregationProbe:
             return {}
         return {entry["message_id"]: entry["times_delivered"] for entry in entries}
 
+    async def destroy_group(self) -> None:
+        await self._stream.xgroup_destroy("stream:entity_event_completed", "sapi-aggregation")
+
     async def group_created(self) -> bool:
         try:
             groups = await self._stream.xinfo_groups("stream:entity_event_completed")
@@ -396,6 +399,61 @@ async def start_stream_redis_outage_recovers(start_aggregation, probe, infra):
         await _wait_merged(probe, "00700", [entity_event_id])
 
         assert layer_tasks.get_layer_tasks()["aggregation"] is layer_task
+
+
+async def start_crash_restarted(start_aggregation, probe):
+    """A consumer that crashes on a real Redis error is reported by GET /v1/health until it
+    restarts on its own, on the same consumer, and the restarted consumer merges messages."""
+    entity_event_id = await probe.seed("00700", P)
+
+    with structlog.testing.capture_logs() as logs:
+        async with start_aggregation(LAYER_RESTART_DELAY_S="2") as client:
+            await _wait_for(probe.group_created, 5)
+            crashed_task = layer_tasks.get_layer_tasks()["aggregation"]
+            consumer = crashed_task.get_coro().cr_frame.f_locals["self"]
+            await probe.destroy_group()
+
+            async def crashed() -> bool:
+                return any(log["event"] == "layer_task_crashed" for log in logs)
+
+            await _wait_for(crashed, 5)
+            while_crashed = await asyncio.wait_for(client.get("/v1/health"), 10)
+
+            await _wait_for(probe.group_created, 5)
+            restarted = await asyncio.wait_for(client.get("/v1/health"), 10)
+            restarted_task = layer_tasks.get_layer_tasks()["aggregation"]
+            await probe.add(entity_event_id)
+            await _wait_merged(probe, "00700", [entity_event_id])
+
+            assert not restarted_task.done()
+            assert restarted_task.get_coro().cr_frame.f_locals["self"] is consumer
+
+    crash_logs = [log for log in logs if log["event"] == "layer_task_crashed"]
+    assert len(crash_logs) == 1
+    assert crash_logs[0]["log_level"] == "critical"
+    assert crash_logs[0]["layer"] == "aggregation"
+    crash = crash_logs[0]["exc_info"]
+    assert isinstance(crash, ExceptionGroup)
+    assert [type(exc) for exc in crash.exceptions] == [redis.exceptions.ResponseError]
+    assert crashed_task.done()
+    assert not crashed_task.cancelled()
+    assert restarted_task is not crashed_task
+    # HKEX is refused on purpose, so the HK Stock List is not ready.
+    other_layers = {"entity_analysis": "ok", "scoring": "ok", "cache": "error"}
+    assert while_crashed.status_code == 503
+    assert while_crashed.json() == {
+        "status": "unhealthy",
+        "database": "ok",
+        "redis_stream": "ok",
+        "redis_state": "ok",
+        "hk_stock_list": "not_ready",
+        "layers": {"aggregation": "error", **other_layers},
+    }
+    assert restarted.status_code == 503
+    assert restarted.json() == {
+        **while_crashed.json(),
+        "layers": {"aggregation": "ok", **other_layers},
+    }
 
 
 def _group_tasks() -> list[asyncio.Task[object]]:

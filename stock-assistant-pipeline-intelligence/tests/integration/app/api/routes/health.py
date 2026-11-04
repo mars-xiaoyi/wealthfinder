@@ -106,13 +106,14 @@ async def get_health_dependency_down_then_recovered(
     infra, start_app, stream_redis, component, mode
 ):
     """A stopped container refuses connections at once; a paused one never answers, so its
-    check ends at HEALTH_CHECK_TIMEOUT_S (default 2s). The Entity Analysis layer rides out
-    the outage without crashing."""
+    check ends at HEALTH_CHECK_TIMEOUT_S (default 2s). The Entity Analysis and Aggregation
+    layers ride out the outage without crashing."""
     container = infra.for_component(component)
 
     async with start_app() as client:
         await _wait_consumer_reading(stream_redis)
         layer_task = layer_tasks.get_layer_tasks()["entity_analysis"]
+        aggregation_task = layer_tasks.get_layer_tasks()["aggregation"]
         getattr(container, mode)()
         with structlog.testing.capture_logs() as logs:
             response, elapsed = await _get_health(client)
@@ -132,6 +133,8 @@ async def get_health_dependency_down_then_recovered(
         assert response.json() == ALL_UP_BODY
         assert layer_tasks.get_layer_tasks()["entity_analysis"] is layer_task
         assert not layer_task.done()
+        assert layer_tasks.get_layer_tasks()["aggregation"] is aggregation_task
+        assert not aggregation_task.done()
 
 
 async def get_health_repeated_db_timeouts(infra, start_app):
