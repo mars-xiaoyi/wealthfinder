@@ -97,8 +97,8 @@ class ScoringConsumer:
                 logger.warning("scoring_reclaim_sweep_failed", exc_info=True)
 
     async def _route(self, message: StreamMessage) -> None:
-        """Dead-letter a message that is malformed or out of retries, and score any other's
-        Event, unless it is already being scored."""
+        """Skip a message whose Event is already being scored, dead-letter one that is malformed
+        or out of retries, and score any other's Event."""
         try:
             event_id = _get_valid_event_id(message)
             if event_id is None:
