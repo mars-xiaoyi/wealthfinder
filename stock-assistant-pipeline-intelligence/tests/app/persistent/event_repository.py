@@ -195,6 +195,19 @@ async def persist_events_no_events(db, tx):
     tx.execute.assert_not_awaited()
 
 
+async def fetch_event_success(db):
+    db.fetch_one.return_value = _row()
+
+    assert await EventRepository(db).fetch_event(EVENT_ID) == _persisted_event()
+    db.fetch_one.assert_awaited_once_with(repository_module._SELECT_EVENT_SQL, EVENT_ID)
+
+
+async def fetch_event_not_found(db):
+    db.fetch_one.return_value = None
+
+    assert await EventRepository(db).fetch_event(EVENT_ID) is None
+
+
 async def fetch_unpublished_events_success(db):
     db.fetch_all.return_value = [_row(), _row(OTHER_EVENT_ID)]
 

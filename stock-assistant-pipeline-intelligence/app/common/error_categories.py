@@ -12,4 +12,5 @@ class ErrorCategory(StrEnum):
     LLM = "LLM"
     NEWS_CLIENT = "NEWS_CLIENT"
     REDIS = "REDIS"
+    SCORING = "SCORING"
     STOCK_LIST = "STOCK_LIST"

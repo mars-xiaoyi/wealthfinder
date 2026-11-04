@@ -77,6 +77,8 @@ _INSERT_EVENT_ENTITY_MAP_SQL = """
     ON CONFLICT DO NOTHING
 """
 
+_SELECT_EVENT_SQL = "SELECT * FROM events WHERE event_id = $1"
+
 _SELECT_UNPUBLISHED_EVENTS_SQL = """
     SELECT * FROM events
     WHERE event_id = ANY($1)
@@ -186,6 +188,14 @@ class EventRepository:
                 if row is not None:
                     written.append(_row_to_event(row))
         return written
+
+    async def fetch_event(self, event_id: UUID) -> Event | None:
+        """
+        Return the stored Event with this id, or None if there is none.
+        Raises ServiceUnavailableError or DatabaseError.
+        """
+        row = await self._db.fetch_one(_SELECT_EVENT_SQL, event_id)
+        return _row_to_event(row) if row is not None else None
 
     async def fetch_unpublished_events(self, event_ids: list[UUID]) -> list[Event]:
         """

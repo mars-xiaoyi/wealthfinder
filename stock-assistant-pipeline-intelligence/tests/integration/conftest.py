@@ -58,6 +58,8 @@ OPTIONAL_ENV = (
     "AGG_MAX_RETRY",
     "SLIDING_WINDOW_HOURS",
     "EVENT_MAX_TIMESPAN_HOURS",
+    "SCORING_BATCH_SIZE",
+    "SCORING_BATCH_TIMEOUT_MS",
 )
 # A project id for cases that never call Vertex AI; nothing is sent to it.
 PLACEHOLDER_VERTEX_PROJECT = "sapi-integration-test"

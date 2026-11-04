@@ -22,6 +22,7 @@ class EventAggregatedStream:
 
     NAME: Final = "stream:event_aggregated"
     VERSION: Final = "1"
+    CONSUMER_GROUP: Final = "sapi-scoring"
 
 
 class EntityAnalysisDeadLetterStream:

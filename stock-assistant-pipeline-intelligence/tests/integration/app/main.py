@@ -22,7 +22,7 @@ NOT_READY_BODY = {
     "layers": {
         "entity_analysis": "ok",
         "aggregation": "ok",
-        "scoring": "error",
+        "scoring": "ok",
         "cache": "error",
     },
 }

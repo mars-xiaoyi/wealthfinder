@@ -342,7 +342,7 @@ async def start_crash_restarted(start_consumer, streams, stub_sadi):
         assert log["log_level"] == "critical"
         assert log["layer"] == "entity_analysis"
         assert isinstance(log["exc_info"], redis.exceptions.ResponseError)
-    other_layers = {"aggregation": "ok", "scoring": "error", "cache": "error"}
+    other_layers = {"aggregation": "ok", "scoring": "ok", "cache": "error"}
     assert while_crashed.status_code == 200
     assert while_crashed.json() == {
         "status": "degraded",
