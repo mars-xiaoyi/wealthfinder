@@ -621,7 +621,7 @@ This document does not introduce new design — every ticket below implements so
 ### Scoring: Brief Summary Salvage & Reuse (S)
 
 **Status:** Created
-**Depends on:** Scoring: Brief Summary; Scoring: Rule Score & Persist (so step 3 runs while the Skill does)
+**Depends on:** Scoring: Brief Summary; Scoring: Rule Score & Persist (so step 3 runs while the Skill does); Scoring: Source Weights via Admin (so step 3's Redis read can fail while the Skill runs)
 **Scope:** Keep a finished summary when a later step fails, and reuse it on the retry (impl.md §13.1 step 2's reuse check, step 3's failure handling; design.md §5.4).
 - `app/scoring/scoring_service.py`: step 2's reuse check, step 3's `try`/`except` around `brief_task`.
 **Acceptance criteria** (per impl.md §13.1):
@@ -677,7 +677,7 @@ This document does not introduce new design — every ticket below implements so
 ### Scoring: Concurrency & Rate-Limit Backoff (S)
 
 **Status:** Created
-**Depends on:** Scoring: Reclaim, Dead Letter & Schema-Version Check (both loops dispatch through `WorkerPool`); Entity Analysis: Concurrency & Rate-Limit Backoff (for `WorkerPool`)
+**Depends on:** Scoring: Reclaim, Dead Letter & Schema-Version Check (both loops dispatch through `WorkerPool`); Entity Analysis: Concurrency & Rate-Limit Backoff (for `WorkerPool`); Scoring: Brief Summary (for the first LLM call, so the cap and backoff are observable)
 **Scope:** Score Events concurrently, bounded by `SCORING_MAX_CONCURRENT`, and pause the layer for `RATE_LIMIT_BACKOFF_S` on a Vertex AI rate limit (impl.md §11.3 reused, §13.2; design.md §12.1).
 - `app/config.py`: `ScoringConfig.max_concurrent`.
 - `app/main.py`: a second `WorkerPool` instance for Scoring (§16).
