@@ -19,17 +19,20 @@ pytestmark = [pytest.mark.live, pytest.mark.timeout(120)]
 SCORING_ENV = {
     "SCORING_BATCH_TIMEOUT_MS": "200",
     "REDIS_RECONNECT_INTERVAL_S": "1",
+    "TOTAL_ACTIVE_SOURCES_DEFAULT": "4",
 }
 POLL_INTERVAL_S = 0.05
 # A fixed aggregation time for every seeded Event.
 T0 = datetime(2026, 9, 8, 3, 0, tzinfo=UTC)
+# The reference Event E1's constituents: (source_name, sentiment_label, sentiment_score).
+E1_CONSTITUENTS = [("HKEX", "POSITIVE", 0.8), ("MINGPAO", "NEGATIVE", 0.4)]
 _INSERT_ENTITY_EVENT_SQL = """
     INSERT INTO entity_events (
         entity_event_id, exchange, source_url, source_name, published_at, stock_code,
         event_type_primary, sentiment_label, sentiment_score, headline, entity_summary,
         additional_outcome, metadata, created_at, updated_at
     )
-    VALUES ($1, 'HKEX', $2, 'MINGPAO', $3, '00700', 'EARNINGS', 'POSITIVE', 0.8, '業績超預期',
+    VALUES ($1, 'HKEX', $2, $6, $3, '00700', 'EARNINGS', $7, $8, '業績超預期',
             '季度收入按年增長。', $4, $5, $3, $3)
 """
 _INSERT_EVENT_SQL = """
@@ -64,24 +67,37 @@ class ScoringProbe:
         self._database_url = infra.env()["DATABASE_URL"]
         self._stream = stream
 
-    async def seed(self) -> uuid.UUID:
-        """Store an Event of two EntityEvents, with its entity_events, events and
-        event_entity_map rows; returns its event_id."""
+    async def seed(
+        self,
+        constituents: list[tuple[str, str, float]] | None = None,
+    ) -> uuid.UUID:
+        """Store an Event of two EntityEvents, by default both MINGPAO POSITIVE 0.8, with its
+        entity_events, events and event_entity_map rows; returns its event_id."""
+        constituents = constituents or [("MINGPAO", "POSITIVE", 0.8)] * 2
         event_id = uuid.uuid4()
         published = [T0 - timedelta(hours=1), T0]
         entity_event_ids = [uuid.uuid4() for _ in published]
+        # One entry per source, from its most recent report, as Aggregation writes it.
+        latest = {
+            source_name: (entity_event_id, published_at)
+            for entity_event_id, published_at, (source_name, _, _) in zip(
+                entity_event_ids, published, constituents, strict=True
+            )
+        }
         source_list = [
             {
-                "source_name": "MINGPAO",
+                "source_name": source_name,
                 "url": f"https://example.com/{entity_event_id}",
                 "published_at": published_at.isoformat(),
             }
-            for entity_event_id, published_at in zip(entity_event_ids, published, strict=True)
+            for source_name, (entity_event_id, published_at) in sorted(latest.items())
         ]
         conn = await asyncpg.connect(self._database_url)
         try:
             async with conn.transaction():
-                for entity_event_id, published_at in zip(entity_event_ids, published, strict=True):
+                for entity_event_id, published_at, (source_name, label, score) in zip(
+                    entity_event_ids, published, constituents, strict=True
+                ):
                     await conn.execute(
                         _INSERT_ENTITY_EVENT_SQL,
                         entity_event_id,
@@ -89,6 +105,9 @@ class ScoringProbe:
                         published_at,
                         json.dumps(_ADDITIONAL_OUTCOME, ensure_ascii=False),
                         json.dumps({"cleaned_id": str(uuid.uuid4())}),
+                        source_name,
+                        label,
+                        score,
                     )
                 await conn.execute(
                     _INSERT_EVENT_SQL,
@@ -103,6 +122,30 @@ class ScoringProbe:
         finally:
             await conn.close()
         return event_id
+
+    async def reaggregate(self, event_id: uuid.UUID, aggregation_updated_at: datetime) -> None:
+        """Move the stored Event to a new merge state, as a later Aggregation flush does."""
+        conn = await asyncpg.connect(self._database_url)
+        try:
+            await conn.execute(
+                "UPDATE events SET aggregation_updated_at = $2 WHERE event_id = $1",
+                event_id,
+                aggregation_updated_at,
+            )
+        finally:
+            await conn.close()
+
+    async def scores(self, event_id: uuid.UUID) -> list[asyncpg.Record]:
+        """The Event's event_scores rows."""
+        conn = await asyncpg.connect(self._database_url)
+        try:
+            return await conn.fetch("SELECT * FROM event_scores WHERE event_id = $1", event_id)
+        finally:
+            await conn.close()
+
+    async def scored(self) -> list[dict[str, str]]:
+        """The fields of every stream:event_scored entry, oldest first."""
+        return [fields for _, fields in await self._stream.xrange("stream:event_scored")]
 
     async def truncate(self) -> None:
         conn = await asyncpg.connect(self._database_url)
@@ -257,3 +300,72 @@ async def start_stream_redis_outage_recovers(start_scoring, probe, infra):
 
         assert layer_tasks.get_layer_tasks()["scoring"] is layer_task
         assert not layer_task.done()
+
+
+async def _wait_scored(probe: ScoringProbe, event_id: uuid.UUID, count: int) -> asyncpg.Record:
+    """Wait until stream:event_scored holds count entries and the stream:event_aggregated
+    messages are all ACKed; returns the Event's one event_scores row."""
+
+    async def announced() -> bool:
+        return len(await probe.scored()) == count and not await probe.pending()
+
+    await _wait_for(announced, 10)
+    rows = await probe.scores(event_id)
+    assert len(rows) == 1
+    return rows[0]
+
+
+async def start_scores_fresh_event(start_scoring, probe):
+    """
+    E1 (EARNINGS, HKEX POSITIVE 0.8, MINGPAO NEGATIVE 0.4) with the tier weights HKEX 9.0 and
+    MINGPAO 6.0 and 4 active sources: event type 9.0, authority 9.0, strength 6.4, heat 5.0, so
+    base 6.41; the weighted sentiment 0.32 gives direction 1 and a final score 6.41 * 0.67.
+    """
+    event_id = await probe.seed(E1_CONSTITUENTS)
+
+    async with start_scoring():
+        await _wait_for(probe.group_created, 5)
+        await probe.add(event_id)
+        row = await _wait_scored(probe, event_id, 1)
+
+    assert row["base_rule_score"] == pytest.approx(6.41, abs=1e-6)
+    assert row["abs_final_score"] == pytest.approx(4.2947, abs=1e-6)
+    assert row["stock_impact_score"] == 0.0
+    assert row["direction"] == 1
+    assert row["llm_fallback"] is True
+    assert row["scored_aggregation_updated_at"] == T0
+    rule_score_detail = json.loads(row["rule_score_detail"])
+    assert rule_score_detail["version"] == "v1.0.0"
+    assert rule_score_detail["output"] == {
+        "event_type_score": pytest.approx(9.0, abs=1e-6),
+        "source_authority_score": pytest.approx(9.0, abs=1e-6),
+        "sentiment_strength_score": pytest.approx(6.4, abs=1e-6),
+        "source_heat_score": pytest.approx(5.0, abs=1e-6),
+    }
+    assert json.loads(row["llm_score_detail"]) == {
+        "version": "none",
+        "output": {"stock_impact_score": 0.0, "adjustment_reason": ""},
+    }
+    assert await probe.scored() == [{"event_id": str(event_id), "v": "1"}]
+    assert await probe.pending() == {}
+
+
+async def start_rescore_keeps_one_row(start_scoring, probe):
+    """Re-scoring an Event after a new merge state updates its one row in place."""
+    event_id = await probe.seed(E1_CONSTITUENTS)
+    t1 = T0 + timedelta(minutes=5)
+
+    async with start_scoring():
+        await _wait_for(probe.group_created, 5)
+        await probe.add(event_id)
+        first = await _wait_scored(probe, event_id, 1)
+        await probe.reaggregate(event_id, t1)
+        await probe.add(event_id)
+        second = await _wait_scored(probe, event_id, 2)
+
+    assert second["score_id"] == first["score_id"]
+    assert second["created_at"] == first["created_at"]
+    assert second["scored_at"] > first["scored_at"]
+    assert second["scored_aggregation_updated_at"] == t1
+    assert await probe.scored() == [{"event_id": str(event_id), "v": "1"}] * 2
+    assert await probe.pending() == {}
