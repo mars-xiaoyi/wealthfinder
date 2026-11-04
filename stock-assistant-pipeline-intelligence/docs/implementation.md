@@ -1262,7 +1262,7 @@ Per system-design.md §1.4 / §11.1, SAPI opens **two independent Redis connecti
 
 #### Stream Constants — `app/redis/stream_enum.py`
 
-Each stream's constants live together in their own class: its `NAME`, the `VERSION` of its message format (carried in every message's `v` field, so each format can change on its own), and, for a stream SAPI consumes, the `CONSUMER_GROUP` that reads it.
+Each stream's constants live together in their own class: its `NAME`, the `VERSION` of its message format (carried in every message's `v` field, so each format can change on its own), and, for a stream SAPI consumes, the `CONSUMER_GROUP` that reads it. Dead-letter streams carry only `NAME`: they all share one message format, whose version is `dead_letter()`'s constant (below).
 
 ```python
 # app/redis/stream_enum.py
@@ -1290,19 +1290,15 @@ class EventScoredStream:
 
 class EntityAnalysisDeadLetterStream:
     NAME: Final = "stream:entity_analysis_dead_letter"
-    VERSION: Final = "1"
 
 class AggregationDeadLetterStream:
     NAME: Final = "stream:aggregation_dead_letter"
-    VERSION: Final = "1"
 
 class ScoringDeadLetterStream:
     NAME: Final = "stream:scoring_dead_letter"
-    VERSION: Final = "1"
 
 class CacheDeadLetterStream:
     NAME: Final = "stream:cache_dead_letter"
-    VERSION: Final = "1"
 ```
 
 | Class | Producer | Consumer Group |
@@ -1410,17 +1406,17 @@ Returns : List of ReclaimedMessage. delivery_count is the pending entry's times_
 Raises  : redis.ConnectionError / redis.TimeoutError, untranslated (Reconnect behaviour, below).
 ```
 
-#### Method: `dead_letter(message, stream, group, dead_letter_stream, dead_letter_version, reason, log_event) -> None`
+#### Method: `dead_letter(message, stream, group, dead_letter_stream, reason, log_event) -> None`
 
 ```python
 async def dead_letter(self, message: StreamMessage, stream: str, group: str,
-                      dead_letter_stream: str, dead_letter_version: str,
-                      reason: DeadLetterReason, log_event: str) -> None:
+                      dead_letter_stream: str, reason: DeadLetterReason,
+                      log_event: str) -> None:
     delivery_count = message.delivery_count if isinstance(message, ReclaimedMessage) else 1
     await self.publish(dead_letter_stream, {
         "message_id": message.id, "fields": json.dumps(message.fields),
         "delivery_count": str(delivery_count), "failed_at": datetime.now(UTC).isoformat(),
-        "v": dead_letter_version,
+        "v": _DEAD_LETTER_VERSION,   # "1" — one message format for every dead-letter stream, a constant in this module
     })
     await self.ack(stream, group, message.id)
     logger.warning(log_event, message_id=message.id, delivery_count=delivery_count, reason=reason)
@@ -1478,8 +1474,7 @@ Per system-design.md §12.1 "RedisStreamClient Reconnect": `read_from()`/`ack()`
   if reclaimed.delivery_count >= config.max_retry:   # ENTITY_ANALYSIS_MAX_RETRY / AGG_MAX_RETRY / SCORING_MAX_RETRY / CACHE_MAX_RETRY
       await redis_stream.dead_letter(
           reclaimed, <Layer stream>.NAME, <Layer stream>.CONSUMER_GROUP,
-          <Layer>DeadLetterStream.NAME, <Layer>DeadLetterStream.VERSION,
-          DeadLetterReason.RETRIES_EXHAUSTED, "<layer>_message_dead_lettered",
+          <Layer>DeadLetterStream.NAME, DeadLetterReason.RETRIES_EXHAUSTED, "<layer>_message_dead_lettered",
       )
       continue   # never enters the layer's normal processing path
   ```
