@@ -10,7 +10,8 @@ from app.common.errors import ServiceUnavailableError
 from app.db import connection as connection_module
 from app.db.connection import DatabaseClient, TransactionConnection
 from app.models.entity_event import EventTypeEnum
-from app.models.event import EntitySource, Event
+from app.models.event import BriefSummary, EntitySource, Event
+from app.models.versioned_metadata import VersionedMetadata
 from app.persistent import event_repository as repository_module
 from app.persistent.event_repository import EventRepository
 
@@ -202,6 +203,34 @@ async def fetch_event_success(db):
     db.fetch_one.assert_awaited_once_with(repository_module._SELECT_EVENT_SQL, EVENT_ID)
 
 
+async def fetch_event_with_brief_summary(db):
+    row = _row()
+    row["brief_summary"] = json.dumps(
+        {
+            "version": "v1.0.0",
+            "aggregation_updated_at": "2026-09-08T03:00:05+00:00",
+            "fallback": True,
+            "output": {
+                "summary_short": "騰訊公布季度業績",
+                "summary_full": "騰訊公布季度業績",
+                "key_numbers": [],
+            },
+        }
+    )
+    db.fetch_one.return_value = row
+    expected = _persisted_event()
+    expected.brief_summary = VersionedMetadata(
+        "v1.0.0",
+        BriefSummary(
+            summary_short="騰訊公布季度業績", summary_full="騰訊公布季度業績", key_numbers=[]
+        ),
+    )
+    expected.brief_summary_aggregation_updated_at = AGGREGATION_UPDATED_AT
+    expected.brief_summary_fallback = True
+
+    assert await EventRepository(db).fetch_event(EVENT_ID) == expected
+
+
 async def fetch_event_not_found(db):
     db.fetch_one.return_value = None
 
@@ -231,6 +260,35 @@ async def mark_published_success(db):
     db.execute.assert_awaited_once_with(
         repository_module._MARK_PUBLISHED_SQL, EVENT_ID, AGGREGATION_UPDATED_AT
     )
+
+
+async def update_brief_summary_success(db):
+    brief_summary = VersionedMetadata(
+        "v1.0.0",
+        BriefSummary(
+            summary_short="騰訊業績超預期",
+            summary_full="騰訊季度收入按年增長，盈利勝預期。",  # noqa: RUF001
+            key_numbers=["收入增長 12%"],
+        ),
+    )
+
+    await EventRepository(db).update_brief_summary(
+        EVENT_ID, brief_summary, AGGREGATION_UPDATED_AT, False
+    )
+
+    sql, event_id, payload = db.execute.await_args.args
+    assert sql == repository_module._UPDATE_BRIEF_SUMMARY_SQL
+    assert event_id == EVENT_ID
+    assert json.loads(payload) == {
+        "version": "v1.0.0",
+        "aggregation_updated_at": "2026-09-08T03:00:05+00:00",
+        "fallback": False,
+        "output": {
+            "summary_short": "騰訊業績超預期",
+            "summary_full": "騰訊季度收入按年增長，盈利勝預期。",  # noqa: RUF001
+            "key_numbers": ["收入增長 12%"],
+        },
+    }
 
 
 async def fetch_mapped_event_id_success(db):

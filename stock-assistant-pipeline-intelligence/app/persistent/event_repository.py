@@ -8,8 +8,9 @@ from app.common.error_categories import ErrorCategory
 from app.common.errors import ServiceUnavailableError
 from app.db.connection import DatabaseClient, get_db_client
 from app.models.entity_event import EventTypeEnum
-from app.models.event import EntitySource, Event
+from app.models.event import BriefSummary, EntitySource, Event
 from app.models.event_entity_map import EventEntityMap
+from app.models.versioned_metadata import VersionedMetadata
 
 # Only newer merge state is written: an unchanged Event, or an older snapshot of one, writes
 # nothing and returns no row. created_at is not in SET, so a re-flush keeps it.
@@ -95,8 +96,13 @@ _MARK_PUBLISHED_SQL = """
 
 _SELECT_MAPPED_EVENT_ID_SQL = "SELECT event_id FROM event_entity_map WHERE entity_event_id = $1"
 
+_UPDATE_BRIEF_SUMMARY_SQL = (
+    "UPDATE events SET brief_summary = $2, updated_at = now() WHERE event_id = $1"
+)
+
 
 def _row_to_event(row: asyncpg.Record) -> Event:
+    brief_summary = json.loads(row["brief_summary"]) if row["brief_summary"] is not None else None
     return Event(
         event_id=row["event_id"],
         exchange=row["exchange"],
@@ -115,6 +121,22 @@ def _row_to_event(row: asyncpg.Record) -> Event:
             )
             for source in json.loads(row["source_list"])
         ],
+        brief_summary=VersionedMetadata(
+            version=brief_summary["version"],
+            output=BriefSummary(
+                summary_short=brief_summary["output"]["summary_short"],
+                summary_full=brief_summary["output"]["summary_full"],
+                key_numbers=brief_summary["output"]["key_numbers"],
+            ),
+        )
+        if brief_summary is not None
+        else None,
+        brief_summary_aggregation_updated_at=datetime.fromisoformat(
+            brief_summary["aggregation_updated_at"]
+        )
+        if brief_summary is not None
+        else None,
+        brief_summary_fallback=brief_summary["fallback"] if brief_summary is not None else None,
         aggregation_updated_at=row["aggregation_updated_at"],
         updated_at=row["updated_at"],
         created_at=row["created_at"],
@@ -222,6 +244,32 @@ class EventRepository:
         """
         row = await self._db.fetch_one(_SELECT_MAPPED_EVENT_ID_SQL, entity_event_id)
         return row["event_id"] if row is not None else None
+
+    async def update_brief_summary(
+        self,
+        event_id: UUID,
+        brief_summary: VersionedMetadata[BriefSummary],
+        aggregation_updated_at: datetime,
+        fallback: bool,
+    ) -> None:
+        """
+        Store the Event's brief summary, made for its merge state as of aggregation_updated_at;
+        fallback says whether it is the extractive fallback.
+        Raises ServiceUnavailableError or DatabaseError.
+        """
+        payload = {
+            "version": brief_summary.version,
+            "aggregation_updated_at": aggregation_updated_at.isoformat(),
+            "fallback": fallback,
+            "output": {
+                "summary_short": brief_summary.output.summary_short,
+                "summary_full": brief_summary.output.summary_full,
+                "key_numbers": brief_summary.output.key_numbers,
+            },
+        }
+        await self._db.execute(
+            _UPDATE_BRIEF_SUMMARY_SQL, event_id, json.dumps(payload, ensure_ascii=False)
+        )
 
 
 _event_repository: EventRepository | None = None
