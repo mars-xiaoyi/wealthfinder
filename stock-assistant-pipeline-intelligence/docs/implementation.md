@@ -86,6 +86,18 @@ alembic upgrade head
 uvicorn app.main:app --reload --port 8001
 ```
 
+### Running Tests
+
+Neither suite needs a `.env` or a running service: the unit tests mock every dependency, and the `live` suite starts its own Postgres and Redis containers and sets every variable the app reads.
+
+```bash
+pytest                                # unit tests (needs the venv with requirements-test.txt)
+scripts/test-live.sh                  # live integration suite, from a clean checkout
+scripts/test-live.sh -m "live and not vertex"   # without the cases that call Vertex AI
+```
+
+`scripts/test-live.sh` needs only `uv` and a running Docker: it creates `.venv` and installs `requirements-test.txt` when needed, and passes extra arguments to pytest. The `vertex` cases call the real Vertex AI with application default credentials (step 4) and `VERTEX_AI_PROJECT`, which falls back to `gcloud config get-value project`; without either, the script warns and those cases fail.
+
 ### Environment Variables for Local Development
 
 Copy `.env.example` to `.env` (gitignored — do NOT commit it) and adjust as needed:
@@ -177,6 +189,8 @@ sapi/
 │       ├── 001_create_entity_events.py  # entity_events
 │       ├── 002_create_events.py         # events + event_entity_map
 │       └── 003_create_event_scores.py   # event_scores
+├── scripts/
+│   └── test-live.sh                     # one-command live integration run (§1 Running Tests)
 ├── Dockerfile
 ├── requirements.txt
 └── docker-compose.yml
