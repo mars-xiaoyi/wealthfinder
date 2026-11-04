@@ -21,6 +21,7 @@ from app.llm.vertex_adapter import create_llm_adapter
 from app.logger import configure_logging, get_logger
 from app.persistent.entity_event_repository import create_entity_event_repository
 from app.persistent.event_repository import create_event_repository
+from app.persistent.event_score_repository import create_event_score_repository
 from app.redis.state_client import create_state_client
 from app.redis.stream_client import create_stream_client
 from app.scoring.scoring_consumer import ScoringConsumer
@@ -52,6 +53,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         create_news_client(http_client, config.entity_analysis.sadi_api_url)
         create_entity_event_repository()
         create_event_repository()
+        create_event_score_repository()
         create_event_aggregation_store()
 
         # Eager, blocking HK Stock List load. Unlike the infra above, a failure must not abort

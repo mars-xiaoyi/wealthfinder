@@ -176,7 +176,7 @@ async def upgrade_downgrade_002_success(infra: Infra, alembic):
         entity_event_id, event_id, other_event_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         await conn.execute(_INSERT_ENTITY_EVENT_SQL, entity_event_id, f"u{entity_event_id}")
 
-        alembic("upgrade", "head")
+        alembic("upgrade", "002")
 
         assert await _columns(conn, "events") == EVENTS_COLUMNS
         assert await _columns(conn, "event_entity_map") == EVENT_ENTITY_MAP_COLUMNS

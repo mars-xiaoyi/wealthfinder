@@ -4,6 +4,8 @@ import pytest
 
 from app import config as config_module
 from app.common.errors import SAPIError, ServiceUnavailableError
+from app.config import EventTypeScore
+from app.models.entity_event import EventTypeEnum
 
 REQUIRED_ENV = {
     "DATABASE_URL": "postgresql://postgres:password@localhost:5432/sapi",
@@ -62,6 +64,17 @@ def load_config_defaults():
     assert config.scoring.batch_size == 10
     assert config.scoring.batch_timeout_ms == 5000
     assert config.scoring.consumer_name == "sapi-scoring-1"
+    assert config.scoring.total_active_sources_default == 4
+    assert config.scoring.event_type_score == [
+        EventTypeScore(EventTypeEnum.EARNINGS, 9.0),
+        EventTypeScore(EventTypeEnum.BUYBACK, 7.0),
+        EventTypeScore(EventTypeEnum.MA, 8.5),
+        EventTypeScore(EventTypeEnum.REGULATORY, 8.0),
+        EventTypeScore(EventTypeEnum.MANAGEMENT_CHANGE, 7.0),
+        EventTypeScore(EventTypeEnum.ANALYST_RATING, 5.0),
+        EventTypeScore(EventTypeEnum.DIVIDEND, 6.0),
+        EventTypeScore(EventTypeEnum.GENERAL_ANNOUNCEMENT, 4.0),
+    ]
 
 
 def load_config_overrides(monkeypatch):
@@ -94,6 +107,15 @@ def load_config_overrides(monkeypatch):
     monkeypatch.setenv("AGG_MAX_RETRY", "7")
     monkeypatch.setenv("SCORING_BATCH_SIZE", "4")
     monkeypatch.setenv("SCORING_BATCH_TIMEOUT_MS", "300")
+    monkeypatch.setenv("TOTAL_ACTIVE_SOURCES_DEFAULT", "6")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_EARNINGS", "1.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_BUYBACK", "2.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_MA", "3.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_REGULATORY", "4.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_MANAGEMENT_CHANGE", "5.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_ANALYST_RATING", "6.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_DIVIDEND", "7.5")
+    monkeypatch.setenv("EVENT_TYPE_WEIGHT_GENERAL", "8.5")
 
     config = config_module.load_config()
 
@@ -128,6 +150,17 @@ def load_config_overrides(monkeypatch):
     assert config.scoring.batch_size == 4
     assert config.scoring.batch_timeout_ms == 300
     assert config.scoring.consumer_name == "sapi-pod-7"
+    assert config.scoring.total_active_sources_default == 6
+    assert config.scoring.event_type_score == [
+        EventTypeScore(EventTypeEnum.EARNINGS, 1.5),
+        EventTypeScore(EventTypeEnum.BUYBACK, 2.5),
+        EventTypeScore(EventTypeEnum.MA, 3.5),
+        EventTypeScore(EventTypeEnum.REGULATORY, 4.5),
+        EventTypeScore(EventTypeEnum.MANAGEMENT_CHANGE, 5.5),
+        EventTypeScore(EventTypeEnum.ANALYST_RATING, 6.5),
+        EventTypeScore(EventTypeEnum.DIVIDEND, 7.5),
+        EventTypeScore(EventTypeEnum.GENERAL_ANNOUNCEMENT, 8.5),
+    ]
 
 
 @pytest.mark.parametrize("missing", list(REQUIRED_ENV))

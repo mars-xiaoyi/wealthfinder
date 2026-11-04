@@ -97,7 +97,13 @@ def config():
             event_max_timespan_hours=24,
             consumer_name="sapi-aggregation-1",
         ),
-        scoring=ScoringConfig(batch_size=10, batch_timeout_ms=5000, consumer_name="sapi-scoring-1"),
+        scoring=ScoringConfig(
+            batch_size=10,
+            batch_timeout_ms=5000,
+            consumer_name="sapi-scoring-1",
+            total_active_sources_default=4,
+            event_type_score=[],
+        ),
     )
 
 
