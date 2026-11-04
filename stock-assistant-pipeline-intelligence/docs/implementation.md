@@ -4743,13 +4743,13 @@ async def count_active_sources(config: ScoringConfig) -> int:
 
 | Scenario | Implementation |
 |---|---|
-| DB read failure | `EventRepository.fetch_event()`/`EntityEventRepository.fetch_entity_events_for_event()` (§10.2/§10.1) raise inside `ScoringService.score_event()`; propagates uncaught to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK |
+| DB read failure | `EventRepository.fetch_event()`/`EntityEventRepository.fetch_entity_events_for_event()` (§10.2/§10.1) raise `ServiceUnavailableError` or `DatabaseError` inside `ScoringService.score_event()`; propagates uncaught to `ScoringConsumer._process_one()`'s `except SAPIError`, logged at its own level (§13.2); do not ACK |
 | Event row not found | `fetch_event()` returns `None` — `stream:event_aggregated` is only published after `persist_events()` commits (§12.1), so this means the row is gone, and no redelivery can fix it. `score_event()` logs `scoring_event_missing` (warning) and returns; ACKed the same as success (§13.2) |
 | BriefSummarySkill: `LLMSchemaViolationError` | Fallback applied inside the Skill (§8.3) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
 | EventLLMScoringSkill: `LLMSchemaViolationError` | Fallback applied inside the Skill (§8.4) — `result.failure_reason` stays `None`; `ScoringService.score_event()` continues normally |
 | Either Skill: `LLMRateLimitError`/`LLMProviderError`/`LLMAuthenticationError` | Caught inside `SkillBase.run()` (§8.1, inherited by both Skills) → `result.failure_reason=err` (the caught exception itself), never raised by `run()` itself; `ScoringService.score_event()` logs the Skill's completion event from `result.skill_log` and re-raises `result.failure_reason` directly, same as `find_entity_events()` (§11.1); `ScoringConsumer` calls `WorkerPool.trigger_backoff()` only for `LLMRateLimitError`, removes from `_in_process`, does not ACK either way. `LLMAuthenticationError` is logged at CRITICAL, its own `log_level` (§7.2) |
 | `source:config` unreachable | The Redis error propagates from `get_source_weights()`/`count_active_sources()` (§13.5) — no fallback weights, no Admin call — to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK (rationale: system-design.md §5.11) |
-| DB write failure | `_db_write_with_retry()` exhausts retries inside `EventRepository.update_brief_summary()`/`EventScoreRepository.persist_score_if_not_stale()` (§10.2/§10.3), raises; propagates uncaught to `ScoringConsumer`'s outer `except Exception` (§13.2); do not ACK |
+| DB write failure | `_db_write_with_retry()` exhausts retries inside `EventRepository.update_brief_summary()`/`EventScoreRepository.persist_score_if_not_stale()` (§10.2/§10.3), raises `ServiceUnavailableError` or `DatabaseError`; propagates uncaught to `ScoringConsumer._process_one()`'s `except SAPIError`, logged at its own level (§13.2); do not ACK |
 | `RedisStreamClient` unreachable | Per §6.1 |
 
 ---
