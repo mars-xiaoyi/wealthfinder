@@ -266,10 +266,17 @@ async def start_reclaimed_retries_exhausted(redis_stream, service):
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_B)]
 
 
-async def start_in_flight_duplicate_skipped(redis_stream, service):
-    """A message whose article is still being analysed is skipped and left un-ACKed; the
-    analysis in flight ACKs once it finishes."""
+@pytest.mark.parametrize(
+    "delivery_count",
+    [pytest.param(2, id="retries_left"), pytest.param(3, id="retries_exhausted")],
+)
+async def start_in_flight_duplicate_skipped(redis_stream, service, delivery_count):
+    """A message whose article is still being analysed is skipped and left un-ACKed, and not
+    dead-lettered even once out of retries; the analysis in flight ACKs once it finishes."""
     release = asyncio.Event()
+    reclaimed = ReclaimedMessage(
+        id=MESSAGE_A.id, fields=MESSAGE_A.fields, delivery_count=delivery_count
+    )
 
     async def _analyse(cleaned_id: UUID) -> list[EntityEvent]:
         await release.wait()
@@ -277,7 +284,7 @@ async def start_in_flight_duplicate_skipped(redis_stream, service):
 
     async def _claim(*args: object, **kwargs: object) -> list[ReclaimedMessage]:
         if redis_stream.autoclaim.await_count == 1:
-            return [RECLAIMED_A]
+            return [reclaimed]
         release.set()
         raise asyncio.CancelledError
 
@@ -290,6 +297,7 @@ async def start_in_flight_duplicate_skipped(redis_stream, service):
     assert service.find_entity_events.await_args_list == [mock.call(ID_A)]
     assert redis_stream.ack.await_args_list == [_ack_call(MESSAGE_A)]
     assert redis_stream.autoclaim.await_count == 2
+    redis_stream.dead_letter.assert_not_awaited()
 
 
 async def start_loop_failure_stops_layer(redis_stream, service):
